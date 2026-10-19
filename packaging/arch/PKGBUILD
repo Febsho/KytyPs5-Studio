@@ -1,12 +1,12 @@
 pkgname=kytyps5-studio
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Linux desktop manager for KytyPS5 sources, builds, and games'
 arch=('x86_64')
 url='https://github.com/Febsho/KytyPs5-Studio'
 license=('MIT')
 options=('!lto')
-depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'librsvg' 'xdg-utils' 'libnotify' 'libsecret' 'xdotool')
+depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'librsvg' 'xdg-utils' 'xdg-desktop-portal' 'zenity' 'libnotify' 'libsecret' 'xdotool')
 makedepends=('nodejs' 'npm' 'rust' 'cargo' 'appmenu-gtk-module' 'xdotool')
 source=("$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP')

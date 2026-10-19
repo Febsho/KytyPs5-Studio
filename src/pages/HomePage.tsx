@@ -1,14 +1,17 @@
 import type { Dispatch, SetStateAction } from "react";
+import { useEffect, useState } from "react";
 import { Activity, ChevronRight, Play, RefreshCw } from "lucide-react";
 import type {
   Build,
   Game,
+  GameContent,
   GraphicsDiagnostics,
   Repo,
   System,
 } from "../types/studio";
-import { HomeGameTile } from "../components/games/GameLibrary";
+import { GameContextMenu, HomeGameTile } from "../components/games/GameLibrary";
 import { date, formatBytes, short } from "../utils/format";
+import { trophySummary } from "../utils/trophies";
 
 type Page =
   | "home"
@@ -34,11 +37,15 @@ export type HomePageProps = {
   setPage: Dispatch<SetStateAction<Page>>;
   choose: (kind: "file" | "directory") => Promise<void>;
   launchGame: (gameId: number) => Promise<void>;
-  selectGameWithGuard: (gameId: number) => void;
+  selectGameWithGuard: (gameId: number) => boolean | void;
   setGameDetailsTab: Dispatch<
-    SetStateAction<"Overview" | "Settings" | "Compatibility" | "Logs">
+    SetStateAction<"Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Cheats">
   >;
   setHomeSelection: Dispatch<SetStateAction<number | null>>;
+  inspectGameContent?: (gameId:number) => Promise<GameContent>;
+  onRemoveGame?: (gameId: number) => void;
+  runningGameId?: number;
+  onShowRunningSession?: () => void;
 };
 
 export function HomePage({
@@ -58,14 +65,26 @@ export function HomePage({
   selectGameWithGuard,
   setGameDetailsTab,
   setHomeSelection,
+  inspectGameContent,
+  onRemoveGame,
+  runningGameId,
+  onShowRunningSession,
 }: HomePageProps) {
+  const [trophyProgress, setTrophyProgress] = useState<ReturnType<typeof trophySummary> | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ game: Game; x: number; y: number } | null>(null);
+  useEffect(() => {
+    if (!featuredGame || !inspectGameContent) { setTrophyProgress(null); return; }
+    let current = true;
+    void inspectGameContent(featuredGame.id).then((result)=>{ if(current) setTrophyProgress(trophySummary(result)); }).catch(()=>{ if(current) setTrophyProgress(null); });
+    return ()=>{ current=false; };
+  }, [featuredGame?.id, inspectGameContent]);
   return (
     <section
       className="page home-page"
       style={
         featuredBackground
           ? {
-              backgroundImage: `linear-gradient(180deg,rgba(4,5,8,.44) 0%,rgba(4,5,8,.22) 32%,rgba(4,5,8,.82) 72%,#050609 100%),linear-gradient(90deg,rgba(4,5,8,.75),transparent 70%),url(${featuredBackground})`,
+              backgroundImage: `linear-gradient(180deg,rgba(2,3,5,.76) 0%,rgba(2,3,5,.5) 25%,rgba(2,3,5,.36) 48%,rgba(2,3,5,.86) 76%,#050609 100%),linear-gradient(90deg,rgba(2,3,5,.8),transparent 72%),url(${featuredBackground})`,
             }
           : undefined
       }
@@ -80,20 +99,23 @@ export function HomePage({
         </div>
         {games.length ? (
           <div className="home-game-row">
-            {games.slice(0, 8).map((game) => (
+            {games.map((game) => (
               <HomeGameTile
                 key={game.id}
                 game={game}
                 selected={featuredGame?.id === game.id}
                 onSelect={() => setHomeSelection(game.id)}
+                onContextMenu={(selected, event) => {
+                  event.preventDefault();
+                  setContextMenu({ game: selected, x: event.clientX, y: event.clientY });
+                }}
               />
             ))}
           </div>
         ) : (
           <div className="home-empty">
-            <span>No imported games</span>
             <button
-              className="outline"
+              className="primary"
               onClick={() => void choose("directory")}
             >
               Import game folder
@@ -101,7 +123,7 @@ export function HomePage({
           </div>
         )}
       </div>
-      <div className="home-feature">
+      {featuredGame && <div className="home-feature">
         <div className="home-game-meta">
           {featuredGame?.title_id && <span>{featuredGame.title_id}</span>}
           {featuredGame?.game_version && (
@@ -114,6 +136,7 @@ export function HomePage({
           {featuredGame?.last_played && (
             <span>{Math.round(featuredGame.play_seconds / 60)} MIN PLAYED</span>
           )}
+          {trophyProgress && trophyProgress.total > 0 && <span>{trophyProgress.earned === null ? `${trophyProgress.total} TROPHIES` : `${trophyProgress.earned}/${trophyProgress.total} TROPHIES EARNED`}</span>}
         </div>
         <h2>{featuredGame?.title || "KytyPS5 Studio"}</h2>
         <p>
@@ -123,21 +146,31 @@ export function HomePage({
               : "Imported game · gameplay compatibility is unconfirmed."
             : "Import a supported game folder to build your library."}
         </p>
+        {trophyProgress?.earned !== null && trophyProgress?.earned !== undefined && trophyProgress.total > 0 && <div className="home-trophy-progress" aria-label="Trophy progress">
+          <span>{trophyProgress.earned} of {trophyProgress.total} earned</span>
+          {(["platinum", "gold", "silver", "bronze"] as const).filter((grade) => trophyProgress.counts[grade] > 0).map((grade) => <span className={`trophy-progress-grade trophy-${grade}`} key={grade}>{trophyProgress.earnedByGrade[grade]}/{trophyProgress.counts[grade]} {grade}</span>)}
+        </div>}
         <div className="hero-actions">
           {featuredGame ? (
             <>
-              <button
-                className="primary"
-                disabled={featuredGame.file_status === "Missing"}
-                title={
-                  featuredGame.file_status === "Missing"
-                    ? "Registered game path is missing"
-                    : ""
-                }
-                onClick={() => void launchGame(featuredGame.id)}
-              >
-                <Play size={15} fill="currentColor" /> Play Game
-              </button>
+              {runningGameId === featuredGame.id ? (
+                <button className="primary" onClick={onShowRunningSession}>
+                  <Activity size={15} /> Open running session
+                </button>
+              ) : (
+                <button
+                  className="primary"
+                  disabled={featuredGame.file_status === "Missing"}
+                  title={
+                    featuredGame.file_status === "Missing"
+                      ? "Registered game path is missing"
+                      : ""
+                  }
+                  onClick={() => void launchGame(featuredGame.id)}
+                >
+                  <Play size={15} fill="currentColor" /> Play Game
+                </button>
+              )}
               <button
                 className="ghost"
                 onClick={() => {
@@ -168,12 +201,6 @@ export function HomePage({
               ? `${repos.find((repo) => repo.id === active.repo_id)?.name || "KytyPS5"} · ${short(active.commit_sha)}`
               : "No verified emulator build"}
           </span>
-          <span>{system?.gpu || "Graphics device unavailable"}</span>
-          <span>
-            {system?.controllers.length
-              ? `${system.controllers.length} controller${system.controllers.length === 1 ? "" : "s"} detected`
-              : "No controller detected"}
-          </span>
           {message.includes("Update available:") && (
             <button
               className="home-update-link"
@@ -183,34 +210,23 @@ export function HomePage({
             </button>
           )}
         </div>
-      </div>
-      <div className="home-recent">
-        <div className="sectionhead">
-          <div>
-            <small className="eyebrow">LIBRARY</small>
-            <h3>Recently played</h3>
-          </div>
-          <button className="text-button" onClick={() => setPage("library")}>
-            All games <ChevronRight size={14} />
-          </button>
-        </div>
-        {games.filter((game) => game.last_played).length ? (
-          <div className="recent-strip">
-            {[...games]
-              .filter((game) => game.last_played)
-              .sort((a, b) => (b.last_played ?? 0) - (a.last_played ?? 0))
-              .slice(0, 4)
-              .map((game) => (
-                <button key={game.id} onClick={() => setHomeSelection(game.id)}>
-                  <span>{game.title}</span>
-                  <small>{date(game.last_played)}</small>
-                </button>
-              ))}
-          </div>
-        ) : (
-          <p className="recent-empty">No play sessions recorded yet.</p>
-        )}
-      </div>
+      </div>}
+      {contextMenu && (
+        <GameContextMenu
+          {...contextMenu}
+          onClose={() => setContextMenu(null)}
+          onDetails={(game) => {
+            setContextMenu(null);
+            if (selectGameWithGuard(game.id) === false) return;
+            setGameDetailsTab("Overview");
+            setPage("game-details");
+          }}
+          onRemove={onRemoveGame ? (game) => {
+            setContextMenu(null);
+            onRemoveGame(game.id);
+          } : undefined}
+        />
+      )}
       {specsOpen && (
         <div className="drawer-backdrop" onClick={() => setSpecsOpen(false)}>
           <aside

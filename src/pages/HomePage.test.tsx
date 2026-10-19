@@ -32,7 +32,7 @@ describe("HomePage", () => {
     const page = props();
     render(<HomePage {...page} />);
 
-    expect(screen.getByText("No imported games")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /import game folder/i })).toBeTruthy();
     fireEvent.click(
       screen.getAllByRole("button", { name: /import game folder/i })[0],
     );

@@ -19,13 +19,12 @@ export type EmulatorManagerPageProps = {
   onActivateBuild: (id: number) => void;
   onOpenBuildLog: (id: number) => void;
   onRemoveBuild: (id: number) => void;
+  onCopyLog?: () => void;
 };
 
 export function EmulatorManagerPage({
   builds,
   repos,
-  games,
-  sessions,
   selectedLog,
   busy,
   onNewBuild,
@@ -37,6 +36,7 @@ export function EmulatorManagerPage({
   onActivateBuild,
   onOpenBuildLog,
   onRemoveBuild,
+  onCopyLog,
 }: EmulatorManagerPageProps) {
   const [compareIds, setCompareIds] = useState<number[]>([]);
   const comparison = compareIds
@@ -49,7 +49,10 @@ export function EmulatorManagerPage({
     });
   };
   const details = [
-    ["Repository", (build: Build) => repos.find((repo) => repo.id === build.repo_id)?.name || "Unknown"],
+    ["Repository", (build: Build) => {
+      const repo = repos.find((item) => item.id === build.repo_id);
+      return repo ? `${repo.name} · by ${repo.owner}` : "Unknown";
+    }],
     ["Commit", (build: Build) => build.commit_sha],
     ["Build type", (build: Build) => build.build_type],
     ["Built", (build: Build) => date(build.created_at)],
@@ -85,7 +88,10 @@ export function EmulatorManagerPage({
               </div>
               <div>
                 <strong>
-                  {repos.find((r) => r.id === b.repo_id)?.name || "Repository"}{" "}
+                  {(() => {
+                    const repo = repos.find((item) => item.id === b.repo_id);
+                    return repo ? `${repo.name} · by ${repo.owner}` : "Repository";
+                  })()} {" "}
                   <span className="subtle">{b.build_type}</span>
                 </strong>
                 <small>
@@ -100,6 +106,16 @@ export function EmulatorManagerPage({
                   <br />
                   {b.path}
                 </small>
+                {!!b.community_prs?.length && (
+                  <div className="build-community-prs">
+                    <span className="badge">Built with community PRs</span>
+                    {b.community_prs.map((pr) => (
+                      <a key={`${pr.number}-${pr.head_sha}`} href={pr.url} target="_blank" rel="noreferrer">
+                        #{pr.number} · {short(pr.head_sha)} ↗
+                      </a>
+                    ))}
+                  </div>
+                )}
                 <details className="build-configuration">
                   <summary>Build configuration</summary>
                   {b.configuration.cmake_arguments.length ? (
@@ -170,27 +186,9 @@ export function EmulatorManagerPage({
               </button>
               <button
                 className="outline danger"
-                disabled={
-                  b.active ||
-                  games.some((game) => game.build_id === b.id) ||
-                  sessions.some((session) => session.build_id === b.id)
-                }
-                title={
-                  b.active
-                    ? "The active build is protected"
-                    : games.some((game) => game.build_id === b.id)
-                      ? "A game still prefers this build"
-                      : sessions.some((session) => session.build_id === b.id)
-                        ? "Session history references this build"
-                        : "Remove this managed installation"
-                }
+                title="Remove this managed installation; game preferences will use the active build and session history will remain"
                 onClick={() => {
-                  if (
-                    window.confirm(
-                      `Remove this inactive emulator build at ${b.path}? This cannot be undone.`,
-                    )
-                  )
-                    onRemoveBuild(b.id);
+                  onRemoveBuild(b.id);
                 }}
               >
                 Remove
@@ -199,11 +197,11 @@ export function EmulatorManagerPage({
           ))}
         </div>
       ) : (
-        <div className="empty">
+        <div className="empty emulator-empty">
           <Cpu />
           <strong>No verified builds yet</strong>
           <p>Clone the official repository and compile it in Build Studio.</p>
-          <button className="primary" onClick={onOpenForkManager}>
+          <button className="primary emulator-empty-action" onClick={onOpenForkManager}>
             Open Fork Manager
           </button>
         </div>
@@ -221,7 +219,10 @@ export function EmulatorManagerPage({
             <div className="table-wrap">
               <table>
                 <thead>
-                  <tr><th scope="col">Property</th>{comparison.map((build) => <th scope="col" key={build.id}>{repos.find((repo) => repo.id === build.repo_id)?.name || "Repository"} · {short(build.commit_sha)}</th>)}</tr>
+                  <tr><th scope="col">Property</th>{comparison.map((build) => {
+                    const repo = repos.find((item) => item.id === build.repo_id);
+                    return <th scope="col" key={build.id}>{repo ? `${repo.name} · by ${repo.owner}` : "Repository"} · {short(build.commit_sha)}</th>;
+                  })}</tr>
                 </thead>
                 <tbody>
                   {details.map(([label, value]) => (
@@ -240,6 +241,7 @@ export function EmulatorManagerPage({
         <div className="panel terminal">
           <div className="terminal-title">
             <Terminal size={16} /> Build log
+            <button className="outline" onClick={() => onCopyLog?.()}>Copy log</button>
           </div>
           <pre>{selectedLog}</pre>
         </div>

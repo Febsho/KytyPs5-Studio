@@ -24,23 +24,27 @@ export type BuildStudioPageProps = {
   onBuild: () => void;
   onBuildLatest: () => void;
   onCancel: () => void;
+  onCopyLog?: () => void;
 };
 
-function buildStageActive(phase: string, label: string) {
+function buildStageIndex(phase: string) {
   const value = phase.toLowerCase();
-  const stage = label.toLowerCase();
-  if (stage.includes("fetch"))
-    return value.includes("fetch") || value.includes("preparing repository");
-  if (stage.includes("submodule")) return value.includes("submodule");
-  if (stage.includes("dependenc")) return value.includes("dependenc");
-  if (stage.includes("cmake") || stage.includes("configur"))
-    return value.includes("configur");
-  if (stage.includes("compile") || stage.includes("ninja"))
-    return value.includes("compile");
-  if (stage.includes("install")) return value.includes("install");
-  if (stage.includes("validat")) return value.includes("validat");
-  if (stage.includes("applying")) return value.includes("applying");
-  return false;
+  if (/complete|succeeded|verified/.test(value)) return 7;
+  if (/fetch|preparing repository/.test(value)) return 0;
+  if (/submodule|updating source/.test(value)) return 1;
+  if (/dependenc/.test(value)) return 2;
+  if (/configur/.test(value)) return 3;
+  if (/compile|ninja/.test(value)) return 4;
+  if (/install/.test(value)) return 5;
+  if (/validat/.test(value)) return 6;
+  return -1;
+}
+
+function buildStageClass(phase: string, index: number) {
+  const active = buildStageIndex(phase);
+  if (active < 0) return "";
+  if (active > index) return "complete";
+  return active === index ? "current" : "";
 }
 
 export function BuildStudioPage({
@@ -64,6 +68,7 @@ export function BuildStudioPage({
   onBuild,
   onBuildLatest,
   onCancel,
+  onCopyLog,
 }: BuildStudioPageProps) {
   const onModeChange = setBuildMode;
   const onBuildTypeChange = setBuildType;
@@ -242,9 +247,7 @@ export function BuildStudioPage({
                 "Validating executable",
               ].map((stage, index) => (
                 <div
-                  className={
-                    buildStageActive(currentBuildPhase, stage) ? "current" : ""
-                  }
+                  className={buildStageClass(currentBuildPhase, index)}
                   key={stage}
                 >
                   <span>{String(index + 1).padStart(2, "0")}</span>
@@ -256,6 +259,7 @@ export function BuildStudioPage({
               <div className="terminal-title">
                 <Terminal size={15} /> Build output{" "}
                 <span>{busy ? "RUNNING" : "IDLE"}</span>
+                <button className="outline" onClick={() => onCopyLog?.()} disabled={!logs.length}>Copy log</button>
               </div>
               <pre>
                 {logs.length
@@ -458,9 +462,7 @@ export function BuildStudioPage({
                 "Validate",
               ].map((stage, index) => (
                 <div
-                  className={
-                    buildStageActive(currentBuildPhase, stage) ? "current" : ""
-                  }
+                  className={buildStageClass(currentBuildPhase, index)}
                   key={stage}
                 >
                   <span>{String(index + 1).padStart(2, "0")}</span>
@@ -471,6 +473,7 @@ export function BuildStudioPage({
             <div className="terminal-title">
               <Terminal size={15} /> Compiler output{" "}
               <span>{busy ? "RUNNING" : "IDLE"}</span>
+              <button className="outline" onClick={() => onCopyLog?.()} disabled={!logs.length}>Copy log</button>
             </div>
             <pre>
               {logs.length

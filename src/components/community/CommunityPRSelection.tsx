@@ -17,6 +17,8 @@ function reviewHasMissingFiles(review: CommunityPRDetails[]) {
 export function CommunityPRSelection({
   selectedPullRequests,
   review,
+  targetRepository,
+  targetBranch,
   pinnedHeads,
   busy,
   reviewLoading,
@@ -33,6 +35,8 @@ export function CommunityPRSelection({
 }: {
   selectedPullRequests: CommunityPR[];
   review: CommunityPRDetails[];
+  targetRepository?: string;
+  targetBranch?: string;
   pinnedHeads: Record<number, string>;
   busy: boolean;
   reviewLoading: boolean;
@@ -48,6 +52,8 @@ export function CommunityPRSelection({
   onCleanChange: (clean: boolean) => void;
 }) {
   if (!selectedPullRequests.length) return null;
+  const baseShas = new Set(review.map((detail) => detail.pull_request.base_sha));
+  const incompatibleBases = review.length === selectedPullRequests.length && baseShas.size > 1;
 
   return (
     <>
@@ -58,7 +64,7 @@ export function CommunityPRSelection({
             {selectedPullRequests.length === 1 ? "" : "s"} selected
           </strong>
           <small>
-            Order:{" "}
+            Build target: {targetRepository || "Selected repository"} · {targetBranch || "default branch"}. Order:{" "}
             {selectedPullRequests.map((pr) => `#${pr.number}`).join(" → ")}. Git
             worktrees isolate source files, not untrusted build code.
           </small>
@@ -162,6 +168,11 @@ export function CommunityPRSelection({
                 ))}
             </div>
           ))}
+          {incompatibleBases && (
+            <p className="diagnosis-note">
+              These PRs target different base commits. Select PRs with the same pinned base before building.
+            </p>
+          )}
           <div className="formgrid pr-build-options">
             <div>
               <label>Build type</label>
@@ -199,7 +210,7 @@ export function CommunityPRSelection({
           </label>
           <button
             className="primary"
-            disabled={busy || reviewLoading || reviewHasMissingFiles(review)}
+            disabled={busy || reviewLoading || reviewHasMissingFiles(review) || incompatibleBases}
             onClick={() => onBuild(review)}
           >
             <Play size={16} /> Compile reviewed PRs

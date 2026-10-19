@@ -1,5 +1,6 @@
 import type { Dispatch, SetStateAction } from "react";
-import { ArrowDownToLine, ChevronRight, GitBranch, Search } from "lucide-react";
+import { useState } from "react";
+import { ArrowDownToLine, ChevronRight, GitBranch, Search, Trash2 } from "lucide-react";
 import type { Fork, GithubDetails, Repo } from "../types/studio";
 import { short } from "../utils/format";
 
@@ -19,10 +20,12 @@ export type RepositoryManagerPageProps = {
   onCloneRepository: (id: number) => void;
   onOpenSourceFolder: (id: number) => void;
   onInspectRepository: (id: number) => void;
-  onCheckRepositoryUpdates: (id: number) => void;
+  onCheckRepositoryUpdates: (id: number) => Promise<string>;
   onRefreshGitHubDetails: (id: number) => void;
   onOpenBuildStudio: () => void;
   onAddFork: (fork: Fork) => void;
+  onRemoveRepository?: (id:number) => void;
+  onUpdateNow?: (id:number) => void;
 };
 
 export function RepositoryManagerPage({
@@ -45,7 +48,19 @@ export function RepositoryManagerPage({
   onRefreshGitHubDetails,
   onOpenBuildStudio,
   onAddFork,
+  onRemoveRepository,
+  onUpdateNow,
 }: RepositoryManagerPageProps) {
+  const [updateStatus, setUpdateStatus] = useState("");
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const trackedRepos = repos.filter((repo) => !repo.removed);
+  const visibleRepos = trackedRepos.filter(
+    (repo) => !(repo.owner.toLowerCase() === "kytyps5" && repo.name.toLowerCase() === "kytyps5"),
+  );
+  const selectedRepository = currentRepo?.removed ? undefined : currentRepo;
+  const officialRepository = trackedRepos.find(
+    (repo) => repo.owner.toLowerCase() === "kytyps5" && repo.name.toLowerCase() === "kytyps5",
+  );
   return (
     <section className="page">
       <div className="sectionhead">
@@ -68,7 +83,7 @@ export function RepositoryManagerPage({
         </button>
       </div>
       <div className="repo-grid">
-        <article className="card accent">
+        <article className={`card accent ${officialRepository && officialRepository.id === selectedRepository?.id ? "selected" : ""}`}>
           <div className="cardtop">
             <GitBranch />
             <span>OFFICIAL</span>
@@ -76,14 +91,14 @@ export function RepositoryManagerPage({
           <h3>KytyPS5 / KytyPS5</h3>
           <p>The upstream PlayStation 5 translation layer for Linux.</p>
           <button className="outline" onClick={onAddOfficialRepository}>
-            Add official repository
+            Select Official Source
           </button>
         </article>
-        {repos.map((r) => (
+        {visibleRepos.map((r) => (
           <article
             className={"card " + (selectedRepo === r.id ? "selected" : "")}
             key={r.id}
-            onClick={() => onSelectRepository(r.id)}
+            onClick={() => { setUpdateStatus(""); onSelectRepository(r.id); }}
           >
             <div className="cardtop">
               <GitBranch />
@@ -103,54 +118,60 @@ export function RepositoryManagerPage({
               <span>{short(r.installed_commit)}</span>
               <span>{r.branch || "Default branch pending clone"}</span>
             </div>
+            <button className="repo-remove-button outline" title={`Remove ${r.owner}/${r.name}`} aria-label={`Remove ${r.owner}/${r.name}`} onClick={(event) => { event.stopPropagation(); onRemoveRepository?.(r.id); }}><Trash2 size={14} /> Remove</button>
           </article>
         ))}
       </div>
-      {currentRepo && (
+      {selectedRepository && (
         <div className="panel">
           <div className="sectionhead">
             <div>
               <h3>
-                {currentRepo.owner} / {currentRepo.name}
+                {selectedRepository.owner} / {selectedRepository.name}
               </h3>
               <p>
-                {currentRepo.source_path || "Source checkout not installed"}
+                {selectedRepository.source_path || "Source checkout not installed"}
               </p>
             </div>
-            <span className="badge">{currentRepo.adapter}</span>
+            <span className="badge">{selectedRepository.adapter}</span>
           </div>
           <div className="buttonrow">
             <button
               className="primary"
-              disabled={busy || !!currentRepo.source_path}
-              onClick={() => onCloneRepository(currentRepo.id)}
+              disabled={busy}
+              onClick={() => onCloneRepository(selectedRepository.id)}
             >
-              <ArrowDownToLine size={16} /> Clone with submodules
+              <ArrowDownToLine size={16} /> Clone / restore checkout
             </button>
             <button
               className="outline"
-              disabled={!currentRepo.source_path}
-              onClick={() => onOpenSourceFolder(currentRepo.id)}
+              disabled={!selectedRepository.source_path}
+              onClick={() => onOpenSourceFolder(selectedRepository.id)}
             >
               Open source folder
             </button>
             <button
               className="outline"
-              disabled={!currentRepo.source_path}
-              onClick={() => onInspectRepository(currentRepo.id)}
+              disabled={!selectedRepository.source_path}
+              onClick={() => onInspectRepository(selectedRepository.id)}
             >
               Inspect adapter
             </button>
             <button
               className="outline"
-              disabled={!currentRepo.source_path}
-              onClick={() => onCheckRepositoryUpdates(currentRepo.id)}
+              disabled={checkingUpdates || !selectedRepository.source_path}
+              onClick={async () => {
+                setCheckingUpdates(true); setUpdateStatus("");
+                try { setUpdateStatus(await onCheckRepositoryUpdates(selectedRepository.id)); }
+                catch (error) { setUpdateStatus(`Check failed: ${String(error)}`); }
+                finally { setCheckingUpdates(false); }
+              }}
             >
-              Check updates
+              {checkingUpdates ? "Checking…" : "Check updates"}
             </button>
             <button
               className="outline"
-              onClick={() => onRefreshGitHubDetails(currentRepo.id)}
+              onClick={() => onRefreshGitHubDetails(selectedRepository.id)}
             >
               Refresh GitHub details
             </button>
@@ -158,6 +179,10 @@ export function RepositoryManagerPage({
               Build <ChevronRight size={15} />
             </button>
           </div>
+          {updateStatus && <div className={`repo-update-status ${updateStatus.startsWith("Update available:") ? "available" : ""}`}>
+            <div><strong>{updateStatus.startsWith("Update available:") ? "Update available" : updateStatus.startsWith("Check failed:") ? "Update check failed" : updateStatus}</strong><small>{updateStatus.startsWith("Update available:") ? updateStatus.slice("Update available:".length).trim() : ""}</small></div>
+            {updateStatus.startsWith("Update available:") && <button className="primary" disabled={busy} onClick={()=>onUpdateNow?.(selectedRepository.id)}>Update Now</button>}
+          </div>}
           {githubDetails && (
             <div className="github-details">
               <div className="game-meta">
@@ -165,7 +190,7 @@ export function RepositoryManagerPage({
                 <span>★ {githubDetails.stars}</span>
                 <span>Default: {githubDetails.default_branch}</span>
                 <span>
-                  Tracked: {currentRepo.branch || githubDetails.default_branch}
+                  Tracked: {selectedRepository.branch || githubDetails.default_branch}
                 </span>
                 <span>
                   Updated{" "}
@@ -191,7 +216,7 @@ export function RepositoryManagerPage({
                           githubDetails.latest_commit.commit.author.date,
                         ).toLocaleString()
                       : "Commit date unavailable"}{" "}
-                    · installed {short(currentRepo.installed_commit)}
+                    · installed {short(selectedRepository.installed_commit)}
                   </small>
                 </>
               )}
@@ -236,7 +261,7 @@ export function RepositoryManagerPage({
                     {new Date(f.updated_at).toLocaleDateString()}
                   </small>
                   <span className="badge">
-                    {repos.some((r) => r.url === f.html_url)
+                    {trackedRepos.some((r) => r.url === f.html_url)
                       ? "Already tracked"
                       : "Build compatibility unknown until source inspection"}
                   </span>

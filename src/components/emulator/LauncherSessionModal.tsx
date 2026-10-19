@@ -9,12 +9,20 @@ export type LauncherSessionModalProps = {
   live: boolean;
   status: string;
   runtimeSeconds: number;
+  performance?: {
+    averageCpuPercent: number | null;
+    peakCpuPercent: number | null;
+    peakResidentBytes: number | null;
+  };
   icon: string | null;
   log: string;
   onDismiss: () => void;
   onStop: () => void;
   onBackToLibrary: () => void;
   onOpenLogs: () => void;
+  onCopyLog?: () => void;
+  onSearchCommunityPRs?: () => void;
+  canSearchCommunityPRs?: boolean;
 };
 
 export function LauncherSessionModal({
@@ -24,13 +32,25 @@ export function LauncherSessionModal({
   live: launcherLive,
   status: launcherStatus,
   runtimeSeconds: launcherRuntime,
+  performance: launcherPerformance = {
+    averageCpuPercent: null,
+    peakCpuPercent: null,
+    peakResidentBytes: null,
+  },
   icon: launcherIcon,
   log: launcherLog,
   onDismiss,
   onStop,
   onBackToLibrary,
   onOpenLogs,
+  onCopyLog,
+  onSearchCommunityPRs,
+  canSearchCommunityPRs = false,
 }: LauncherSessionModalProps) {
+  const sessionFailed = !launcherLive && (
+    (launcherSession.exit_code !== null && launcherSession.exit_code !== 0) ||
+    /error|crash|failed/i.test(launcherSession.outcome || "")
+  );
   return (
     <div
       className="launcher-overlay"
@@ -42,7 +62,7 @@ export function LauncherSessionModal({
         <header>
           <span>
             <i className={`launcher-live-dot ${launcherLive ? "" : "ended"}`} />{" "}
-            KYTYPS5 LAUNCHER
+              {launcherLive ? "KYTYPS5 LAUNCHER" : "SESSION SUMMARY"}
           </span>
           <button
             className="launcher-close"
@@ -94,12 +114,22 @@ export function LauncherSessionModal({
               <button className="outline" onClick={onBackToLibrary}>
                 Back to Library
               </button>
+              {sessionFailed && onSearchCommunityPRs && (
+                <button
+                  className="outline"
+                  disabled={!canSearchCommunityPRs}
+                  title={canSearchCommunityPRs ? "Search pull requests in a cloned repository" : "Clone a repository to search its community pull requests"}
+                  onClick={onSearchCommunityPRs}
+                >
+                  Search community PRs
+                </button>
+              )}
             </div>
           </div>
         </div>
         <details className="launcher-details" open>
-          <summary>⌁ &nbsp; Technical Details</summary>
-          <div className="launcher-metrics">
+          <summary>{launcherLive ? "⌁  Technical Details" : "⌁  Session overview and performance"}</summary>
+          {launcherLive ? <div className="launcher-metrics">
             <div>
               <small>PROCESS ID</small>
               <strong>
@@ -130,7 +160,20 @@ export function LauncherSessionModal({
                   : "—"}
               </strong>
             </div>
-          </div>
+          </div> : <>
+            <div className="launcher-metrics session-summary-metrics">
+              <div><small>PLAYTIME</small><strong>{Math.floor(launcherRuntime / 60)}m {(launcherRuntime % 60).toString().padStart(2, "0")}s</strong></div>
+              <div><small>RESULT</small><strong>{launcherStatus}</strong></div>
+              <div><small>EXIT CODE</small><strong>{launcherSession.exit_code ?? "Unavailable"}</strong></div>
+              <div><small>AVERAGE CPU</small><strong>{launcherPerformance.averageCpuPercent === null ? "Unavailable" : `${launcherPerformance.averageCpuPercent.toFixed(1)}%`}</strong></div>
+              <div><small>PEAK CPU</small><strong>{launcherPerformance.peakCpuPercent === null ? "Unavailable" : `${launcherPerformance.peakCpuPercent.toFixed(1)}%`}</strong></div>
+              <div><small>PEAK MEMORY</small><strong>{launcherPerformance.peakResidentBytes === null ? "Unavailable" : `${(launcherPerformance.peakResidentBytes / 1024 / 1024).toFixed(0)} MiB`}</strong></div>
+              <div><small>AVERAGE FPS</small><strong>Not measured</strong></div>
+              <div><small>1% LOW</small><strong>Not measured</strong></div>
+              <div><small>PEAK FPS</small><strong>Not measured</strong></div>
+            </div>
+            <p className="launcher-metric-note">The emulator does not currently expose frame-time telemetry, so FPS and 1% low values are unavailable.</p>
+          </>}
           <div className="launcher-log-head">
             <span>PROCESS OUTPUT & EMULATOR LOG</span>
             <button
@@ -141,6 +184,7 @@ export function LauncherSessionModal({
             >
               <Terminal size={13} /> Open Logs
             </button>
+            <button className="outline" disabled={!launcherLog} onClick={() => onCopyLog?.()}>Copy log</button>
           </div>
           <p className="launcher-log-path">
             {launcherSession.log_path ||

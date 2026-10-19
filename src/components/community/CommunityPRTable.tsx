@@ -5,6 +5,7 @@ export function CommunityPRTable({
   selectedPullRequests,
   selectedDetails,
   loading,
+  onSelectPage = () => {},
   onSelectionChange,
   onOpenDetails,
 }: {
@@ -12,15 +13,38 @@ export function CommunityPRTable({
   selectedPullRequests: CommunityPR[];
   selectedDetails: CommunityPRDetails | null;
   loading: boolean;
+  onSelectPage?: (selected: boolean) => void;
   onSelectionChange: (pr: CommunityPR, selected: boolean) => void;
   onOpenDetails: (pr: CommunityPR) => void;
 }) {
+  const selectedOnPage = pullRequests.filter((pr) =>
+    selectedPullRequests.some((item) => item.number === pr.number),
+  ).length;
   return (
     <div className="pr-table-wrap">
       <table className="pr-table">
         <thead>
           <tr>
-            <th>Select</th>
+            <th>
+              <label className="pr-select-page">
+                <input
+                  type="checkbox"
+                  aria-label="Select all pull requests on this page"
+                  checked={
+                    pullRequests.length > 0 &&
+                    selectedOnPage === pullRequests.length
+                  }
+                  ref={(element) => {
+                    if (element)
+                      element.indeterminate =
+                        selectedOnPage > 0 &&
+                        selectedOnPage < pullRequests.length;
+                  }}
+                  onChange={(event) => onSelectPage(event.target.checked)}
+                />
+                <span>Select</span>
+              </label>
+            </th>
             <th>PR</th>
             <th>Title / branch</th>
             <th>Author</th>

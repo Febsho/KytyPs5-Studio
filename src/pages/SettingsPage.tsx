@@ -1,6 +1,6 @@
-import type { Dispatch, SetStateAction } from "react";
+import { useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { Settings } from "lucide-react";
-import type { ProfileCapabilities, StorageReport } from "../types/studio";
+import type { AppUpdateInfo, ProfileCapabilities, StorageReport } from "../types/studio";
 import {
   ProfileOptionFields,
   cliOptionInfo,
@@ -17,20 +17,26 @@ export type SettingsPageProps = {
   githubTokenInput: string;
   setGithubTokenInput: Dispatch<SetStateAction<string>>;
   updateInterval: string;
+  discordPresenceEnabled?: boolean;
   autoUpdateMode: "notify" | "build";
   storageReport: StorageReport | null;
+  appUpdate?: AppUpdateInfo | null;
+  appUpdateStatus?: string;
+  appUpdateBusy?: boolean;
   busy: boolean;
   activeSessions: boolean;
   onSaveGlobalDefaults: () => void;
   onSaveGithubToken: (token: string) => void;
   onDeleteGithubToken: () => void;
   onUpdateIntervalChange: (value: string) => void;
+  onDiscordPresenceEnabledChange?: (enabled: boolean) => void;
   onAutoUpdateModeChange: (value: "notify" | "build") => void;
-  onRefreshStorage: () => void;
-  onCleanIncompleteBuilds: () => void;
-  onClearCompilerCache: () => void;
-  onClearCommunityWorktrees: () => void;
-  onClearSessionLogs: () => void;
+  onRefreshStorage: () => void | Promise<void>;
+  onCleanIncompleteBuilds: () => void | Promise<void>;
+  onClearCompilerCache: () => void | Promise<void>;
+  onClearCommunityWorktrees: () => void | Promise<void>;
+  onClearSessionLogs: () => void | Promise<void>;
+  onCheckAppUpdate?: () => void;
 };
 
 export function SettingsPage({
@@ -43,21 +49,41 @@ export function SettingsPage({
   githubTokenInput,
   setGithubTokenInput,
   updateInterval,
+  discordPresenceEnabled = true,
   autoUpdateMode,
   storageReport,
+  appUpdate,
+  appUpdateStatus,
+  appUpdateBusy,
   busy,
   activeSessions,
   onSaveGlobalDefaults,
   onSaveGithubToken,
   onDeleteGithubToken,
   onUpdateIntervalChange,
+  onDiscordPresenceEnabledChange,
   onAutoUpdateModeChange,
   onRefreshStorage,
   onCleanIncompleteBuilds,
   onClearCompilerCache,
   onClearCommunityWorktrees,
   onClearSessionLogs,
+  onCheckAppUpdate,
 }: SettingsPageProps) {
+  const [storageTask, setStorageTask] = useState<string | null>(null);
+  const storageTaskActive = useRef(false);
+  const runStorageTask = (name: string, task: () => void | Promise<void>) => {
+    if (storageTaskActive.current) return;
+    storageTaskActive.current = true;
+    setStorageTask(name);
+    void Promise.resolve()
+      .then(task)
+      .catch(() => {})
+      .finally(() => {
+        storageTaskActive.current = false;
+        setStorageTask(null);
+      });
+  };
   return (
     <section className="page settings-page">
       <div className="panel">
@@ -205,13 +231,17 @@ export function SettingsPage({
           </div>
         ))}
         <div className="buttonrow">
-          <button className="outline" onClick={onRefreshStorage}>
-            Refresh sizes
+          <button
+            className="outline"
+            disabled={busy || storageTask !== null}
+            onClick={() => runStorageTask("refresh", onRefreshStorage)}
+          >
+            {storageTask === "refresh" ? "Refreshing sizes…" : "Refresh sizes"}
           </button>
           <button
             className="outline danger"
             disabled={
-              busy ||
+              busy || storageTask !== null ||
               !storageReport?.categories.find(
                 (category) => category.name === "Incomplete build installs",
               )?.size_bytes
@@ -225,15 +255,15 @@ export function SettingsPage({
                   `Remove ${formatBytes(bytes)} of incomplete, unregistered emulator installations? Registered builds and installations containing a kyty_emulator executable will be kept.`,
                 )
               )
-                onCleanIncompleteBuilds();
+                runStorageTask("incomplete", onCleanIncompleteBuilds);
             }}
           >
-            Clear incomplete builds
+            {storageTask === "incomplete" ? "Clearing incomplete builds…" : "Clear incomplete builds"}
           </button>
           <button
             className="outline danger"
             disabled={
-              busy ||
+              busy || storageTask !== null ||
               !storageReport?.categories.find(
                 (category) => category.name === "Compiler build cache",
               )?.size_bytes
@@ -245,18 +275,18 @@ export function SettingsPage({
                 )?.size_bytes || 0;
               if (
                 window.confirm(
-                  `Remove ${formatBytes(bytes)} of rebuildable compiler cache? Installed emulator builds, repositories, games, profiles and logs will be kept.`,
+                  `Remove ${formatBytes(bytes)} of rebuildable compiler cache? Installed emulator builds, repositories, games, profiles and logs are stored separately and will be kept.`,
                 )
               )
-                onClearCompilerCache();
+                runStorageTask("compiler", onClearCompilerCache);
             }}
           >
-            Clear compiler cache
+            {storageTask === "compiler" ? "Clearing compiler cache…" : "Clear compiler cache"}
           </button>
           <button
             className="outline danger"
             disabled={
-              busy || activeSessions ||
+              busy || storageTask !== null || activeSessions ||
               !storageReport?.categories.find(
                 (category) => category.name === "Community build worktrees",
               )?.size_bytes
@@ -271,15 +301,15 @@ export function SettingsPage({
                   `Remove ${formatBytes(bytes)} of temporary community build source checkouts? Installed builds, build history, repositories, games, profiles and logs will be kept.`,
                 )
               )
-                onClearCommunityWorktrees();
+                runStorageTask("community", onClearCommunityWorktrees);
             }}
           >
-            Clear temporary community files
+            {storageTask === "community" ? "Clearing temporary files…" : "Clear temporary community files"}
           </button>
           <button
             className="outline danger"
             disabled={
-              busy || activeSessions ||
+              busy || storageTask !== null || activeSessions ||
               !storageReport?.categories.find(
                 (category) => category.name === "Session logs",
               )?.size_bytes
@@ -294,12 +324,50 @@ export function SettingsPage({
                   `Delete ${formatBytes(bytes)} of session log files? Session history and outcomes will remain, but deleted logs cannot be opened or exported. Active emulator sessions must finish first.`,
                 )
               )
-                onClearSessionLogs();
+                runStorageTask("logs", onClearSessionLogs);
             }}
           >
-            Clear session logs
+            {storageTask === "logs" ? "Clearing session logs…" : "Clear session logs"}
           </button>
         </div>
+      </div>
+      <div className="panel">
+        <h3>Discord Rich Presence</h3>
+        <p>
+          Show KytyPS5 Studio while it is open and the current game with its
+          session timer while an emulator is running.
+        </p>
+        <label className="checkbox">
+          <input
+            type="checkbox"
+            checked={discordPresenceEnabled}
+            onChange={(event) => onDiscordPresenceEnabledChange?.(event.target.checked)}
+          />
+          <span>Show activity on Discord</span>
+        </label>
+        <small className="hint">
+          Presence is sent only to a Discord desktop client running on this
+          computer. Discord shows the application icon; game artwork remains
+          local to Studio.
+        </small>
+      </div>
+      <div className="panel">
+        <h3>KytyPS5 Studio updates</h3>
+        <p>
+          {appUpdateStatus || "App updates are checked automatically when Studio starts."}
+        </p>
+        {appUpdate?.update_available && (
+          <p className="hint">
+            Version {appUpdate.latest_version} is available
+            {appUpdate.asset_name ? ` · ${appUpdate.asset_name}` : ""}.
+            {appUpdate.running_appimage
+              ? " The verified AppImage will replace this one after download. Restart Studio to use it."
+              : " In-place installation is available when Studio runs from an AppImage."}
+          </p>
+        )}
+        <button className="outline" disabled={appUpdateBusy} onClick={() => onCheckAppUpdate?.()}>
+          {appUpdateBusy ? "Checking / updating…" : "Check for App Update"}
+        </button>
       </div>
       <div className="panel">
         <h3>About</h3>

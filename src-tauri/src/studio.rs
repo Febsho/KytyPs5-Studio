@@ -10,6 +10,7 @@ use std::{
     os::fd::AsRawFd,
     os::unix::fs::MetadataExt,
     os::unix::fs::PermissionsExt,
+    os::unix::net::UnixStream,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -426,6 +427,52 @@ fn migrate(db: &mut Connection) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
     }
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version < 16 {
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        let columns = {
+            let mut statement = tx
+                .prepare("PRAGMA table_info(builds)")
+                .map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        if !columns.is_empty() && !columns.iter().any(|column| column == "removed_at") {
+            tx.execute_batch("ALTER TABLE builds ADD COLUMN removed_at INTEGER;")
+                .map_err(|e| e.to_string())?;
+        }
+        tx.pragma_update(None, "user_version", 16)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version < 17 {
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        let columns = {
+            let mut statement = tx
+                .prepare("PRAGMA table_info(repositories)")
+                .map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        if !columns.is_empty() && !columns.iter().any(|column| column == "removed_at") {
+            tx.execute_batch("ALTER TABLE repositories ADD COLUMN removed_at INTEGER;")
+                .map_err(|e| e.to_string())?;
+        }
+        tx.pragma_update(None, "user_version", 17)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 #[derive(Serialize)]
@@ -438,6 +485,7 @@ struct Repo {
     source_path: Option<String>,
     adapter: String,
     installed_commit: Option<String>,
+    removed: bool,
 }
 #[derive(Serialize)]
 struct Build {
@@ -455,6 +503,13 @@ struct Build {
     last_session_at: Option<i64>,
     last_session_outcome: Option<String>,
     last_session_exit_code: Option<i32>,
+    community_prs: Vec<BuildPullRequest>,
+}
+#[derive(Serialize)]
+struct BuildPullRequest {
+    number: u64,
+    head_sha: String,
+    url: String,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct BuildConfiguration {
@@ -2058,8 +2113,19 @@ fn clean_compiler_cache(
     if jobs.active.load(Ordering::SeqCst) {
         return Err("Wait for the active repository or build job to finish before cleaning the compiler cache".into());
     }
-    let cache_root = state_paths(&app)?.cache;
-    clear_managed_compiler_cache(&cache_root.join("builds"), &cache_root)
+    let paths = state_paths(&app)?;
+    let cache_root = fs::canonicalize(&paths.cache).map_err(|error| error.to_string())?;
+    let data_root = fs::canonicalize(&paths.data).map_err(|error| error.to_string())?;
+    let compiler_builds = cache_root.join("builds");
+    let installed_builds = data_root.join("builds");
+    if compiler_builds.starts_with(&installed_builds)
+        || installed_builds.starts_with(&compiler_builds)
+    {
+        return Err(
+            "Compiler cache overlaps installed emulator builds; cleanup was refused".into(),
+        );
+    }
+    clear_managed_compiler_cache(&compiler_builds, &cache_root)
 }
 #[tauri::command]
 fn clean_community_worktrees(
@@ -2169,7 +2235,7 @@ fn graphics_diagnostics() -> GraphicsDiagnostics {
             "Install vulkan-tools and a Vulkan ICD/driver package, then retry diagnostics.".into(),
         )
     } else {
-        match Command::new("vulkaninfo")
+        match host_tool_command("vulkaninfo")
             .arg("--summary")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2328,8 +2394,48 @@ fn detected_controllers(input_devices: &str) -> Vec<String> {
     }
     found
 }
+fn host_tool_command(program: &str) -> Command {
+    #[cfg(target_os = "linux")]
+    let mut command = if Path::new("/usr/bin").join(program).is_file() {
+        Command::new(Path::new("/usr/bin").join(program))
+    } else {
+        Command::new(program)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut command = Command::new(program);
+    #[cfg(target_os = "linux")]
+    {
+        let mut search_path = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
+        if let Some(path) = env::var_os("PATH") {
+            search_path.extend(env::split_paths(&path));
+        }
+        if let Ok(path) = env::join_paths(search_path) {
+            command.env("PATH", path);
+        }
+        // AppImage launchers add private libraries to LD_LIBRARY_PATH. Host tools
+        // such as CMake and Git must load their matching system libraries instead.
+        // The AppImage Python runtime also sets PYTHONHOME/PYTHONPATH; inheriting
+        // those values makes host Python use the bundled stdlib and CMake's
+        // FindPython3 check fail before configuration can finish.
+        command.env_remove("LD_LIBRARY_PATH");
+        command.env_remove("LD_PRELOAD");
+        command.env_remove("PYTHONHOME");
+        command.env_remove("PYTHONPATH");
+    }
+    command
+}
+
+fn git_command() -> Command {
+    let mut command = host_tool_command("git");
+    #[cfg(target_os = "linux")]
+    {
+        command.env_remove("GIT_EXEC_PATH");
+    }
+    command
+}
+
 fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
-    let mut c = Command::new("git");
+    let mut c = git_command();
     if let Some(d) = dir {
         c.arg("-C").arg(d);
     }
@@ -2491,7 +2597,7 @@ fn git_cancellable_env(
     environment: &[(&str, &str)],
 ) -> Result<String, String> {
     ensure_job_not_cancelled(jobs)?;
-    let mut command = Command::new("git");
+    let mut command = git_command();
     if let Some(directory) = dir {
         command.arg("-C").arg(directory);
     }
@@ -2682,7 +2788,7 @@ fn valid_branch_name(branch: &str) -> bool {
             .unwrap_or(false)
 }
 fn repo(conn: &Connection, id: i64) -> Result<Repo, String> {
-    conn.query_row("SELECT id,owner,name,url,branch,source_path,adapter,installed_commit FROM repositories WHERE id=?",[id],|r|Ok(Repo{id:r.get(0)?,owner:r.get(1)?,name:r.get(2)?,url:r.get(3)?,branch:r.get(4)?,source_path:r.get(5)?,adapter:r.get(6)?,installed_commit:r.get(7)?})).map_err(|e|e.to_string())
+    conn.query_row("SELECT id,owner,name,url,branch,source_path,adapter,installed_commit,removed_at IS NOT NULL FROM repositories WHERE id=?",[id],|r|Ok(Repo{id:r.get(0)?,owner:r.get(1)?,name:r.get(2)?,url:r.get(3)?,branch:r.get(4)?,source_path:r.get(5)?,adapter:r.get(6)?,installed_commit:r.get(7)?,removed:r.get::<_,i64>(8)?!=0})).map_err(|e|e.to_string())
 }
 fn open_directory(path: &Path) -> Result<(), String> {
     let directory =
@@ -2690,7 +2796,7 @@ fn open_directory(path: &Path) -> Result<(), String> {
     if !directory.is_dir() {
         return Err("Selected location is not a directory".into());
     }
-    let mut child = Command::new("xdg-open")
+    let mut child = host_tool_command("xdg-open")
         .arg(directory)
         .spawn()
         .map_err(|error| {
@@ -2727,7 +2833,7 @@ fn open_game_folder(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
     open_directory(directory)
 }
 fn build(conn: &Connection, id: i64) -> Result<Build, String> {
-    conn.query_row(
+    let mut result = conn.query_row(
         "SELECT id,repo_id,commit_sha,build_type,path,created_at,active,install_size_bytes,validation_status,
          (SELECT started_at FROM sessions WHERE build_id=builds.id ORDER BY started_at DESC,id DESC LIMIT 1),
          (SELECT outcome FROM sessions WHERE build_id=builds.id ORDER BY started_at DESC,id DESC LIMIT 1),
@@ -2762,10 +2868,38 @@ fn build(conn: &Connection, id: i64) -> Result<Build, String> {
                 last_session_exit_code: r.get(11)?,
                 configuration: serde_json::from_str(&r.get::<_, String>(12)?)
                     .unwrap_or_default(),
+                community_prs: Vec::new(),
             })
         },
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    let mut statement = conn.prepare(
+        "SELECT repositories.owner,repositories.name,community_build_prs.number,community_build_prs.head_sha
+         FROM community_build_results
+         JOIN community_build_configs ON community_build_configs.id=community_build_results.config_id
+         JOIN repositories ON repositories.id=community_build_configs.repo_id
+         JOIN community_build_prs ON community_build_prs.config_id=community_build_configs.id
+         WHERE community_build_results.build_id=? AND community_build_results.status='verified'
+         ORDER BY community_build_results.started_at,community_build_prs.position",
+    ).map_err(|e| e.to_string())?;
+    result.community_prs = statement
+        .query_map([id], |row| {
+            let owner: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let number: i64 = row.get(2)?;
+            Ok(BuildPullRequest {
+                number: number.max(0) as u64,
+                head_sha: row.get(3)?,
+                url: format!("https://github.com/{owner}/{name}/pull/{number}"),
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    result
+        .community_prs
+        .dedup_by(|a, b| a.number == b.number && a.head_sha == b.head_sha);
+    Ok(result)
 }
 fn game(conn: &Connection, id: i64) -> Result<Game, String> {
     conn.query_row(
@@ -2804,22 +2938,49 @@ fn list_repos(app: tauri::AppHandle) -> Result<Vec<Repo>, String> {
         .prepare("SELECT id FROM repositories ORDER BY id")
         .map_err(|e| e.to_string())?;
     let rows = s.query_map([], |r| r.get(0)).map_err(|e| e.to_string())?;
-    let result = rows
-        .map(|id| repo(&c, id.map_err(|e| e.to_string())?))
-        .collect();
-    result
+    let mut result = Vec::new();
+    for id in rows {
+        let id = id.map_err(|e| e.to_string())?;
+        let repository = repo(&c, id)?;
+        if repository
+            .source_path
+            .as_deref()
+            .is_some_and(|path| !Path::new(path).is_dir())
+        {
+            c.execute(
+                "UPDATE repositories SET source_path=NULL,adapter='unknown' WHERE id=?",
+                [id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        result.push(repo(&c, id)?);
+    }
+    Ok(result)
 }
 #[tauri::command]
 fn list_builds(app: tauri::AppHandle) -> Result<Vec<Build>, String> {
-    let c = db(&app)?;
+    let mut c = db(&app)?;
     let mut s = c
-        .prepare("SELECT id FROM builds ORDER BY created_at DESC,id DESC")
+        .prepare("SELECT id FROM builds WHERE removed_at IS NULL ORDER BY created_at DESC,id DESC")
+        .map_err(|e| e.to_string())?;
+    let rows = s
+        .query_map([], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<i64>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(s);
+    for id in rows {
+        let installed = build(&c, id)?;
+        if !Path::new(&installed.path).is_dir() {
+            retire_missing_build(&mut c, id)?;
+        }
+    }
+    let mut s = c
+        .prepare("SELECT id FROM builds WHERE removed_at IS NULL ORDER BY created_at DESC,id DESC")
         .map_err(|e| e.to_string())?;
     let rows = s.query_map([], |r| r.get(0)).map_err(|e| e.to_string())?;
-    let result = rows
-        .map(|id| build(&c, id.map_err(|e| e.to_string())?))
-        .collect();
-    result
+    rows.map(|id| build(&c, id.map_err(|e| e.to_string())?))
+        .collect()
 }
 #[tauri::command]
 fn list_games(app: tauri::AppHandle) -> Result<Vec<Game>, String> {
@@ -3005,7 +3166,7 @@ fn add_repository(
     }
     let c = db(&app)?;
     c.execute(
-        "INSERT OR IGNORE INTO repositories(owner,name,url,branch) VALUES(?,?,?,?)",
+        "INSERT INTO repositories(owner,name,url,branch) VALUES(?,?,?,?) ON CONFLICT(url) DO UPDATE SET removed_at=NULL,branch=CASE WHEN excluded.branch<>'' THEN excluded.branch ELSE repositories.branch END",
         params![owner, name, url, branch],
     )
     .map_err(|e| e.to_string())?;
@@ -3015,6 +3176,27 @@ fn add_repository(
         })
         .map_err(|e| e.to_string())?;
     repo(&c, id)
+}
+#[tauri::command]
+fn remove_repository(app: tauri::AppHandle, id: i64) -> Result<String, String> {
+    if id <= 0 {
+        return Err("Repository ID must be positive".into());
+    }
+    let c = db(&app)?;
+    let repository = repo(&c, id)?;
+    c.execute(
+        "UPDATE repositories SET removed_at=? WHERE id=? AND removed_at IS NULL",
+        params![now(), id],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(if repository.source_path.is_some() {
+        format!("Removed {}/{} from tracked repositories. Existing source files, builds, and history were kept.", repository.owner, repository.name)
+    } else {
+        format!(
+            "Removed {}/{} from tracked repositories.",
+            repository.owner, repository.name
+        )
+    })
 }
 #[derive(Deserialize, Serialize)]
 struct GithubRepo {
@@ -3060,6 +3242,31 @@ struct GithubRelease {
     html_url: String,
     prerelease: bool,
     draft: bool,
+}
+#[derive(Deserialize)]
+struct GithubAppRelease {
+    tag_name: String,
+    html_url: String,
+    prerelease: bool,
+    draft: bool,
+    assets: Vec<GithubAppReleaseAsset>,
+}
+#[derive(Deserialize)]
+struct GithubAppReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+    digest: Option<String>,
+}
+#[derive(Serialize)]
+struct AppUpdateInfo {
+    current_version: String,
+    latest_version: String,
+    update_available: bool,
+    release_url: String,
+    asset_name: Option<String>,
+    download_size_bytes: Option<u64>,
+    running_appimage: bool,
 }
 #[derive(Serialize)]
 struct GithubRepositoryDetails {
@@ -3340,6 +3547,260 @@ fn github_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
         .body_mut()
         .read_json()
         .map_err(|error| format!("GitHub returned invalid JSON: {error}"))
+}
+const APP_RELEASES_API: &str = "https://api.github.com/repos/Febsho/KytyPs5-Studio/releases/latest";
+const APP_RELEASES_DOWNLOAD_PREFIX: &str =
+    "https://github.com/Febsho/KytyPs5-Studio/releases/download/";
+const MAX_APPIMAGE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+fn release_version_tuple(value: &str) -> Option<Vec<u64>> {
+    value
+        .trim_start_matches('v')
+        .split(['-', '+'])
+        .next()?
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+}
+
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    let (Some(latest), Some(current)) = (
+        release_version_tuple(latest),
+        release_version_tuple(current),
+    ) else {
+        return false;
+    };
+    (0..latest.len().max(current.len()))
+        .map(|index| {
+            (
+                latest.get(index).copied().unwrap_or_default(),
+                current.get(index).copied().unwrap_or_default(),
+            )
+        })
+        .find_map(|(latest, current)| (latest != current).then_some(latest > current))
+        .unwrap_or(false)
+}
+
+fn running_appimage_path() -> Option<PathBuf> {
+    let path = env::var_os("APPIMAGE").map(PathBuf::from)?;
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("appimage"))
+    {
+        return None;
+    }
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
+    }
+    let canonical = fs::canonicalize(path).ok()?;
+    canonical.is_file().then_some(canonical)
+}
+
+fn latest_app_release() -> Result<GithubAppRelease, String> {
+    let release: GithubAppRelease = github_json(APP_RELEASES_API)?;
+    if release.draft || release.prerelease {
+        return Err("GitHub's latest Studio release is not a stable public release".into());
+    }
+    Ok(release)
+}
+
+fn appimage_asset(release: &GithubAppRelease) -> Option<&GithubAppReleaseAsset> {
+    let name = match env::consts::ARCH {
+        "x86_64" => ["x86_64", "amd64"],
+        "aarch64" => ["aarch64", "arm64"],
+        _ => return None,
+    };
+    release.assets.iter().find(|asset| {
+        let lower = asset.name.to_ascii_lowercase();
+        lower.ends_with(".appimage") && name.iter().any(|arch| lower.contains(arch))
+    })
+}
+
+#[tauri::command]
+fn check_app_update() -> Result<AppUpdateInfo, String> {
+    let release = latest_app_release()?;
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let asset = appimage_asset(&release);
+    let latest_version = release.tag_name.clone();
+    let release_url = release.html_url.clone();
+    let update_available = version_is_newer(&latest_version, &current_version);
+    let asset_name = asset.map(|asset| asset.name.clone());
+    let download_size_bytes = asset.map(|asset| asset.size);
+    Ok(AppUpdateInfo {
+        update_available,
+        current_version,
+        latest_version,
+        release_url,
+        asset_name,
+        download_size_bytes,
+        running_appimage: running_appimage_path().is_some(),
+    })
+}
+
+fn release_asset_url(
+    release: &GithubAppRelease,
+    asset: &GithubAppReleaseAsset,
+) -> Result<String, String> {
+    let url = url::Url::parse(&asset.browser_download_url).map_err(|error| error.to_string())?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || url.path()
+            != format!(
+                "/Febsho/KytyPs5-Studio/releases/download/{}/{}",
+                release.tag_name, asset.name
+            )
+        || !asset
+            .browser_download_url
+            .starts_with(APP_RELEASES_DOWNLOAD_PREFIX)
+    {
+        return Err("GitHub returned an unexpected AppImage download URL".into());
+    }
+    Ok(asset.browser_download_url.clone())
+}
+
+fn release_asset_text(
+    asset: &GithubAppReleaseAsset,
+    release: &GithubAppRelease,
+) -> Result<String, String> {
+    let url = release_asset_url(release, asset)?;
+    let request = ureq::get(&url)
+        .header("User-Agent", "KytyPS5-Studio")
+        .header("Accept", "application/octet-stream");
+    let mut response = request
+        .call()
+        .map_err(|error| format!("Could not download release checksums: {error}"))?;
+    response
+        .body_mut()
+        .read_to_string()
+        .map_err(|error| error.to_string())
+}
+
+fn download_and_install_app_update() -> Result<String, String> {
+    let target = running_appimage_path().ok_or(
+        "In-place updates are available only when KytyPS5 Studio is running from an AppImage",
+    )?;
+    let release = latest_app_release()?;
+    let current_version = env!("CARGO_PKG_VERSION");
+    if !version_is_newer(&release.tag_name, current_version) {
+        return Err("KytyPS5 Studio is already up to date".into());
+    }
+    let asset = appimage_asset(&release)
+        .ok_or("This release has no AppImage for the current system architecture")?;
+    if asset.size == 0 || asset.size > MAX_APPIMAGE_SIZE {
+        return Err("The AppImage release asset has an invalid or excessive size".into());
+    }
+    let checksums = release
+        .assets
+        .iter()
+        .find(|candidate| candidate.name == "SHA256SUMS")
+        .ok_or("The release does not include SHA256SUMS; update was not installed")?;
+    let expected_digest = if let Some(digest) = asset
+        .digest
+        .as_deref()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+    {
+        digest.to_ascii_lowercase()
+    } else {
+        release_asset_text(checksums, &release)?
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let digest = fields.next()?;
+                let name = fields.next()?.trim_start_matches('*');
+                (name == asset.name).then(|| digest.to_ascii_lowercase())
+            })
+            .ok_or("SHA256SUMS does not contain the AppImage checksum")?
+    };
+    if expected_digest.len() != 64
+        || !expected_digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err("The release AppImage checksum is malformed".into());
+    }
+    let parent = target.parent().ok_or("AppImage has no parent directory")?;
+    let filename = target
+        .file_name()
+        .ok_or("AppImage has no filename")?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{filename}.{}.download", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    let result = (|| {
+        let url = release_asset_url(&release, asset)?;
+        let request = ureq::get(&url)
+            .header("User-Agent", "KytyPS5-Studio")
+            .header("Accept", "application/octet-stream");
+        let mut response = request
+            .call()
+            .map_err(|error| format!("Could not download AppImage: {error}"))?;
+        let mut reader = response.body_mut().as_reader();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("Could not create temporary update file: {error}"))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 128 * 1024];
+        let mut total = 0_u64;
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(read as u64);
+            if total > MAX_APPIMAGE_SIZE || total > asset.size {
+                return Err("Downloaded AppImage exceeded its declared size".into());
+            }
+            file.write_all(&buffer[..read])
+                .map_err(|error| error.to_string())?;
+            hasher.update(&buffer[..read]);
+        }
+        if total != asset.size {
+            return Err(format!(
+                "Downloaded AppImage size mismatch: expected {}, received {total}",
+                asset.size
+            ));
+        }
+        let mut signature = [0_u8; 4];
+        let mut verify_file = fs::File::open(&temporary).map_err(|error| error.to_string())?;
+        verify_file
+            .read_exact(&mut signature)
+            .map_err(|error| format!("Downloaded asset is not a readable AppImage: {error}"))?;
+        if signature != *b"\x7fELF" {
+            return Err("Downloaded asset is not an ELF AppImage; current app was kept".into());
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        if digest != expected_digest {
+            return Err(
+                "Downloaded AppImage checksum did not match GitHub's release checksum".into(),
+            );
+        }
+        file.sync_all().map_err(|error| error.to_string())?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+        fs::rename(&temporary, &target)
+            .map_err(|error| format!("Verified update could not replace the AppImage: {error}"))?;
+        if let Ok(directory) = fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(format!(
+            "Updated KytyPS5 Studio to {}. Restart the app to use the new version.",
+            release.tag_name
+        ))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[tauri::command]
+fn install_app_update() -> Result<String, String> {
+    download_and_install_app_update()
 }
 fn cached_community_prs(
     conn: &Connection,
@@ -4037,6 +4498,7 @@ fn start_community_build(
                 &build_options,
                 &compiler,
                 "community-build",
+                false,
             ) {
                 Ok(install) => {
                     let connection = db(&app)?;
@@ -4176,7 +4638,7 @@ fn rename_community_build_config(
 }
 #[tauri::command]
 fn discover_forks() -> Result<Vec<GithubRepo>, String> {
-    github_json("https://api.github.com/repos/KytyPS5/KytyPS5/forks?sort=updated&per_page=30")
+    github_json("https://api.github.com/repos/KytyPS5/KytyPS5/forks?per_page=30")
 }
 #[tauri::command]
 fn github_repository_details(
@@ -4264,7 +4726,7 @@ fn system_info(app: tauri::AppHandle) -> Result<SystemInfo, String> {
     for name in ["vulkan", "x11", "wayland-client", "libpulse", "libudev"] {
         dependencies.push(Dependency {
             name: name.into(),
-            present: Command::new("pkg-config")
+            present: host_tool_command("pkg-config")
                 .args(["--exists", name])
                 .status()
                 .map(|status| status.success())
@@ -4349,6 +4811,7 @@ fn drain_job_output<R: Read>(
     kind: &str,
     phase: &str,
     logfile: Option<&Arc<Mutex<BuildLogWriter>>>,
+    capture: Option<&Arc<Mutex<Vec<String>>>>,
 ) {
     let mut reader = CappedOutputReader::new(stream);
     loop {
@@ -4357,6 +4820,13 @@ fn drain_job_output<R: Read>(
                 let line = output.text();
                 if let Some(file) = logfile {
                     let _ = file.lock().unwrap().append_line(label, &line);
+                }
+                if let Some(capture) = capture {
+                    let mut tail = capture.lock().unwrap();
+                    if tail.len() == 30 {
+                        tail.remove(0);
+                    }
+                    tail.push(line.chars().take(2048).collect());
                 }
                 emit(app, kind, phase, line, false, true);
             }
@@ -4413,7 +4883,7 @@ fn execute(
         false,
         true,
     );
-    let mut c = Command::new(program);
+    let mut c = host_tool_command(program);
     c.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(d) = cwd {
         c.current_dir(d);
@@ -4426,12 +4896,22 @@ fn execute(
         let _ = stop_process_group(pid);
     }
     let stderr = child.stderr.take().ok_or("Missing stderr")?;
+    let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+    let error_capture = stderr_tail.clone();
     let a = app.clone();
     let k = kind.to_string();
     let p = phase.to_string();
     let error_log = logfile.clone();
     let stderr_reader = thread::spawn(move || {
-        drain_job_output(stderr, "stderr", &a, &k, &p, error_log.as_ref());
+        drain_job_output(
+            stderr,
+            "stderr",
+            &a,
+            &k,
+            &p,
+            error_log.as_ref(),
+            Some(&error_capture),
+        );
     });
     let stdout = child.stdout.take().ok_or("Missing stdout")?;
     let a = app.clone();
@@ -4439,7 +4919,7 @@ fn execute(
     let p = phase.to_string();
     let output_log = logfile.clone();
     let stdout_reader = thread::spawn(move || {
-        drain_job_output(stdout, "stdout", &a, &k, &p, output_log.as_ref());
+        drain_job_output(stdout, "stdout", &a, &k, &p, output_log.as_ref(), None);
     });
     let waited = wait_for_child_and_cleanup_group(&mut child, || {
         jobs.pid.store(0, Ordering::SeqCst);
@@ -4463,7 +4943,12 @@ fn execute(
         return Err("Job cancelled".into());
     }
     if !status.success() {
-        return Err(format!("{} failed with {}", program, status));
+        let detail = stderr_tail.lock().unwrap().join("\n");
+        return Err(if detail.is_empty() {
+            format!("{} failed with {}", program, status)
+        } else {
+            format!("{} failed with {}: {}", program, status, detail)
+        });
     }
     Ok(())
 }
@@ -4800,7 +5285,7 @@ fn verify_build_dependencies(app: &tauri::AppHandle, job_kind: &str) -> Result<(
     }
     let missing_packages = if command_exists("pkg-config") {
         missing_pkg_config_dependencies(|name| {
-            Command::new("pkg-config")
+            host_tool_command("pkg-config")
                 .args(["--exists", name])
                 .status()
                 .map(|status| status.success())
@@ -4904,6 +5389,7 @@ fn build_and_register(
     options: &BuildOptions,
     compiler: &str,
     job_kind: &str,
+    reuse_repository_build: bool,
 ) -> Result<PathBuf, String> {
     ensure_job_not_cancelled(jobs)?;
     validate_clean_source_checkout(source)?;
@@ -5025,22 +5511,100 @@ fn build_and_register(
     })
     .map_err(|error| error.to_string())?;
     ensure_job_not_cancelled(jobs)?;
-    if !insert_registered_build(
-        &paths.db()?,
-        repository_id,
-        commit,
-        &options.build_type,
-        &install,
-        now(),
-        install_size_bytes,
-        &configuration_json,
-    )? {
-        return Err(
-            "Build output was not registered because its installation path already exists".into(),
-        );
-    }
+    let connection = paths.db()?;
+    let replaced_install = if reuse_repository_build {
+        let existing: Option<(i64, String)> = connection
+            .query_row(
+                "SELECT id,path FROM builds WHERE repo_id=? AND build_type=? AND NOT EXISTS(SELECT 1 FROM community_build_results WHERE community_build_results.build_id=builds.id) ORDER BY active DESC,created_at DESC,id DESC LIMIT 1",
+                params![repository_id, options.build_type],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some((existing_id, existing_path)) = existing {
+            let running: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE build_id=? AND ended_at IS NULL)",
+                    [existing_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if running {
+                return Err(
+                    "Stop the running emulator session before rebuilding this repository.".into(),
+                );
+            }
+            let changed = connection
+                .execute(
+                    "UPDATE builds SET commit_sha=?,path=?,created_at=?,install_size_bytes=?,validation_status='verified',configuration_json=?,removed_at=NULL WHERE id=?",
+                    params![commit, install.display().to_string(), now(), install_size_bytes.map(|size| size.min(i64::MAX as u64) as i64), configuration_json, existing_id],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("Existing emulator build changed while it was being rebuilt.".into());
+            }
+            Some(PathBuf::from(existing_path))
+        } else {
+            if !insert_registered_build(
+                &connection,
+                repository_id,
+                commit,
+                &options.build_type,
+                &install,
+                now(),
+                install_size_bytes,
+                &configuration_json,
+            )? {
+                return Err(
+                    "Build output was not registered because its installation path already exists"
+                        .into(),
+                );
+            }
+            None
+        }
+    } else {
+        if !insert_registered_build(
+            &connection,
+            repository_id,
+            commit,
+            &options.build_type,
+            &install,
+            now(),
+            install_size_bytes,
+            &configuration_json,
+        )? {
+            return Err(
+                "Build output was not registered because its installation path already exists"
+                    .into(),
+            );
+        }
+        None
+    };
     install_guard.keep = true;
+    if let Some(previous) = replaced_install {
+        remove_replaced_install(&previous, &install, &paths.data.join("builds"));
+    }
     Ok(install)
+}
+fn remove_replaced_install(previous: &Path, replacement: &Path, managed_root: &Path) {
+    if previous == replacement || !previous.exists() {
+        return;
+    }
+    let Ok(root) = fs::canonicalize(managed_root) else {
+        return;
+    };
+    let Ok(metadata) = fs::symlink_metadata(previous) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return;
+    }
+    let Ok(canonical) = fs::canonicalize(previous) else {
+        return;
+    };
+    if canonical != root && canonical.starts_with(&root) && canonical != replacement {
+        let _ = fs::remove_dir_all(canonical);
+    }
 }
 fn directory_size_bytes(path: &Path) -> Option<u64> {
     let mut total = 0u64;
@@ -5088,7 +5652,7 @@ fn start_build(
     let job_id = begin_job(&jobs, "Another job is running", true, "build")?;
     thread::spawn(move || {
         let result = build_and_register(
-            &app, &jobs, id, &source, &commit, &options, &compiler, "build",
+            &app, &jobs, id, &source, &commit, &options, &compiler, "build", true,
         )
         .and_then(|path| {
             mark_repository_build_commit(&app, id, &commit, &branch)?;
@@ -5109,6 +5673,7 @@ fn start_update_build(
     jobs: tauri::State<'_, Arc<Jobs>>,
     id: i64,
     options: BuildOptions,
+    activate_after_build: Option<bool>,
 ) -> Result<u64, String> {
     let compiler = validate_build_options(&options)?;
     let c = db(&app)?;
@@ -5117,6 +5682,7 @@ fn start_update_build(
         return Err("No verified build adapter for this checkout".into());
     }
     let source = PathBuf::from(repository.source_path.ok_or("Clone the repository first")?);
+    let activate_after_build = activate_after_build.unwrap_or(false);
     let jobs = jobs.inner().clone();
     let job_id = begin_job(&jobs, "Another job is running", true, "build")?;
     thread::spawn(move || {
@@ -5185,20 +5751,49 @@ fn start_update_build(
             if let Some(path) = existing {
                 if verify_emulator(&Path::new(&path).join("kyty_emulator")).is_ok() {
                     mark_repository_build_commit(&app, id, &commit, &branch)?;
+                    if activate_after_build {
+                        let existing_id: i64 = conn
+                            .query_row("SELECT id FROM builds WHERE path=?", [&path], |row| {
+                                row.get(0)
+                            })
+                            .map_err(|error| error.to_string())?;
+                        activate_build(app.clone(), existing_id)?;
+                    }
                     return Ok(format!(
-                        "Commit {} is already installed and verified; no rebuild was needed",
-                        &commit[..12]
+                        "Commit {} is already installed and verified; no rebuild was needed{}",
+                        &commit[..12],
+                        if activate_after_build {
+                            " and it is now active"
+                        } else {
+                            ""
+                        }
                     ));
                 }
             }
             let path = build_and_register(
-                &app, &jobs, id, &source, &commit, &options, &compiler, "build",
+                &app, &jobs, id, &source, &commit, &options, &compiler, "build", true,
             )?;
             mark_repository_build_commit(&app, id, &commit, &branch)?;
-            Ok(format!(
-                "Update build verified at {}. The active build was left unchanged.",
-                path.display()
-            ))
+            if activate_after_build {
+                let connection = db(&app)?;
+                let build_id: i64 = connection
+                    .query_row(
+                        "SELECT id FROM builds WHERE path=?",
+                        [path.display().to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                activate_build(app.clone(), build_id)?;
+                Ok(format!(
+                    "Update build verified and activated at {}",
+                    path.display()
+                ))
+            } else {
+                Ok(format!(
+                    "Update build verified at {}. The active build was left unchanged.",
+                    path.display()
+                ))
+            }
         })();
         finish_job(&app, &jobs, "build", result);
     });
@@ -5264,28 +5859,104 @@ fn remove_build(app: tauri::AppHandle, id: i64) -> Result<(), String> {
     let root = state_paths(&app)?.data.join("builds");
     remove_managed_build(&mut c, id, &root)
 }
+fn retire_missing_build(c: &mut Connection, id: i64) -> Result<(), String> {
+    let (active, path): (i64, String) = c
+        .query_row(
+            "SELECT active,path FROM builds WHERE id=? AND removed_at IS NULL",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| "Emulator build was not found".to_string())?;
+    if Path::new(&path).is_dir() {
+        return Err("Build installation still exists".into());
+    }
+    let running_session: bool = c
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE build_id=? AND ended_at IS NULL)",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if running_session {
+        return Ok(());
+    }
+    let replacement: Option<i64> = if active != 0 {
+        let mut statement = c.prepare(
+            "SELECT id,path FROM builds WHERE id<>? AND removed_at IS NULL AND validation_status='verified' ORDER BY created_at DESC,id DESC",
+        ).map_err(|error| error.to_string())?;
+        let candidates = statement
+            .query_map([id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        candidates
+            .into_iter()
+            .find(|(_, candidate)| Path::new(candidate).join("kyty_emulator").is_file())
+            .map(|(candidate, _)| candidate)
+    } else {
+        None
+    };
+    let tx = c.transaction().map_err(|error| error.to_string())?;
+    if active != 0 {
+        tx.execute("UPDATE builds SET active=0 WHERE active=1", [])
+            .map_err(|error| error.to_string())?;
+        if let Some(replacement) = replacement {
+            tx.execute(
+                "UPDATE builds SET active=1 WHERE id=? AND removed_at IS NULL",
+                [replacement],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    tx.execute("UPDATE games SET build_id=NULL WHERE build_id=?", [id])
+        .map_err(|error| error.to_string())?;
+    tx.execute(
+        "UPDATE builds SET active=0,removed_at=? WHERE id=? AND removed_at IS NULL",
+        params![now(), id],
+    )
+    .map_err(|error| error.to_string())?;
+    tx.commit().map_err(|error| error.to_string())
+}
 fn remove_managed_build(c: &mut Connection, id: i64, managed_root: &Path) -> Result<(), String> {
     let (path, active): (String, i64) = c
         .query_row("SELECT path,active FROM builds WHERE id=?", [id], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })
         .map_err(|_| "Emulator build was not found".to_string())?;
-    if active != 0 {
-        return Err("The active emulator build cannot be removed".into());
-    }
-    for (table, column) in [
-        ("games", "build_id"),
-        ("sessions", "build_id"),
-        ("community_build_results", "build_id"),
-        ("manual_compatibility_observations", "build_id"),
-    ] {
-        let sql = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column}=?)");
-        let referenced: bool = c
-            .query_row(&sql, [id], |row| row.get(0))
+    let replacement: Option<i64> = if active != 0 {
+        let mut statement = c
+            .prepare(
+                "SELECT id,path FROM builds WHERE id<>? AND removed_at IS NULL AND validation_status='verified' ORDER BY created_at DESC,id DESC",
+            )
             .map_err(|e| e.to_string())?;
-        if referenced {
-            return Err(format!("This build is still referenced by {table}; keep it to preserve game assignments and history"));
-        }
+        let candidates = statement
+            .query_map([id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        candidates
+            .into_iter()
+            .find(|(_, path)| Path::new(path).join("kyty_emulator").is_file())
+            .map(|(candidate, _)| candidate)
+    } else {
+        None
+    };
+    let running_session: bool = c
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE build_id=? AND ended_at IS NULL)",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if running_session {
+        return Err("This build has a running emulator session".into());
+    }
+    if !Path::new(&path).exists() {
+        return retire_missing_build(c, id);
     }
     let root = fs::canonicalize(managed_root)
         .map_err(|_| "Managed emulator build directory is unavailable".to_string())?;
@@ -5308,8 +5979,25 @@ fn remove_managed_build(c: &mut Connection, id: i64, managed_root: &Path) -> Res
         .map_err(|e| format!("Could not safely stage build removal: {e}"))?;
     let result = (|| {
         let tx = c.transaction().map_err(|e| e.to_string())?;
+        if let Some(replacement) = replacement {
+            tx.execute("UPDATE builds SET active=0 WHERE active=1", [])
+                .map_err(|e| e.to_string())?;
+            tx.execute(
+                "UPDATE builds SET active=1 WHERE id=? AND removed_at IS NULL",
+                [replacement],
+            )
+            .map_err(|e| e.to_string())?;
+        } else if active != 0 {
+            tx.execute("UPDATE builds SET active=0 WHERE id=?", [id])
+                .map_err(|e| e.to_string())?;
+        }
+        tx.execute("UPDATE games SET build_id=NULL WHERE build_id=?", [id])
+            .map_err(|e| e.to_string())?;
         let changed = tx
-            .execute("DELETE FROM builds WHERE id=? AND active=0", [id])
+            .execute(
+                "UPDATE builds SET active=0,removed_at=? WHERE id=? AND removed_at IS NULL",
+                params![now(), id],
+            )
             .map_err(|e| e.to_string())?;
         if changed != 1 {
             return Err("Build changed while removal was being prepared".to_string());
@@ -5767,7 +6455,24 @@ fn is_elf_file(path: &Path) -> bool {
         return false;
     };
     let mut magic = [0u8; 4];
-    file.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF"
+    if file.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    if magic == *b"\x7fELF" {
+        return true;
+    }
+    let known_self_magic = magic == [0x4f, 0x15, 0x3d, 0x1d] || magic == [0x54, 0x14, 0xf5, 0xee];
+    if !known_self_magic {
+        return false;
+    }
+    let mut rest = [0u8; 24];
+    if file.read_exact(&mut rest).is_err() {
+        return false;
+    }
+    let ident_tail = &rest[..8];
+    let unknown = u16::from_le_bytes([rest[22], rest[23]]);
+    (ident_tail == [0x00, 0x01, 0x01, 0x12, 0x01, 0x01, 0x00, 0x00] && unknown == 0x22)
+        || (ident_tail == [0x10, 0x01, 0x01, 0x12, 0x01, 0x01, 0x00, 0x10] && unknown == 0x32)
 }
 fn game_metadata(path: &Path) -> (String, Option<String>, Option<String>, Option<String>) {
     let root = if path.is_dir() {
@@ -5826,10 +6531,10 @@ async fn read_game_icon(app: tauri::AppHandle, game_id: i64) -> Result<Option<Ve
         Ok(read_game_thumbnail(
             Path::new(&icon),
             &root,
-            4 * 1024 * 1024,
-            512,
-            512,
-            2 * 1024 * 1024,
+            16 * 1024 * 1024,
+            1024,
+            1024,
+            8 * 1024 * 1024,
         ))
     })
     .await
@@ -6195,6 +6900,438 @@ fn get_profile(app: tauri::AppHandle, game_id: i64) -> Result<Profile, String> {
     game(&c, game_id)?;
     profile(&c, game_id)
 }
+#[tauri::command]
+fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_json::Value, String> {
+    let c = db(&app)?;
+    let selected = game(&c, game_id)?;
+    let selected_build = build_for_game(&c, game_id).ok();
+    let game_options = profile(&c, game_id)?.options;
+    let global_options = global_profile_options(&c)?;
+    let user_id = game_options
+        .get("--user-id")
+        .or_else(|| global_options.get("--user-id"))
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1000);
+    let selected_path = fs::canonicalize(&selected.path).map_err(|e| e.to_string())?;
+    let root = if selected_path.is_dir() {
+        selected_path
+    } else {
+        selected_path
+            .parent()
+            .ok_or("Game path has no containing directory")?
+            .to_path_buf()
+    };
+    let mut trophies = Vec::new();
+    for trophy_dir in [root.join("sce_sys/trophy2"), root.join("sce_sys/trophy")] {
+        if let Ok(entries) = fs::read_dir(&trophy_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .is_none_or(|x| !x.eq_ignore_ascii_case("ucp"))
+                {
+                    continue;
+                }
+                let bytes = match fs::read(&path) {
+                    Ok(b) if b.len() >= 64 && b.len() <= 256 * 1024 * 1024 => b,
+                    _ => continue,
+                };
+                let be32 = |o: usize| -> Option<u32> {
+                    Some(u32::from_be_bytes(bytes.get(o..o + 4)?.try_into().ok()?))
+                };
+                let be64 = |o: usize| -> Option<u64> {
+                    Some(u64::from_be_bytes(bytes.get(o..o + 8)?.try_into().ok()?))
+                };
+                if be32(0) != Some(0xb228c60a) || be32(4) != Some(1) {
+                    continue;
+                }
+                let (Some(count), Some(toc)) = (be32(16), be32(20)) else {
+                    continue;
+                };
+                if count > 4096 {
+                    continue;
+                }
+                let mut conf = None;
+                let mut metadata_by_language = BTreeMap::new();
+                for i in 0..count as usize {
+                    let Some(base) = (toc as usize)
+                        .checked_add(32)
+                        .and_then(|x| x.checked_add(i * 64))
+                    else {
+                        break;
+                    };
+                    let Some(name_bytes) = bytes.get(base..base + 32) else {
+                        break;
+                    };
+                    let name = String::from_utf8_lossy(
+                        &name_bytes[..name_bytes.iter().position(|b| *b == 0).unwrap_or(32)],
+                    )
+                    .to_ascii_lowercase();
+                    let (Some(off), Some(size)) = (be64(base + 32), be64(base + 40)) else {
+                        continue;
+                    };
+                    let (Ok(off), Ok(size)) = (usize::try_from(off), usize::try_from(size)) else {
+                        continue;
+                    };
+                    let Some(data) = off.checked_add(size).and_then(|end| bytes.get(off..end))
+                    else {
+                        continue;
+                    };
+                    if name == "tropconf.json" {
+                        conf = serde_json::from_slice::<serde_json::Value>(data).ok();
+                    } else if name.starts_with("tropmeta_") && name.ends_with(".json") {
+                        let language = name
+                            .strip_prefix("tropmeta_")
+                            .and_then(|name| name.strip_suffix(".json"))
+                            .unwrap_or("unknown")
+                            .to_owned();
+                        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(data) {
+                            metadata_by_language.insert(language, value);
+                        }
+                    }
+                }
+                let Some(conf) = conf else {
+                    continue;
+                };
+                let default_language = conf
+                    .get("defaultLanguage")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let metadata = metadata_by_language
+                    .get("en-us")
+                    .or_else(|| metadata_by_language.get("en-gb"))
+                    .or_else(|| metadata_by_language.get("en"))
+                    .or_else(|| metadata_by_language.get(&default_language))
+                    .or_else(|| metadata_by_language.values().next());
+                let trophy_id = |value: &serde_json::Value| {
+                    let text = value
+                        .as_str()
+                        .map(str::to_owned)
+                        .or_else(|| value.as_number().map(ToString::to_string))?;
+                    Some(
+                        text.parse::<u32>()
+                            .map(|id| format!("{id:04}"))
+                            .unwrap_or(text),
+                    )
+                };
+                let text_map: HashMap<String, serde_json::Value> = metadata
+                    .and_then(|value| value.get("metadata"))
+                    .and_then(|m| m.get("trophyMetadata"))
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| {
+                        let id = trophy_id(item.get("id")?)?;
+                        Some((id, item.clone()))
+                    })
+                    .collect();
+                for def in conf
+                    .get("trophies")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    let id = def.get("id").and_then(trophy_id).unwrap_or_default();
+                    if id.is_empty() {
+                        continue;
+                    }
+                    let text = text_map.get(&id);
+                    trophies.push(serde_json::json!({"id":id,"grade":def.get("grade"),"hidden":def.get("hidden").and_then(|v|v.as_bool()).unwrap_or(false),"name":text.and_then(|v|v.get("name")).and_then(|v|v.as_str()).unwrap_or(""),"detail":text.and_then(|v|v.get("detail")).and_then(|v|v.as_str()).unwrap_or(""),"unlocked":null}));
+                }
+            }
+        }
+    }
+    let mut unlock_data_available = false;
+    if let (Some(title_id), Some(build)) = (selected.title_id.as_deref(), selected_build) {
+        let unlock_dir = Path::new(&build.path).join("_Trophies").join(title_id);
+        if let Ok(entries) = fs::read_dir(unlock_dir) {
+            let mut unlocked = HashSet::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !filename.starts_with(&format!("trophies_{user_id}_"))
+                    || path.extension().is_none_or(|ext| ext != "json")
+                {
+                    continue;
+                }
+                let Ok(bytes) = fs::read(&path) else { continue };
+                let Ok(state) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                    continue;
+                };
+                let Some(ids) = state
+                    .get("unlockedTrophies")
+                    .and_then(|value| value.as_array())
+                else {
+                    continue;
+                };
+                unlock_data_available = true;
+                for id in ids.iter().filter_map(|value| value.as_u64()) {
+                    unlocked.insert(id);
+                }
+            }
+            if unlock_data_available {
+                for trophy in &mut trophies {
+                    let id = trophy
+                        .get("id")
+                        .and_then(|value| value.as_str())
+                        .and_then(|value| value.parse::<u64>().ok());
+                    if let Some(id) = id {
+                        trophy["unlocked"] = serde_json::json!(unlocked.contains(&id));
+                    }
+                }
+            }
+        }
+    }
+    let options = game_options;
+    let patch_path = options
+        .get("--game-patch")
+        .or_else(|| global_options.get("--game-patch"))
+        .filter(|s| !s.is_empty());
+    let mut cheats = Vec::new();
+    let mut cheat_error = None;
+    if let Some(path) = patch_path {
+        match fs::metadata(path)
+            .ok()
+            .filter(|m| m.is_file() && m.len() <= 8 * 1024 * 1024)
+            .and_then(|_| fs::read(path).ok())
+            .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+        {
+            Some(doc) => {
+                let mods = doc.get("mods").and_then(|v| v.as_array());
+                if mods.is_none() {
+                    cheat_error = Some("The configured patch is valid JSON but does not contain a GoldHEN-style mods list.");
+                }
+                for m in mods.into_iter().flatten() {
+                    cheats.push(serde_json::json!({"name":m.get("name").and_then(|v|v.as_str()).unwrap_or("Unnamed mod"),"enabled":m.get("enabled").and_then(|v|v.as_bool()).unwrap_or(true),"title_id":doc.get("id"),"version":doc.get("version")}));
+                }
+            }
+            None => {
+                cheat_error =
+                    Some("The configured game patch could not be parsed as GoldHEN-style JSON.")
+            }
+        }
+    }
+    Ok(
+        serde_json::json!({"trophies":trophies,"trophy_unlock_state":if unlock_data_available {"available"} else {"unavailable"},"cheats":cheats,"cheat_source":patch_path,"cheat_error":cheat_error}),
+    )
+}
+const PS5_CHEAT_INDEX: &str =
+    "https://raw.githubusercontent.com/TeeKay87/HEN-Cheats-Collection/master/cheats/json.txt";
+const PS5_CHEAT_FILE_BASE: &str =
+    "https://raw.githubusercontent.com/TeeKay87/HEN-Cheats-Collection/master/cheats/json/";
+fn read_remote_text(url: &str, max_bytes: usize) -> Result<String, String> {
+    let mut response = ureq::get(url)
+        .header("User-Agent", "KytyPS5-Studio")
+        .call()
+        .map_err(|error| format!("Cheat repository request failed: {error}"))?;
+    let mut body = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| format!("Could not read cheat repository response: {error}"))?;
+    if body.len() > max_bytes {
+        return Err("Cheat repository response exceeded the size limit".into());
+    }
+    String::from_utf8(body)
+        .map_err(|error| format!("Cheat repository returned invalid UTF-8: {error}"))
+}
+fn valid_cheat_filename(filename: &str) -> bool {
+    filename.ends_with(".json")
+        && filename.len() <= 180
+        && filename
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+fn remote_cheat_entry(
+    filename: &str,
+    title: &str,
+    title_id: &str,
+) -> Result<serde_json::Value, String> {
+    let source = read_remote_text(&format!("{PS5_CHEAT_FILE_BASE}{filename}"), 8 * 1024 * 1024)?;
+    let document: serde_json::Value = serde_json::from_str(&source)
+        .map_err(|error| format!("Cheat file {filename} is invalid JSON: {error}"))?;
+    if document.get("id").and_then(|value| value.as_str()) != Some(title_id) {
+        return Err(format!(
+            "Cheat file {filename} does not match game ID {title_id}"
+        ));
+    }
+    let mods = document
+        .get("mods")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| format!("Cheat file {filename} has no supported mods list"))?;
+    let version = document
+        .get("version")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let items = mods
+        .iter()
+        .filter_map(|item| {
+            Some(serde_json::json!({
+                "name": item.get("name")?.as_str()?,
+                "type": item.get("type").and_then(|value| value.as_str()).unwrap_or("unknown")
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "filename": filename,
+        "title": document.get("name").and_then(|value| value.as_str()).unwrap_or(title),
+        "version": version,
+        "mods": items,
+        "source": format!("https://github.com/TeeKay87/HEN-Cheats-Collection/blob/master/cheats/json/{filename}")
+    }))
+}
+#[tauri::command]
+fn fetch_game_cheats(
+    app: tauri::AppHandle,
+    game_id: i64,
+) -> Result<Vec<serde_json::Value>, String> {
+    let connection = db(&app)?;
+    let selected = game(&connection, game_id)?;
+    let Some(title_id) = selected.title_id.as_deref() else {
+        return Ok(Vec::new());
+    };
+    if title_id.is_empty()
+        || !title_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err("Game title ID is not valid for cheat lookup".into());
+    }
+    let index = read_remote_text(PS5_CHEAT_INDEX, 4 * 1024 * 1024)?;
+    let mut filenames = index
+        .lines()
+        .filter_map(|line| {
+            line.split_once('=')
+                .map(|(filename, title)| (filename, title))
+        })
+        .filter(|(filename, _)| {
+            valid_cheat_filename(filename) && filename.split('_').next() == Some(title_id)
+        })
+        .map(|(filename, title)| (filename.to_owned(), title.to_owned()))
+        .take(40)
+        .collect::<Vec<_>>();
+    filenames.sort_by_key(|(filename, _)| {
+        let version = filename.split('_').nth(1).unwrap_or("");
+        (
+            version != selected.game_version.as_deref().unwrap_or(""),
+            version.to_owned(),
+        )
+    });
+    filenames
+        .iter()
+        .map(|(filename, title)| remote_cheat_entry(filename, title, title_id))
+        .collect()
+}
+#[tauri::command]
+fn download_game_cheat(
+    app: tauri::AppHandle,
+    game_id: i64,
+    filename: String,
+) -> Result<String, String> {
+    if !valid_cheat_filename(&filename) {
+        return Err("Cheat filename is not valid".into());
+    }
+    let connection = db(&app)?;
+    let selected = game(&connection, game_id)?;
+    let title_id = selected.title_id.as_deref().ok_or("Game has no title ID")?;
+    if !filename.starts_with(&format!("{title_id}_")) {
+        return Err("Cheat file does not belong to this game".into());
+    }
+    let source = read_remote_text(&format!("{PS5_CHEAT_FILE_BASE}{filename}"), 8 * 1024 * 1024)?;
+    let document: serde_json::Value = serde_json::from_str(&source)
+        .map_err(|error| format!("Cheat file is invalid JSON: {error}"))?;
+    if document.get("id").and_then(|value| value.as_str()) != Some(title_id)
+        || document
+            .get("mods")
+            .and_then(|value| value.as_array())
+            .is_none()
+    {
+        return Err("Downloaded cheat file failed game ID or format validation".into());
+    }
+    let directory = state_paths(&app)?.data.join("cheats").join(title_id);
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let destination = directory.join(&filename);
+    fs::write(&destination, source.as_bytes()).map_err(|error| error.to_string())?;
+    Ok(destination.display().to_string())
+}
+
+fn store_custom_game_patch(
+    app: &tauri::AppHandle,
+    game_id: i64,
+    content: &[u8],
+) -> Result<String, String> {
+    const MAX_CUSTOM_PATCH_BYTES: usize = 8 * 1024 * 1024;
+    if content.is_empty() || content.len() > MAX_CUSTOM_PATCH_BYTES {
+        return Err("Patch file must be between 1 byte and 8 MiB".into());
+    }
+    let conn = db(app)?;
+    let selected = game(&conn, game_id)?;
+    let title_id = selected
+        .title_id
+        .as_deref()
+        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        .ok_or("This game needs a recognized title ID before a patch can be added")?;
+    let document: serde_json::Value = serde_json::from_slice(content)
+        .map_err(|error| format!("Patch is not valid JSON: {error}"))?;
+    if document.get("id").and_then(|value| value.as_str()) != Some(title_id) {
+        return Err(format!("Patch title ID must match this game ({title_id})"));
+    }
+    let mods = document
+        .get("mods")
+        .and_then(|value| value.as_array())
+        .filter(|mods| !mods.is_empty())
+        .ok_or("Patch must contain a non-empty GoldHEN-style mods array")?;
+    if mods.iter().any(|item| {
+        !item.is_object()
+            || item.get("name").and_then(|value| value.as_str()).is_none()
+            || item.get("enabled").is_some_and(|value| !value.is_boolean())
+    }) {
+        return Err(
+            "Each patch mod must be an object with a name and an optional boolean enabled field"
+                .into(),
+        );
+    }
+    let directory = state_paths(app)?.data.join("cheats").join(title_id);
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let destination = directory.join(format!("custom-{}-{}.json", now(), std::process::id()));
+    fs::write(&destination, content).map_err(|error| error.to_string())?;
+    Ok(destination.display().to_string())
+}
+
+#[tauri::command]
+fn import_game_patch(app: tauri::AppHandle, game_id: i64, path: String) -> Result<String, String> {
+    let source =
+        fs::canonicalize(path).map_err(|error| format!("Could not open patch file: {error}"))?;
+    if source
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_none_or(|ext| !ext.eq_ignore_ascii_case("json"))
+    {
+        return Err("Only GoldHEN-style JSON patch files can be imported".into());
+    }
+    let metadata = fs::metadata(&source).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.len() > 8 * 1024 * 1024 {
+        return Err("Patch file must be a regular file no larger than 8 MiB".into());
+    }
+    let content = fs::read(source).map_err(|error| error.to_string())?;
+    store_custom_game_patch(&app, game_id, &content)
+}
+
+#[tauri::command]
+fn save_custom_game_patch(
+    app: tauri::AppHandle,
+    game_id: i64,
+    content: String,
+) -> Result<String, String> {
+    store_custom_game_patch(&app, game_id, content.as_bytes())
+}
+
 #[tauri::command]
 fn get_profile_capabilities(
     app: tauri::AppHandle,
@@ -6790,7 +7927,7 @@ fn stop_game_session(app: tauri::AppHandle, session_id: i64) -> Result<String, S
 #[tauri::command]
 fn recent_sessions(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, String> {
     let c = db(&app)?;
-    let mut s=c.prepare("SELECT sessions.id,sessions.game_id,sessions.build_id,games.title,sessions.started_at,sessions.ended_at,sessions.exit_code,sessions.outcome,sessions.log_path,builds.commit_sha,builds.build_type,sessions.process_pid FROM sessions JOIN games ON games.id=sessions.game_id JOIN builds ON builds.id=sessions.build_id ORDER BY sessions.id DESC LIMIT 30").map_err(|e|e.to_string())?;
+    let mut s=c.prepare("SELECT sessions.id,sessions.game_id,sessions.build_id,games.title,sessions.started_at,sessions.ended_at,sessions.exit_code,sessions.outcome,sessions.log_path,builds.commit_sha,builds.build_type,sessions.process_pid FROM sessions JOIN games ON games.id=sessions.game_id JOIN builds ON builds.id=sessions.build_id ORDER BY sessions.id DESC LIMIT 10").map_err(|e|e.to_string())?;
     let rows=s.query_map([],|r|Ok(serde_json::json!({"id":r.get::<_,i64>(0)?,"game_id":r.get::<_,i64>(1)?,"build_id":r.get::<_,i64>(2)?,"title":r.get::<_,String>(3)?,"started_at":r.get::<_,i64>(4)?,"ended_at":r.get::<_,Option<i64>>(5)?,"exit_code":r.get::<_,Option<i32>>(6)?,"outcome":r.get::<_,Option<String>>(7)?,"log_path":r.get::<_,String>(8)?,"commit_sha":r.get::<_,String>(9)?,"build_type":r.get::<_,String>(10)?,"pid":r.get::<_,Option<i64>>(11)?}))).map_err(|e|e.to_string())?;
     let result = rows.map(|r| r.map_err(|e| e.to_string())).collect();
     result
@@ -6902,9 +8039,127 @@ fn read_build_log(app: tauri::AppHandle, id: i64) -> Result<String, String> {
     }
     read_bounded_tail(&path, 4 * 1024 * 1024)
 }
+
+#[derive(Debug)]
+struct DiscordSession {
+    title: String,
+    started_at: i64,
+}
+
+fn discord_current_state(app: &tauri::AppHandle) -> Result<(bool, Option<DiscordSession>), String> {
+    let conn = db(app)?;
+    let enabled = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key='discord_presence_enabled'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .map(|value| value.as_deref() != Some("false"))
+        .map_err(|e| e.to_string())?;
+    let active = conn
+        .query_row(
+            "SELECT g.title,s.started_at FROM sessions s JOIN games g ON g.id=s.game_id WHERE s.ended_at IS NULL ORDER BY s.started_at DESC,s.id DESC LIMIT 1",
+            [],
+            |r| Ok(DiscordSession { title: r.get(0)?, started_at: r.get(1)? }),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok((enabled, active))
+}
+
+fn discord_ipc_candidates() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = env::var_os("XDG_RUNTIME_DIR") {
+        dirs.push(PathBuf::from(dir));
+    }
+    dirs.push(PathBuf::from("/tmp"));
+    dirs.into_iter()
+        .flat_map(|dir| (0..10).map(move |i| dir.join(format!("discord-ipc-{i}"))))
+        .collect()
+}
+
+fn discord_write_frame(stream: &mut UnixStream, op: u32, payload: &[u8]) -> std::io::Result<()> {
+    stream.write_all(&(op as u32).to_le_bytes())?;
+    stream.write_all(&(payload.len() as u32).to_le_bytes())?;
+    stream.write_all(payload)
+}
+
+fn connect_discord(client_id: &str) -> Option<UnixStream> {
+    let mut stream = discord_ipc_candidates()
+        .into_iter()
+        .find_map(|path| UnixStream::connect(path).ok())?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    let handshake = serde_json::json!({"v": 1, "client_id": client_id});
+    discord_write_frame(&mut stream, 0, handshake.to_string().as_bytes()).ok()?;
+    let mut header = [0u8; 8];
+    stream.read_exact(&mut header).ok()?;
+    let length = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
+    if length > 64 * 1024 {
+        return None;
+    }
+    let mut response = vec![0u8; length];
+    stream.read_exact(&mut response).ok()?;
+    let message: serde_json::Value = serde_json::from_slice(&response).ok()?;
+    (message.get("evt").and_then(|v| v.as_str()) == Some("READY")).then_some(stream)
+}
+
+fn discord_activity(session: Option<&DiscordSession>) -> serde_json::Value {
+    let mut activity = serde_json::json!({"name": "KytyPS5 Studio", "type": 0});
+    if let Some(session) = session {
+        let title: String = session.title.chars().take(120).collect();
+        activity["name"] = serde_json::json!(title);
+        activity["details"] = serde_json::json!("Playing with KytyPS5 Studio");
+        activity["state"] = serde_json::json!("KytyPS5 Studio");
+        activity["timestamps"] =
+            serde_json::json!({"start": session.started_at.saturating_mul(1000)});
+    } else {
+        activity["details"] = serde_json::json!("Browsing KytyPS5 Studio");
+        activity["state"] = serde_json::json!("No game running");
+    }
+    activity
+}
+
+fn start_discord_presence(app: tauri::AppHandle) {
+    thread::spawn(move || {
+        let mut stream: Option<UnixStream> = None;
+        let mut nonce = 0u64;
+        loop {
+            let (enabled, session) = discord_current_state(&app).unwrap_or_default();
+            if !enabled {
+                stream = None;
+                thread::sleep(Duration::from_secs(5));
+                continue;
+            }
+            if stream.is_none() {
+                stream = connect_discord("1561813805229674627");
+            }
+            if let Some(connection) = stream.as_mut() {
+                nonce = nonce.wrapping_add(1);
+                let payload = serde_json::json!({
+                    "cmd": "SET_ACTIVITY",
+                    "args": {"pid": std::process::id(), "activity": discord_activity(session.as_ref())},
+                    "nonce": nonce.to_string()
+                });
+                if discord_write_frame(connection, 1, payload.to_string().as_bytes()).is_err() {
+                    stream = None;
+                }
+            }
+            thread::sleep(Duration::from_secs(15));
+        }
+    });
+}
+
 #[tauri::command]
 fn get_setting(app: tauri::AppHandle, key: String) -> Result<Option<String>, String> {
-    if !["update_interval", "auto_update_mode", "theme"].contains(&key.as_str()) {
+    if ![
+        "update_interval",
+        "auto_update_mode",
+        "theme",
+        "discord_presence_enabled",
+    ]
+    .contains(&key.as_str())
+    {
         return Err("Unsupported setting".into());
     }
     db(&app)?
@@ -6916,7 +8171,14 @@ fn get_setting(app: tauri::AppHandle, key: String) -> Result<Option<String>, Str
 }
 #[tauri::command]
 fn set_setting(app: tauri::AppHandle, key: String, value: String) -> Result<(), String> {
-    if !["update_interval", "auto_update_mode", "theme"].contains(&key.as_str()) {
+    if ![
+        "update_interval",
+        "auto_update_mode",
+        "theme",
+        "discord_presence_enabled",
+    ]
+    .contains(&key.as_str())
+    {
         return Err("Unsupported setting".into());
     }
     if key == "update_interval" && !valid_update_interval(&value) {
@@ -6924,6 +8186,9 @@ fn set_setting(app: tauri::AppHandle, key: String, value: String) -> Result<(), 
     }
     if key == "auto_update_mode" && !valid_auto_update_mode(&value) {
         return Err("Update behavior must be notify or build".into());
+    }
+    if key == "discord_presence_enabled" && !["true", "false"].contains(&value.as_str()) {
+        return Err("Discord presence must be enabled or disabled".into());
     }
     db(&app)?.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value]).map_err(|e|e.to_string())?;
     Ok(())
@@ -6988,6 +8253,10 @@ pub fn run() {
     p.db().expect("Cannot initialize database");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            start_discord_presence(app.handle().clone());
+            Ok(())
+        })
         .manage(p)
         .manage(Arc::new(Jobs {
             pid: AtomicI32::new(0),
@@ -7000,6 +8269,8 @@ pub fn run() {
         }))
         .manage(ProcessSamples::default())
         .invoke_handler(tauri::generate_handler![
+            check_app_update,
+            install_app_update,
             list_repos,
             open_repository_folder,
             list_builds,
@@ -7038,6 +8309,7 @@ pub fn run() {
             activate_build,
             remove_build,
             add_game,
+            remove_repository,
             refresh_game_metadata,
             open_game_folder,
             read_game_icon,
@@ -7046,6 +8318,11 @@ pub fn run() {
             set_game_build,
             toggle_favorite,
             get_profile,
+            inspect_game_content,
+            fetch_game_cheats,
+            download_game_cheat,
+            import_game_patch,
+            save_custom_game_patch,
             get_profile_capabilities,
             set_profile,
             get_global_profile_options,
@@ -7806,7 +9083,7 @@ mod tests {
             ),
             ("KytyPS5", "/build", "Existing Game", "dark")
         );
-        assert_eq!(version, 15);
+        assert_eq!(version, 17);
         assert_eq!(hidden_default, 0);
         assert_eq!(compatibility_table, 1);
         assert_eq!(columns, 4);
@@ -7855,7 +9132,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(row, (2560, 1440, "Mailbox".into(), 1, 0));
-        assert_eq!(version, 15);
+        assert_eq!(version, 17);
     }
     #[test]
     fn migration_removes_only_the_legacy_sqlite_github_token() {
@@ -8309,52 +9586,92 @@ mod tests {
         assert_eq!(hidden, 0);
     }
     #[test]
-    fn managed_build_removal_protects_active_and_referenced_builds() {
+    fn managed_build_removal_preserves_history_and_protects_game_assignments() {
         let dir = std::env::temp_dir().join(format!("kyty-build-remove-{}", now()));
         let root = dir.join("builds");
         let install = root.join("commit-release");
+        let replacement_install = root.join("replacement-release");
         fs::create_dir_all(&install).unwrap();
         fs::write(install.join("kyty_emulator"), b"emulator").unwrap();
+        fs::create_dir_all(&replacement_install).unwrap();
+        fs::write(replacement_install.join("kyty_emulator"), b"emulator").unwrap();
         let mut db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE builds(id INTEGER PRIMARY KEY,path TEXT,active INTEGER); CREATE TABLE games(id INTEGER PRIMARY KEY,build_id INTEGER); CREATE TABLE sessions(id INTEGER PRIMARY KEY,build_id INTEGER); CREATE TABLE community_build_results(id INTEGER PRIMARY KEY,build_id INTEGER); CREATE TABLE manual_compatibility_observations(id INTEGER PRIMARY KEY,build_id INTEGER); INSERT INTO builds VALUES(1,'placeholder',1);").unwrap();
+        db.execute_batch("CREATE TABLE builds(id INTEGER PRIMARY KEY,path TEXT,active INTEGER,validation_status TEXT,removed_at INTEGER,created_at INTEGER); CREATE TABLE games(id INTEGER PRIMARY KEY,build_id INTEGER); CREATE TABLE sessions(id INTEGER PRIMARY KEY,build_id INTEGER,ended_at INTEGER); CREATE TABLE community_build_results(id INTEGER PRIMARY KEY,build_id INTEGER); CREATE TABLE manual_compatibility_observations(id INTEGER PRIMARY KEY,build_id INTEGER); INSERT INTO builds VALUES(1,'placeholder',1,'verified',NULL,2); INSERT INTO builds VALUES(2,'replacement-placeholder',0,'verified',NULL,1);").unwrap();
+        db.execute(
+            "UPDATE builds SET path=? WHERE id=2",
+            [replacement_install.display().to_string()],
+        )
+        .unwrap();
         db.execute(
             "UPDATE builds SET path=? WHERE id=1",
             [install.display().to_string()],
         )
         .unwrap();
-        assert!(remove_managed_build(&mut db, 1, &root).is_err());
-        db.execute("UPDATE builds SET active=0 WHERE id=1", [])
+        db.execute("INSERT INTO sessions VALUES(1,1,NULL)", [])
             .unwrap();
+        assert!(remove_managed_build(&mut db, 1, &root).is_err());
+        db.execute("UPDATE sessions SET ended_at=123", []).unwrap();
         db.execute("INSERT INTO games VALUES(1,1)", []).unwrap();
-        assert!(remove_managed_build(&mut db, 1, &root).is_err());
-        db.execute("DELETE FROM games", []).unwrap();
-        db.execute("INSERT INTO sessions VALUES(1,1)", []).unwrap();
-        assert!(remove_managed_build(&mut db, 1, &root).is_err());
-        db.execute("DELETE FROM sessions", []).unwrap();
         remove_managed_build(&mut db, 1, &root).unwrap();
         assert!(!install.exists());
-        let remaining: i64 = db
-            .query_row("SELECT count(*) FROM builds", [], |row| row.get(0))
+        let active: i64 = db
+            .query_row("SELECT id FROM builds WHERE active=1", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(remaining, 0);
+        assert_eq!(active, 2);
+        let removed_at: Option<i64> = db
+            .query_row("SELECT removed_at FROM builds WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(removed_at.is_some());
+        let history_count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE build_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(history_count, 1);
+        let game_build: Option<i64> = db
+            .query_row("SELECT build_id FROM games WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(game_build, None);
         let outside = dir.join("unmanaged-install");
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("keep.txt"), b"keep").unwrap();
         let link = root.join("linked-build");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         db.execute(
-            "INSERT INTO builds VALUES(2,?,0)",
+            "INSERT INTO builds(id,path,active,validation_status,removed_at,created_at) VALUES(3,?,0,'verified',NULL,0)",
             [link.display().to_string()],
         )
         .unwrap();
-        assert!(remove_managed_build(&mut db, 2, &root).is_err());
+        assert!(remove_managed_build(&mut db, 3, &root).is_err());
         db.execute(
-            "UPDATE builds SET path=? WHERE id=2",
+            "UPDATE builds SET path=? WHERE id=3",
             [outside.display().to_string()],
         )
         .unwrap();
-        assert!(remove_managed_build(&mut db, 2, &root).is_err());
+        assert!(remove_managed_build(&mut db, 3, &root).is_err());
         assert!(outside.join("keep.txt").is_file());
+        db.execute("INSERT INTO games VALUES(2,2)", []).unwrap();
+        remove_managed_build(&mut db, 2, &root).unwrap();
+        let active_count: i64 = db
+            .query_row(
+                "SELECT count(*) FROM builds WHERE active=1 AND removed_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let preferred_build: Option<i64> = db
+            .query_row("SELECT build_id FROM games WHERE id=2", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(active_count, 0);
+        assert_eq!(preferred_build, None);
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

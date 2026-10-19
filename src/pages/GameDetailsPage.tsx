@@ -1,16 +1,20 @@
 import type { ReactNode, Dispatch, SetStateAction } from "react";
+import { useEffect, useState } from "react";
 import { Play } from "lucide-react";
 import type {
   Build,
   Game,
+  GameContent,
+  RemoteCheatFile,
   GameCompatibility,
   ManualCompatibilityObservation,
   Repo,
   Session,
 } from "../types/studio";
 import { date, formatBytes, short } from "../utils/format";
+import { trophyGrade, trophyGrades } from "../utils/trophies";
 
-type Tab = "Overview" | "Settings" | "Compatibility" | "Logs";
+type Tab = "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Cheats";
 export type GameDetailsPageProps = {
   game: Game;
   tab: Tab;
@@ -34,6 +38,12 @@ export type GameDetailsPageProps = {
   onSetPreferredBuild: (buildId: number | null) => void;
   onRecordObservation: () => void;
   onOpenSessionLog: (session: Session) => void;
+  onInspectContent?: (gameId:number) => Promise<GameContent>;
+  onFetchOnlineCheats?: (gameId:number) => Promise<RemoteCheatFile[]>;
+  onDownloadOnlineCheat?: (gameId:number, filename:string) => Promise<string>;
+  onImportCustomPatch?: (gameId:number) => Promise<string | null>;
+  onSaveCustomPatch?: (gameId:number, content:string) => Promise<string>;
+  onSelectCustomPatch?: (path:string) => void;
 };
 
 export function GameDetailsPage({
@@ -59,7 +69,80 @@ export function GameDetailsPage({
   onSetPreferredBuild,
   onRecordObservation,
   onOpenSessionLog,
+  onInspectContent,
+  onFetchOnlineCheats,
+  onDownloadOnlineCheat,
+  onImportCustomPatch,
+  onSaveCustomPatch,
+  onSelectCustomPatch,
 }: GameDetailsPageProps) {
+  const [content, setContent] = useState<GameContent | null>(null);
+  const [contentError, setContentError] = useState("");
+  const [cheatQuery, setCheatQuery] = useState("");
+  const [remoteCheats, setRemoteCheats] = useState<RemoteCheatFile[] | null>(null);
+  const [remoteCheatError, setRemoteCheatError] = useState("");
+  const [downloadingCheat, setDownloadingCheat] = useState("");
+  const [downloadedCheatPath, setDownloadedCheatPath] = useState("");
+  const [customPatchDraft, setCustomPatchDraft] = useState("");
+  const [customPatchError, setCustomPatchError] = useState("");
+  const [customPatchBusy, setCustomPatchBusy] = useState(false);
+  const [customPatchPath, setCustomPatchPath] = useState("");
+  useEffect(() => {
+    setCustomPatchDraft(JSON.stringify({
+      id: currentGame.title_id || "TITLE_ID_REQUIRED",
+      name: currentGame.title,
+      version: currentGame.game_version || "1.0.0",
+      mods: [],
+    }, null, 2));
+    setCustomPatchError("");
+    setCustomPatchPath("");
+  }, [currentGame.id, currentGame.title_id, currentGame.game_version, currentGame.title]);
+  useEffect(() => {
+    if ((gameDetailsTab !== "Trophies" && gameDetailsTab !== "Cheats") || !onInspectContent) return;
+    let current = true;
+    void onInspectContent(currentGame.id).then((result) => { if (current) { setContent(result); setContentError(""); } }).catch((error) => { if (current) setContentError(String(error)); });
+    return () => { current = false; };
+  }, [gameDetailsTab, currentGame.id, onInspectContent]);
+  useEffect(() => {
+    if (gameDetailsTab !== "Cheats" || !onFetchOnlineCheats) return;
+    let current = true;
+    setRemoteCheats(null);
+    setRemoteCheatError("");
+    setDownloadedCheatPath("");
+    void onFetchOnlineCheats(currentGame.id)
+      .then((items) => { if (current) setRemoteCheats(items); })
+      .catch((error) => { if (current) setRemoteCheatError(String(error)); });
+    return () => { current = false; };
+  }, [gameDetailsTab, currentGame.id, onFetchOnlineCheats]);
+  const importCustomPatch = async () => {
+    if (!onImportCustomPatch) return;
+    setCustomPatchBusy(true);
+    setCustomPatchError("");
+    try {
+      const path = await onImportCustomPatch(currentGame.id);
+      if (!path) return;
+      setCustomPatchPath(path);
+      onSelectCustomPatch?.(path);
+    } catch (error) {
+      setCustomPatchError(String(error));
+    } finally {
+      setCustomPatchBusy(false);
+    }
+  };
+  const saveCustomPatch = async () => {
+    if (!onSaveCustomPatch) return;
+    setCustomPatchBusy(true);
+    setCustomPatchError("");
+    try {
+      const path = await onSaveCustomPatch(currentGame.id, customPatchDraft);
+      setCustomPatchPath(path);
+      onSelectCustomPatch?.(path);
+    } catch (error) {
+      setCustomPatchError(String(error));
+    } finally {
+      setCustomPatchBusy(false);
+    }
+  };
   return (
     <section className="page game-details-page">
       <div className="game-details-header">
@@ -93,7 +176,7 @@ export function GameDetailsPage({
         </div>
       </div>
       <nav className="details-tabs" aria-label="Game details tabs">
-        {(["Overview", "Settings", "Compatibility", "Logs"] as const).map(
+        {(["Overview", "Settings", "Compatibility", "Logs", "Trophies", "Cheats"] as const).map(
           (tab) => (
             <button
               key={tab}
@@ -147,19 +230,7 @@ export function GameDetailsPage({
               </button>
               <button
                 className="outline danger"
-                onClick={() => {
-                  if (
-                    profileDirty &&
-                    !window.confirm("Discard unsaved game profile changes?")
-                  )
-                    return;
-                  if (
-                    window.confirm(
-                      `Remove ${currentGame.title} from the library? The original files and session history will be kept.`,
-                    )
-                  )
-                    onRemoveEntry();
-                }}
+                onClick={onRemoveEntry}
               >
                 Remove library entry
               </button>
@@ -205,6 +276,85 @@ export function GameDetailsPage({
           {gameProfileEditor}
         </div>
       )}
+      {(gameDetailsTab === "Trophies" || gameDetailsTab === "Cheats") && <div className="panel game-content-panel">
+        {gameDetailsTab === "Trophies" ? <>
+          <h2>Trophies</h2>
+          <p>All trophies from the game package, grouped by grade. Earned status comes from this emulator build’s local trophy progress.</p>
+          {contentError && <p className="error-note">{contentError}</p>}
+          {!content && !contentError && <p>Reading trophy package…</p>}
+          {content?.trophies.length ? <>
+            <div className="trophy-counts" aria-label="Trophy counts">
+              {content.trophy_unlock_state === "available" && <span className="trophy-count trophy-earned"><strong>{content.trophies.filter((t) => t.unlocked === true).length}/{content.trophies.length}</strong>earned</span>}
+              {content.trophy_unlock_state !== "available" && <span className="trophy-count trophy-other">Earned progress unavailable for this game/build</span>}
+              {trophyGrades.map((grade) => <span className={`trophy-count trophy-${grade}`} key={grade}><strong>{content.trophies.filter((t) => trophyGrade(t.grade) === grade).length}</strong>{grade}</span>)}
+              {content.trophies.some((t) => trophyGrade(t.grade) === "other") && <span className="trophy-count trophy-other"><strong>{content.trophies.filter((t) => trophyGrade(t.grade) === "other").length}</strong>other</span>}
+            </div>
+            {([...trophyGrades, "other"] as const).map((grade) => {
+              const trophies = content.trophies.filter((t) => trophyGrade(t.grade) === grade);
+              if (!trophies.length) return null;
+              return <section className={`trophy-section trophy-${grade}`} key={grade}>
+                <h3><span className="trophy-grade-icon" aria-hidden="true">{grade === "platinum" ? "✦" : "●"}</span>{grade === "other" ? "Other trophies" : `${grade[0].toUpperCase()}${grade.slice(1)} trophies`}<small>{trophies.length}</small></h3>
+                <div className="trophy-grid">{trophies.map((t) => <article className={`trophy-item trophy-${grade}`} key={t.id}>
+                  <span className="trophy-item-top"><span className="trophy-grade">{grade === "other" ? (t.grade || "Trophy") : grade}</span><span className={`trophy-earned-state ${t.unlocked === true ? "earned" : ""}`}>{t.unlocked === true ? "✓ Earned" : t.unlocked === false ? "Not earned" : "Status unavailable"}</span></span>
+                  <strong>{t.name || (t.hidden ? "Hidden trophy" : `Trophy ${t.id}`)}</strong>
+                  <small>{t.detail || (t.hidden ? "This trophy is hidden." : `Trophy ${t.id}`)}</small>
+                </article>)}</div>
+              </section>;
+            })}
+          </> : content && <p>No readable trophy definitions were found in the game's <code>sce_sys/trophy2</code> or <code>sce_sys/trophy</code> packages.</p>}
+        </> : <>
+          <h2>Cheats</h2>
+          <p>Search local mods and matching PS5 cheat files. Downloading saves a file to Studio’s data directory; it does not enable or apply the cheats.</p>
+          <label className="cheat-search">Search cheats<input value={cheatQuery} onChange={(e)=>setCheatQuery(e.target.value)} placeholder="Search by cheat name" /></label>
+          {contentError && <p className="error-note">{contentError}</p>}
+          {content?.cheat_error && <p className="error-note">{content.cheat_error}</p>}
+          {content?.cheat_source && <p className="hint">Source: {content.cheat_source}</p>}
+          {content?.cheats.filter((c)=>c.name.toLowerCase().includes(cheatQuery.trim().toLowerCase())).map((c,i)=><div className="kv cheat-row" key={`${c.name}-${i}`}><strong>{c.name}</strong><span>{c.enabled ? "Enabled in file" : "Disabled in file"} · {c.title_id || "No title ID"} · v{c.version || "?"}</span></div>)}
+          {content && !content.cheats.length && !content.cheat_error && <p>No configured game patch file was found. Set one under Game settings.</p>}
+          <section className="custom-patch-editor">
+            <div className="buttonrow">
+              <h3>Custom game patch</h3>
+              <button className="outline" disabled={!onImportCustomPatch || customPatchBusy} onClick={() => void importCustomPatch()}>
+                {customPatchBusy ? "Working…" : "Import JSON patch"}
+              </button>
+            </div>
+            <p className="hint">
+              Import a GoldHEN-style JSON file or edit a patch below. The title ID must match this game. ZIP archives are not applied directly.
+            </p>
+            <label className="cheat-search">
+              Patch JSON
+              <textarea className="patch-json-editor" rows={12} spellCheck={false} value={customPatchDraft} onChange={(event) => setCustomPatchDraft(event.target.value)} />
+            </label>
+            <div className="buttonrow">
+              <button className="outline" disabled={!onSaveCustomPatch || customPatchBusy || !currentGame.title_id} onClick={() => void saveCustomPatch()}>
+                {customPatchBusy ? "Saving…" : "Save custom patch"}
+              </button>
+              {!currentGame.title_id && <small className="hint">Refresh game metadata first to detect its title ID.</small>}
+            </div>
+            {customPatchError && <p className="error-note">{customPatchError}</p>}
+            {customPatchPath && <p className="hint">Patch saved and selected for this game: <code>{customPatchPath}</code>. Open Game Settings and save the profile to apply it when launching.</p>}
+          </section>
+          <h3>Online PS5 cheat repository</h3>
+          <p className="hint">Source: TeeKay87/HEN-Cheats-Collection · files are matched by title ID and ordered with the closest game version first.</p>
+          {remoteCheatError && <p className="error-note">{remoteCheatError}</p>}
+          {!remoteCheats && !remoteCheatError && <p>Searching repository…</p>}
+          {remoteCheats?.length === 0 && <p>No matching PS5 cheat file was found for this title ID.</p>}
+          {remoteCheats?.map((file) => {
+            const matchingMods = file.mods.filter((mod) => mod.name.toLowerCase().includes(cheatQuery.trim().toLowerCase()));
+            if (cheatQuery.trim() && !matchingMods.length) return null;
+            return <article className="remote-cheat-file" key={file.filename}>
+              <div className="remote-cheat-heading"><div><strong>{file.title}</strong><small>{file.filename} · version {file.version || "unknown"} · {file.mods.length} cheats</small></div><button className="outline" disabled={!onDownloadOnlineCheat || downloadingCheat === file.filename} onClick={() => {
+                if (!onDownloadOnlineCheat) return;
+                setDownloadingCheat(file.filename);
+                void onDownloadOnlineCheat(currentGame.id, file.filename).then(setDownloadedCheatPath).catch((error) => setRemoteCheatError(String(error))).finally(() => setDownloadingCheat(""));
+              }}>{downloadingCheat === file.filename ? "Downloading…" : "Download file"}</button></div>
+              {matchingMods.map((mod, index) => <div className="kv cheat-row" key={`${mod.name}-${index}`}><strong>{mod.name}</strong><span>{mod.type}</span></div>)}
+              <a href={file.source} target="_blank" rel="noreferrer">View source file</a>
+            </article>;
+          })}
+          {downloadedCheatPath && <p className="hint">Saved locally: <code>{downloadedCheatPath}</code>. Select it in this game’s Settings under Game patch file to use it.</p>}
+        </>}
+      </div>}
       {gameDetailsTab === "Compatibility" && (
         <div className="panel compatibility-panel">
           <h2>Compatibility evidence</h2>

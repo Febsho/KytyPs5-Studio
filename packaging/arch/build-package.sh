@@ -3,7 +3,8 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 package_dir="$(mktemp -d)"
 trap 'rm -rf "$package_dir"' EXIT
-archive="$package_dir/kytyps5-studio-0.1.0.tar.gz"
+pkgver="$(sed -n 's/^pkgver=//p' "$repo_root/packaging/arch/PKGBUILD")"
+archive="$package_dir/kytyps5-studio-$pkgver.tar.gz"
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"
 tar -C "$(dirname "$repo_root")" \
   --sort=name \
@@ -15,7 +16,7 @@ tar -C "$(dirname "$repo_root")" \
   --exclude="$(basename "$repo_root")/src-tauri/target" \
   --exclude="$(basename "$repo_root")/.git" \
   --exclude="$(basename "$repo_root")/packaging/arch/*.pkg.tar.*" \
-  --transform="s|^$(basename "$repo_root")|kytyps5-studio-0.1.0|" \
+  --transform="s|^$(basename "$repo_root")|kytyps5-studio-$pkgver|" \
   -cf - "$(basename "$repo_root")" | gzip -n > "$archive"
 cp "$repo_root/packaging/arch/PKGBUILD" "$package_dir/PKGBUILD"
 checksum="$(sha256sum "$archive" | cut -d' ' -f1)"

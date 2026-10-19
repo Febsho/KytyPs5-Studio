@@ -83,14 +83,15 @@ describe("EmulatorManagerPage", () => {
     expect(page.onVerifyBuild).toHaveBeenCalledWith(build.id);
   });
 
-  it("protects builds referenced by registered games", () => {
-    render(<EmulatorManagerPage {...props({ games: [game] })} />);
-
+  it("removes a game-preferred build immediately without a confirmation popup", () => {
+    const page = props({ games: [game] });
+    const confirm = vi.spyOn(window, "confirm");
+    render(<EmulatorManagerPage {...page} />);
     const remove = screen.getByRole("button", { name: "Remove" });
-    expect((remove as HTMLButtonElement).disabled).toBe(true);
-    expect(remove.getAttribute("title")).toContain(
-      "game still prefers this build",
-    );
+    expect((remove as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(remove);
+    expect(page.onRemoveBuild).toHaveBeenCalledWith(build.id);
+    expect(confirm).not.toHaveBeenCalled();
   });
 
   it("compares recorded configuration and validation for two builds", () => {

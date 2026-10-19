@@ -4,7 +4,10 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { filterAndSortGames } from "../components/games/libraryModel";
+import {
+  filterAndSortGames,
+  isPubliclyRecognizedGame,
+} from "../components/games/libraryModel";
 import {
   Activity,
   BookOpen,
@@ -28,6 +31,7 @@ import type {
   Game,
   GameCompatibility,
   ManualCompatibilityObservation,
+  AppUpdateInfo,
   Fork,
   GithubDetails,
   GraphicsDiagnostics,
@@ -37,6 +41,8 @@ import type {
   Job,
   GameScanEvent,
   GameScanResult,
+  GameContent,
+  RemoteCheatFile,
   CommunityPR,
   CommunityPRDetails,
   CommunityBuildHistory as CommunityBuildHistoryEntry,
@@ -85,6 +91,12 @@ const nav = [
   { id: "diagnostics", label: "Diagnostics", icon: Activity },
   { id: "settings", label: "Settings", icon: Settings },
 ] as const;
+type SessionPerformanceSamples = {
+  cpuTotal: number;
+  cpuCount: number;
+  peakCpu: number | null;
+  peakResidentBytes: number | null;
+};
 const readUiState = (key: string) => {
   try {
     return localStorage.getItem(`studio.ui.${key}`);
@@ -120,6 +132,10 @@ export function App() {
   const [storageReport, setStorageReport] = useState<StorageReport | null>(
     null,
   );
+  const [appUpdateInfo, setAppUpdateInfo] = useState<AppUpdateInfo | null>(null);
+  const [appUpdateStatus, setAppUpdateStatus] = useState("Checking for updates when Studio starts…");
+  const [appUpdateBusy, setAppUpdateBusy] = useState(false);
+  const appUpdateInFlight = useRef(false);
   const [graphics, setGraphics] = useState<GraphicsDiagnostics | null>(null);
   const [repoUrl, setRepoUrl] = useState("");
   const [selectedRepo, setSelectedRepo] = useState<number | null>(() =>
@@ -134,7 +150,7 @@ export function App() {
     readUiId("game"),
   );
   const [gameDetailsTab, setGameDetailsTab] = useState<
-    "Overview" | "Settings" | "Compatibility" | "Logs"
+    "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Cheats"
   >("Overview");
   const [homeSelection, setHomeSelection] = useState<number | null>(() =>
     readUiId("home_game"),
@@ -161,6 +177,13 @@ export function App() {
   const jobStartedAt = useRef<number | null>(null);
   const jobEventGate = useRef(createJobEventGate<Job>());
   const [message, setMessage] = useState("");
+  useEffect(() => {
+    if (!message) return;
+    const timeout = window.setTimeout(() => {
+      setMessage((current) => (current === message ? "" : current));
+    }, 5000);
+    return () => window.clearTimeout(timeout);
+  }, [message]);
   const [query, setQuery] = useState(() => readUiState("query") || "");
   const [libraryView, setLibraryView] = useState<"grid" | "list">(() =>
     readUiState("library_view") === "list" ? "list" : "grid",
@@ -197,7 +220,12 @@ export function App() {
     null,
   );
   const [updateInterval, setUpdateInterval] = useState("24");
+  const [discordPresenceEnabled, setDiscordPresenceEnabled] = useState(true);
   const [processMetrics, setProcessMetrics] = useState<ProcessMetric[]>([]);
+  const processMetricsRef = useRef<ProcessMetric[]>([]);
+  const sessionPerformanceSamples = useRef(
+    new Map<number, SessionPerformanceSamples>(),
+  );
   const [processMetricsReady, setProcessMetricsReady] = useState(false);
   const [autoUpdateMode, setAutoUpdateMode] = useState<"notify" | "build">(
     "notify",
@@ -267,8 +295,18 @@ export function App() {
     sessions,
     setSessions,
     refresh,
+    refreshBuilds,
   } = useStudioData(call);
-  const currentRepo = repos.find((r) => r.id === selectedRepo) || repos[0];
+  const trackedRepos = useMemo(() => repos.filter((repo) => !repo.removed), [repos]);
+  const currentRepo = trackedRepos.find((r) => r.id === selectedRepo) || trackedRepos[0];
+  useEffect(() => {
+    if (page !== "emulators") return;
+    void refreshBuilds().catch(() => {});
+    const timer = window.setInterval(() => {
+      void refreshBuilds().catch(() => {});
+    }, 30_000);
+    return () => window.clearInterval(timer);
+  }, [page, refreshBuilds]);
   const exportSelectedLog = async () => {
     if (!selectedLogPath) return;
     const destination = await save({
@@ -278,6 +316,33 @@ export function App() {
     if (destination)
       await call("export_log", { path: selectedLogPath, destination });
   };
+  const inspectGameContent = useCallback(
+    (gameId: number) => call<GameContent>("inspect_game_content", { gameId }),
+    [call],
+  );
+  const fetchGameCheats = useCallback(
+    (gameId: number) => call<RemoteCheatFile[]>("fetch_game_cheats", { gameId }),
+    [call],
+  );
+  const downloadGameCheat = useCallback(
+    (gameId: number, filename: string) =>
+      call<string>("download_game_cheat", { gameId, filename }),
+    [call],
+  );
+  const importCustomGamePatch = useCallback(async (gameId: number) => {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "GoldHEN JSON patch", extensions: ["json"] }],
+    });
+    if (typeof selected !== "string") return null;
+    return call<string>("import_game_patch", { gameId, path: selected });
+  }, [call]);
+  const saveCustomGamePatch = useCallback(
+    (gameId: number, content: string) =>
+      call<string>("save_custom_game_patch", { gameId, content }),
+    [call],
+  );
   useEffect(() => {
     for (const [key, value] of [
       ["page", page],
@@ -310,15 +375,18 @@ export function App() {
     specsOpen,
   ]);
   useEffect(() => {
-    if (!repos.length) return;
+    if (!trackedRepos.length) {
+      setSelectedRepo(null);
+      return;
+    }
     if (
       selectedRepo === null ||
-      !repos.some((repo) => repo.id === selectedRepo)
+      !trackedRepos.some((repo) => repo.id === selectedRepo)
     )
       setSelectedRepo(
-        repos.find((repo) => repo.source_path)?.id ?? repos[0].id,
+        trackedRepos.find((repo) => repo.source_path)?.id ?? trackedRepos[0].id,
       );
-  }, [repos, selectedRepo]);
+  }, [trackedRepos, selectedRepo]);
   useEffect(() => {
     if (page !== "settings") return;
     let cancelled = false;
@@ -475,6 +543,9 @@ export function App() {
     invoke<string | null>("get_setting", { key: "auto_update_mode" })
       .then((v) => setAutoUpdateMode(v === "build" ? "build" : "notify"))
       .catch(() => setAutoUpdateMode("notify"));
+    invoke<string | null>("get_setting", { key: "discord_presence_enabled" })
+      .then((v) => setDiscordPresenceEnabled(v !== "false"))
+      .catch(() => setDiscordPresenceEnabled(true));
   }, []);
   useEffect(() => {
     setGithubDetails(null);
@@ -589,8 +660,48 @@ export function App() {
     }
   };
   const handleProcessMetrics = useCallback((metrics: ProcessMetric[]) => {
+    const wasActive = processMetricsRef.current.filter(
+      (metric) => !/(ended|interrupted)/i.test(metric.status),
+    );
+    const activeIds = new Set(
+      metrics
+        .filter((metric) => !/(ended|interrupted)/i.test(metric.status))
+        .map((metric) => metric.session_id),
+    );
+    for (const metric of metrics) {
+      if (/(ended|interrupted)/i.test(metric.status)) continue;
+      const sample = sessionPerformanceSamples.current.get(metric.session_id) || {
+        cpuTotal: 0,
+        cpuCount: 0,
+        peakCpu: null,
+        peakResidentBytes: null,
+      };
+      if (metric.cpu_percent !== null) {
+        sample.cpuTotal += metric.cpu_percent;
+        sample.cpuCount += 1;
+        sample.peakCpu = Math.max(sample.peakCpu ?? 0, metric.cpu_percent);
+      }
+      if (metric.resident_bytes !== null) {
+        sample.peakResidentBytes = Math.max(
+          sample.peakResidentBytes ?? 0,
+          metric.resident_bytes,
+        );
+      }
+      sessionPerformanceSamples.current.set(metric.session_id, sample);
+    }
     setProcessMetrics(metrics);
+    processMetricsRef.current = metrics;
     setProcessMetricsReady(true);
+    const completed = wasActive
+      .filter((metric) => !activeIds.has(metric.session_id))
+      .at(-1);
+    if (completed) {
+      setLauncherSessionId(completed.session_id);
+      setLauncherDismissed(false);
+      void invoke<Session[]>("recent_sessions")
+        .then(setSessions)
+        .catch(() => {});
+    }
   }, []);
   const refreshSessionData = useCallback(() => {
     refresh().catch(() => {});
@@ -664,6 +775,7 @@ export function App() {
             try {
               const jobId = await invoke<number>("start_update_build", {
                 id: repo.id,
+                activateAfterBuild: false,
                 options: {
                   build_type: "Release",
                   jobs: Math.min(
@@ -806,8 +918,61 @@ export function App() {
     try {
       await fn();
       await refresh();
-    } catch {}
+    } catch (error) {
+      setMessage(`Action failed: ${String(error)}`);
+    }
   };
+  const refreshStorageReport = async () => {
+    try {
+      setStorageReport(await invoke<StorageReport>("storage_report"));
+    } catch (error) {
+      setMessage(`Storage refresh failed: ${String(error)}`);
+    }
+  };
+  const cleanStorage = async (
+    command: string,
+    success: (bytes: number) => string,
+    refreshSessions = false,
+  ) => {
+    try {
+      const removed = await invoke<number>(command);
+      setMessage(success(removed));
+      setStorageReport(await invoke<StorageReport>("storage_report"));
+      if (refreshSessions) setSessions(await call<Session[]>("recent_sessions"));
+    } catch (error) {
+      setMessage(`Storage cleanup failed: ${String(error)}`);
+    }
+  };
+  const checkAppUpdate = async () => {
+    if (appUpdateInFlight.current) return;
+    appUpdateInFlight.current = true;
+    setAppUpdateBusy(true);
+    setAppUpdateStatus("Checking GitHub for a newer Studio release…");
+    try {
+      const info = await invoke<AppUpdateInfo>("check_app_update");
+      setAppUpdateInfo(info);
+      if (!info.update_available) {
+        setAppUpdateStatus(`KytyPS5 Studio ${info.current_version} is up to date.`);
+      } else if (!info.asset_name) {
+        setAppUpdateStatus(`Version ${info.latest_version} is available, but no AppImage was published for this architecture.`);
+      } else if (!info.running_appimage) {
+        setAppUpdateStatus(`Version ${info.latest_version} is available. In-place updates require launching Studio from its AppImage.`);
+      } else {
+        setAppUpdateStatus(`Version ${info.latest_version} found. Downloading and verifying the AppImage…`);
+        const result = await invoke<string>("install_app_update");
+        setAppUpdateInfo({ ...info, current_version: info.latest_version, update_available: false });
+        setAppUpdateStatus(result);
+      }
+    } catch (error) {
+      setAppUpdateStatus(`App update failed: ${String(error)}`);
+    } finally {
+      appUpdateInFlight.current = false;
+      setAppUpdateBusy(false);
+    }
+  };
+  useEffect(() => {
+    void checkAppUpdate();
+  }, []);
   const launchGame = async (gameId: number) => {
     const previousId = sessions.reduce(
       (latest, session) => Math.max(latest, session.id),
@@ -898,6 +1063,11 @@ export function App() {
   };
   const active = builds.find((b) => b.active);
   const currentGame = games.find((g) => g.id === selectedGame) || games[0];
+  const publicGames = useMemo(
+    () => games.filter(isPubliclyRecognizedGame),
+    [games],
+  );
+  const libraryCurrentGame = publicGames.find((g) => g.id === selectedGame) || publicGames[0];
   const {
     profile,
     setProfile,
@@ -914,16 +1084,16 @@ export function App() {
   );
   const featuredGame = useMemo(
     () =>
-      games.find((game) => game.id === homeSelection) ||
-      ([...games].sort(
+      publicGames.find((game) => game.id === homeSelection) ||
+      ([...publicGames].sort(
         (a, b) => (b.last_played ?? 0) - (a.last_played ?? 0),
       )[0] ??
         null),
-    [games, homeSelection],
+    [publicGames, homeSelection],
   );
   const filteredGames = useMemo(
-    () => filterAndSortGames(games, query, libraryFilter, librarySort),
-    [games, query, libraryFilter, librarySort],
+    () => filterAndSortGames(publicGames, query, libraryFilter, librarySort),
+    [publicGames, query, libraryFilter, librarySort],
   );
   const vulkanGpus = useMemo(() => {
     const lines = (graphics?.vulkan_details || "").split("\n");
@@ -957,8 +1127,9 @@ export function App() {
         "This game profile has unsaved changes. Discard them and switch games?",
       )
     )
-      return;
+      return false;
     setSelectedGame(id);
+    return true;
   };
   const hasUnsupportedProfile =
     !!profileCapabilities &&
@@ -1108,6 +1279,7 @@ export function App() {
     if (activeSession) {
       setLauncherSessionId(activeSession.session_id);
       setLauncherDismissed(false);
+      setHomeSelection(activeSession.game_id);
       invoke<Session[]>("recent_sessions")
         .then(setSessions)
         .catch(() => {});
@@ -1139,6 +1311,17 @@ export function App() {
             launcherSession.started_at,
         )
       : 0;
+  const launcherSamples = launcherSession
+    ? sessionPerformanceSamples.current.get(launcherSession.id)
+    : undefined;
+  const launcherPerformance = {
+    averageCpuPercent:
+      launcherSamples && launcherSamples.cpuCount > 0
+        ? launcherSamples.cpuTotal / launcherSamples.cpuCount
+        : null,
+    peakCpuPercent: launcherSamples?.peakCpu ?? null,
+    peakResidentBytes: launcherSamples?.peakResidentBytes ?? null,
+  };
   const [launcherIcon, setLauncherIcon] = useState<string | null>(null);
   useEffect(() => {
     let disposed = false;
@@ -1296,11 +1479,7 @@ export function App() {
           onDoubleClick={maximizeWindow}
           aria-label="KytyPS5 Studio home"
         >
-          <span className="brandmark">K</span>
-          <span>
-            <strong>KYTYPS5</strong>
-            <small>STUDIO</small>
-          </span>
+          <span className="wordmark">KytyPS5 Studio</span>
         </button>
         <MainNavigation
           items={nav.filter(
@@ -1378,7 +1557,7 @@ export function App() {
       </header>
       <main>
         <div className="main-content">
-          {message && !message.includes("Update available:") && (
+          {page !== "home" && message && !message.includes("Update available:") && (
             <div className="notice" onClick={() => setMessage("")}>
               <CircleAlert size={17} />
               {message}
@@ -1387,7 +1566,7 @@ export function App() {
           )}
           {page === "home" && (
             <HomePage
-              games={games}
+              games={publicGames}
               featuredGame={featuredGame}
               featuredBackground={featuredBackground}
               active={active}
@@ -1403,6 +1582,17 @@ export function App() {
               selectGameWithGuard={selectGameWithGuard}
               setGameDetailsTab={setGameDetailsTab}
               setHomeSelection={setHomeSelection}
+              inspectGameContent={inspectGameContent}
+              runningGameId={activeSessionGame?.id}
+              onShowRunningSession={() => setLauncherDismissed(false)}
+              onRemoveGame={(gameId) =>
+                action(async () => {
+                  await call("remove_game_entry", { gameId });
+                  setSelectedGame((current) => current === gameId ? null : current);
+                  setHomeSelection((current) => current === gameId ? null : current);
+                  setMessage("Game entry removed; files and session history were kept");
+                })
+              }
             />
           )}
           {page === "forks" && (
@@ -1437,6 +1627,7 @@ export function App() {
                     branch: "",
                   });
                   setSelectedRepo(repo.id);
+                  setMessage(`${repo.owner}/${repo.name} selected as the official source. Use Build to create an emulator installation.`);
                 })
               }
               onSelectRepository={(id) => {
@@ -1451,9 +1642,7 @@ export function App() {
                 action(() => call("inspect_repository", { id }))
               }
               onCheckRepositoryUpdates={(id) =>
-                action(async () =>
-                  setMessage(await call<string>("check_updates", { id })),
-                )
+                call<string>("check_updates", { id })
               }
               onRefreshGitHubDetails={(id) =>
                 action(async () =>
@@ -1474,6 +1663,22 @@ export function App() {
                   setSelectedRepo(repo.id);
                 })
               }
+              onRemoveRepository={(id) =>
+                action(async () => {
+                  const result = await call<string>("remove_repository", { id });
+                  if (selectedRepo === id) setSelectedRepo(null);
+                  setGithubDetails(null);
+                  setMessage(result);
+                })
+              }
+              onUpdateNow={(id) => {
+                setPage("build");
+                void runJob("start_update_build", {
+                  id,
+                  activateAfterBuild: true,
+                  options: { build_type: buildType, jobs, clean: cleanBuild },
+                });
+              }}
             />
           )}
           {page === "community" && (
@@ -1496,7 +1701,7 @@ export function App() {
                 </button>
               </div>
               <CommunityPRFilters
-                repos={repos}
+                repos={trackedRepos}
                 selectedRepo={selectedRepo}
                 state={communityState}
                 search={communitySearch}
@@ -1605,6 +1810,21 @@ export function App() {
                     selectedPullRequests={selectedPrs}
                     selectedDetails={communityDetails}
                     loading={communityLoading}
+                    onSelectPage={(selected) => {
+                      setSelectionReview([]);
+                      setCommunityPinnedHeads({});
+                      setSelectedPrs((current) => {
+                        const pageNumbers = new Set(
+                          communityVisible.map((pr) => pr.number),
+                        );
+                        const retained = current.filter(
+                          (pr) => !pageNumbers.has(pr.number),
+                        );
+                        return selected
+                          ? [...retained, ...communityVisible]
+                          : retained;
+                      });
+                    }}
                     onSelectionChange={(pr, selected) => {
                       setSelectionReview([]);
                       setCommunityPinnedHeads({});
@@ -1655,6 +1875,14 @@ export function App() {
               <CommunityPRSelection
                 selectedPullRequests={selectedPrs}
                 review={selectionReview}
+                targetRepository={
+                  communityPrs?.repository || "Selected repository"
+                }
+                targetBranch={
+                  selectedPrs[0]?.base_branch ||
+                  communityPrs?.items[0]?.base_branch ||
+                  "default branch"
+                }
                 pinnedHeads={communityPinnedHeads}
                 busy={busy}
                 reviewLoading={reviewLoading}
@@ -1745,7 +1973,7 @@ export function App() {
           )}
           {page === "build" && (
             <BuildStudioPage
-              repos={repos}
+                repos={trackedRepos}
               currentRepo={currentRepo}
               buildSourceInfo={buildSourceInfo}
               system={system}
@@ -1771,10 +1999,12 @@ export function App() {
               onBuildLatest={() =>
                 runJob("start_update_build", {
                   id: currentRepo!.id,
+                  activateAfterBuild: false,
                   options: { build_type: buildType, jobs, clean: cleanBuild },
                 })
               }
               onCancel={() => action(() => call("cancel_job"))}
+              onCopyLog={() => action(() => navigator.clipboard.writeText(logs.join("\n")))}
             />
           )}
           {page === "emulators" && (
@@ -1825,17 +2055,19 @@ export function App() {
                   setMessage("Managed emulator build removed");
                 })
               }
+              onCopyLog={() => action(() => navigator.clipboard.writeText(selectedLog))}
             />
           )}
           {page === "library" && (
             <GameLibraryPage
-              games={games}
+              games={publicGames}
               filteredGames={filteredGames}
-              currentGame={currentGame}
+              currentGame={libraryCurrentGame}
               gameBackground={gameBackground}
               gameIcon={gameIcon}
               gameScan={gameScan}
               gameCompatibility={gameCompatibility}
+              inspectGameContent={inspectGameContent}
               query={query}
               setQuery={setQuery}
               libraryFilter={libraryFilter}
@@ -1849,6 +2081,14 @@ export function App() {
               profileDirty={profileDirty}
               onChoose={choose}
               onSelectGame={selectGameWithGuard}
+              onRemoveGame={(gameId) =>
+                action(async () => {
+                  await call("remove_game_entry", { gameId });
+                  setSelectedGame((current) => current === gameId ? null : current);
+                  setHomeSelection((current) => current === gameId ? null : current);
+                  setMessage("Game entry removed; files and session history were kept");
+                })
+              }
               onOpenDetails={() => {
                 setGameDetailsTab("Overview");
                 setPage("game-details");
@@ -1896,6 +2136,7 @@ export function App() {
                 })
               }
               onExportLog={() => action(exportSelectedLog)}
+              onCopyLog={() => action(() => navigator.clipboard.writeText(selectedLog))}
             />
           )}
           {page === "game-details" && currentGame && (
@@ -1971,6 +2212,17 @@ export function App() {
                   setPage("diagnostics");
                 })
               }
+              onInspectContent={inspectGameContent}
+              onFetchOnlineCheats={fetchGameCheats}
+              onDownloadOnlineCheat={downloadGameCheat}
+              onImportCustomPatch={importCustomGamePatch}
+              onSaveCustomPatch={saveCustomGamePatch}
+              onSelectCustomPatch={(path) =>
+                setProfile((current) => ({
+                  ...current,
+                  options: { ...current.options, "--game-patch": path },
+                }))
+              }
             />
           )}
           {page === "game-details" && !currentGame && (
@@ -1995,10 +2247,15 @@ export function App() {
               githubTokenInput={githubTokenInput}
               setGithubTokenInput={setGithubTokenInput}
               updateInterval={updateInterval}
+              discordPresenceEnabled={discordPresenceEnabled}
               autoUpdateMode={autoUpdateMode}
               storageReport={storageReport}
+              appUpdate={appUpdateInfo}
+              appUpdateStatus={appUpdateStatus}
+              appUpdateBusy={appUpdateBusy}
               busy={busy}
               activeSessions={gameRunning}
+              onCheckAppUpdate={checkAppUpdate}
               onSaveGlobalDefaults={() =>
                 action(async () => {
                   await call("set_global_profile_options", {
@@ -2028,66 +2285,45 @@ export function App() {
                   call("set_setting", { key: "update_interval", value }),
                 );
               }}
+              onDiscordPresenceEnabledChange={(enabled) => {
+                setDiscordPresenceEnabled(enabled);
+                action(() => call("set_setting", {
+                  key: "discord_presence_enabled",
+                  value: enabled ? "true" : "false",
+                }));
+              }}
               onAutoUpdateModeChange={(value) => {
                 setAutoUpdateMode(value);
                 action(() =>
                   call("set_setting", { key: "auto_update_mode", value }),
                 );
               }}
-              onRefreshStorage={() => {
-                void invoke<StorageReport>("storage_report")
-                  .then(setStorageReport)
-                  .catch((error) => setMessage(String(error)));
-              }}
-              onCleanIncompleteBuilds={() => {
-                void invoke<number>("clean_incomplete_builds")
-                  .then(async (removed) => {
-                    setMessage(
-                      `Incomplete emulator installations cleared · ${formatBytes(removed)} freed`,
-                    );
-                    setStorageReport(
-                      await invoke<StorageReport>("storage_report"),
-                    );
-                  })
-                  .catch((error) => setMessage(String(error)));
-              }}
-              onClearCompilerCache={() => {
-                void invoke<number>("clean_compiler_cache")
-                  .then(async (removed) => {
-                    setMessage(
-                      `Compiler cache cleared · ${formatBytes(removed)} freed`,
-                    );
-                    setStorageReport(
-                      await invoke<StorageReport>("storage_report"),
-                    );
-                  })
-                  .catch((error) => setMessage(String(error)));
-              }}
-              onClearCommunityWorktrees={() => {
-                void invoke<number>("clean_community_worktrees")
-                  .then(async (removed) => {
-                    setMessage(
-                      `Temporary community files cleared · ${formatBytes(removed)} freed`,
-                    );
-                    setStorageReport(
-                      await invoke<StorageReport>("storage_report"),
-                    );
-                  })
-                  .catch((error) => setMessage(String(error)));
-              }}
-              onClearSessionLogs={() => {
-                void invoke<number>("clean_session_logs")
-                  .then(async (removed) => {
-                    setMessage(
-                      `Session logs cleared · ${formatBytes(removed)} freed; session history was kept`,
-                    );
-                    setStorageReport(
-                      await invoke<StorageReport>("storage_report"),
-                    );
-                    setSessions(await call<Session[]>("recent_sessions"));
-                  })
-                  .catch((error) => setMessage(String(error)));
-              }}
+              onRefreshStorage={refreshStorageReport}
+              onCleanIncompleteBuilds={() =>
+                cleanStorage(
+                  "clean_incomplete_builds",
+                  (bytes) => `Incomplete emulator installations cleared · ${formatBytes(bytes)} freed`,
+                )
+              }
+              onClearCompilerCache={() =>
+                cleanStorage(
+                  "clean_compiler_cache",
+                  (bytes) => `Compiler cache cleared · ${formatBytes(bytes)} freed`,
+                )
+              }
+              onClearCommunityWorktrees={() =>
+                cleanStorage(
+                  "clean_community_worktrees",
+                  (bytes) => `Temporary community files cleared · ${formatBytes(bytes)} freed`,
+                )
+              }
+              onClearSessionLogs={() =>
+                cleanStorage(
+                  "clean_session_logs",
+                  (bytes) => `Session logs cleared · ${formatBytes(bytes)} freed; session history was kept`,
+                  true,
+                )
+              }
             />
           )}
           {launcherSession && !launcherDismissed && (
@@ -2098,6 +2334,7 @@ export function App() {
               live={launcherLive}
               status={launcherStatus}
               runtimeSeconds={launcherRuntime}
+              performance={launcherPerformance}
               icon={launcherIcon}
               log={launcherLog}
               onDismiss={() => setLauncherDismissed(true)}
@@ -2126,6 +2363,27 @@ export function App() {
                   setLauncherDismissed(true);
                 })
               }
+              onCopyLog={() => action(() => navigator.clipboard.writeText(launcherLog))}
+              canSearchCommunityPRs={trackedRepos.some((repo) => repo.source_path)}
+              onSearchCommunityPRs={() => {
+                const searchRepo =
+                  trackedRepos.find(
+                    (repo) => repo.id === selectedRepo && repo.source_path,
+                  ) || trackedRepos.find((repo) => repo.source_path);
+                if (!searchRepo) {
+                  setMessage("Clone a repository before searching its community pull requests");
+                  return;
+                }
+                const searchTerm = (
+                  launcherGame?.title_id || launcherGame?.title || launcherSession.title
+                ).slice(0, 128);
+                setSelectedRepo(searchRepo.id);
+                setCommunityState("all");
+                setCommunityPage(1);
+                setCommunitySearch(searchTerm);
+                setLauncherDismissed(true);
+                setPage("community");
+              }}
             />
           )}
         </div>

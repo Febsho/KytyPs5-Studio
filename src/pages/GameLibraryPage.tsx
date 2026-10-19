@@ -1,4 +1,6 @@
 import type { Dispatch, SetStateAction } from "react";
+import { useEffect, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import {
   BookOpen,
   FolderOpen,
@@ -11,11 +13,13 @@ import type {
   Build,
   Game,
   GameCompatibility,
+  GameContent,
   GameScanEvent,
   Repo,
 } from "../types/studio";
-import { VirtualGameGrid } from "../components/games/GameLibrary";
+import { GameContextMenu, VirtualGameGrid } from "../components/games/GameLibrary";
 import { short } from "../utils/format";
+import { trophySummary } from "../utils/trophies";
 
 export type GameLibraryPageProps = {
   games: Game[];
@@ -25,6 +29,7 @@ export type GameLibraryPageProps = {
   gameIcon: string | null;
   gameScan: GameScanEvent | null;
   gameCompatibility: GameCompatibility | null;
+  inspectGameContent?: (gameId: number) => Promise<GameContent>;
   query: string;
   setQuery: Dispatch<SetStateAction<string>>;
   libraryFilter: "all" | "favorites" | "recent";
@@ -39,13 +44,14 @@ export type GameLibraryPageProps = {
   repos: Repo[];
   profileDirty: boolean;
   onChoose: (kind: "file" | "directory") => Promise<void>;
-  onSelectGame: (id: number) => void;
+  onSelectGame: (id: number) => boolean | void;
   onOpenDetails: () => void;
   onOpenGameFolder: () => void;
   onOpenLatestSessionLog: () => void;
   onLaunch: (id: number) => void;
   onToggleFavorite: (id: number) => void;
   onSetPreferredBuild: (id: number | null) => void;
+  onRemoveGame?: (id: number) => void;
 };
 
 export function GameLibraryPage({
@@ -56,6 +62,7 @@ export function GameLibraryPage({
   gameIcon,
   gameScan,
   gameCompatibility,
+  inspectGameContent,
   query,
   setQuery,
   libraryFilter,
@@ -75,7 +82,16 @@ export function GameLibraryPage({
   onLaunch,
   onToggleFavorite,
   onSetPreferredBuild,
+  onRemoveGame,
 }: GameLibraryPageProps) {
+  const [contextMenu, setContextMenu] = useState<{ game: Game; x: number; y: number } | null>(null);
+  const [trophyProgress, setTrophyProgress] = useState<ReturnType<typeof trophySummary> | null>(null);
+  useEffect(() => {
+    if (!currentGame || !inspectGameContent) { setTrophyProgress(null); return; }
+    let current = true;
+    void inspectGameContent(currentGame.id).then((content) => { if (current) setTrophyProgress(trophySummary(content)); }).catch(() => { if (current) setTrophyProgress(null); });
+    return () => { current = false; };
+  }, [currentGame?.id, inspectGameContent]);
   return (
     <section
       className="page library-page"
@@ -118,7 +134,7 @@ export function GameLibraryPage({
           </span>
         </div>
       )}
-      <div className="library-toolbar">
+      {games.length > 0 && <div className="library-toolbar">
         <div className="search">
           <Search size={18} />
           <input
@@ -165,15 +181,19 @@ export function GameLibraryPage({
             List
           </button>
         </div>
-      </div>
-      <div className="library-layout">
+      </div>}
+      {filteredGames.length > 0 && <div className="library-layout">
         <VirtualGameGrid
           games={filteredGames}
           selectedId={currentGame?.id}
           onSelect={onSelectGame}
+          onContextMenu={(game, event: ReactMouseEvent<HTMLButtonElement>) => {
+            event.preventDefault();
+            setContextMenu({ game, x: event.clientX, y: event.clientY });
+          }}
           mode={libraryView}
         />
-        {currentGame && (
+        {currentGame && filteredGames.some((game) => game.id === currentGame.id) && (
           <div className="panel detail">
             <div className="detail-art">
               {gameBackground && (
@@ -195,16 +215,18 @@ export function GameLibraryPage({
             </div>
             <h2>{currentGame.title}</h2>
             <p className="path">{currentGame.path}</p>
-            <button
-              className="outline"
-              disabled={currentGame.file_status === "Missing"}
-              onClick={onOpenGameFolder}
-            >
-              Open game folder
-            </button>
-            <button className="outline" onClick={onOpenDetails}>
-              Game details
-            </button>
+            <div className="library-detail-actions">
+              <button
+                className="outline"
+                disabled={currentGame.file_status === "Missing"}
+                onClick={onOpenGameFolder}
+              >
+                Open game folder
+              </button>
+              <button className="outline" onClick={onOpenDetails}>
+                Game details
+              </button>
+            </div>
             <div className="game-meta">
               {currentGame.title_id && <span>{currentGame.title_id}</span>}
               {currentGame.game_version && (
@@ -217,6 +239,11 @@ export function GameLibraryPage({
                 </span>
               )}
             </div>
+            {trophyProgress && trophyProgress.total > 0 && <div className="library-trophy-progress">
+              <strong>Trophies</strong>
+              <span>{trophyProgress.earned === null ? `${trophyProgress.total} total · earned status unavailable` : `${trophyProgress.earned} / ${trophyProgress.total} earned`}</span>
+              {trophyProgress.earned !== null && <div>{(["platinum", "gold", "silver", "bronze"] as const).filter((grade) => trophyProgress.counts[grade] > 0).map((grade) => <span className={`trophy-progress-grade trophy-${grade}`} key={grade}>{trophyProgress.earnedByGrade[grade]}/{trophyProgress.counts[grade]} {grade}</span>)}</div>}
+            </div>}
             <div className="compatibility-panel">
               <h3>Compatibility evidence</h3>
               <div className="kv">
@@ -336,19 +363,33 @@ export function GameLibraryPage({
             </div>
           </div>
         )}
-      </div>
+      </div>}
+      {contextMenu && (
+        <GameContextMenu
+          {...contextMenu}
+          onClose={() => setContextMenu(null)}
+          onDetails={(game) => {
+            setContextMenu(null);
+            if (onSelectGame(game.id) !== false) onOpenDetails();
+          }}
+          onRemove={onRemoveGame ? (game) => {
+            setContextMenu(null);
+            onRemoveGame(game.id);
+          } : undefined}
+        />
+      )}
       {games.length === 0 && (
-        <div className="empty">
+        <div className="empty library-empty">
           <BookOpen />
           <strong>Your library is empty</strong>
-          <p>
-            Scan a directory containing game folders with eboot.bin or .zar
-            files.
-          </p>
+          <p>Import a supported game folder to add it to your library.</p>
+          <button className="primary" onClick={() => void onChoose("directory")}>
+            <FolderOpen size={15} /> Import game folder
+          </button>
         </div>
       )}
       {games.length > 0 && filteredGames.length === 0 && (
-        <div className="empty">
+        <div className="empty library-empty">
           <Search />
           <strong>No games match these filters</strong>
           <p>Change the search or library filter to see more games.</p>

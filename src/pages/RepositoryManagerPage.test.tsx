@@ -41,6 +41,7 @@ function props(
     onRefreshGitHubDetails: vi.fn(),
     onOpenBuildStudio: vi.fn(),
     onAddFork: vi.fn(),
+    onRemoveRepository: vi.fn(),
     ...overrides,
   };
 }
@@ -64,9 +65,18 @@ describe("RepositoryManagerPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add repository" }));
     expect(page.onAddManualRepository).toHaveBeenCalledOnce();
     fireEvent.click(
-      screen.getByRole("button", { name: "Add official repository" }),
+      screen.getByRole("button", { name: "Select Official Source" }),
     );
     expect(page.onAddOfficialRepository).toHaveBeenCalledOnce();
+  });
+
+  it("removes a tracked fork immediately without a confirmation popup", () => {
+    const page = props();
+    const confirm = vi.spyOn(window, "confirm");
+    render(<RepositoryManagerPage {...page} />);
+    fireEvent.click(screen.getByRole("button", { name: "Remove example/Kyty fork" }));
+    expect(page.onRemoveRepository).toHaveBeenCalledWith(repo.id);
+    expect(confirm).not.toHaveBeenCalled();
   });
 
   it("keeps source management actions tied to the selected repository", () => {
@@ -81,7 +91,7 @@ describe("RepositoryManagerPage", () => {
     );
 
     fireEvent.click(
-      screen.getByRole("button", { name: "Clone with submodules" }),
+      screen.getByRole("button", { name: "Clone / restore checkout" }),
     );
     expect(page.onCloneRepository).toHaveBeenCalledWith(repo.id);
     rerender(<RepositoryManagerPage {...page} />);

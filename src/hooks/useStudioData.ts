@@ -31,6 +31,9 @@ export function useStudioData(call: StudioCommand) {
     setSystem(nextSystem);
     setSessions(nextSessions);
   }, [call]);
+  const refreshBuilds = useCallback(async () => {
+    setBuilds(await call<Build[]>("list_builds"));
+  }, [call]);
 
   return {
     repos,
@@ -40,5 +43,6 @@ export function useStudioData(call: StudioCommand) {
     sessions,
     setSessions,
     refresh,
+    refreshBuilds,
   };
 }

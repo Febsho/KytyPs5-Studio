@@ -1,91 +1,74 @@
 # KytyPS5 Studio
 
-Linux desktop manager for independent KytyPS5 source checkouts, builds, game paths, and launch diagnostics. KytyPS5 Studio does not include games, firmware, or an emulator binary.
+KytyPS5 Studio is a Linux desktop app for managing KytyPS5 source checkouts, emulator builds, game folders, and launch logs in one place.
 
-## Current functionality
+> **This project is not affiliated with or endorsed by the KytyPS5 developers.** The emulator source is maintained in the [official KytyPS5 repository](https://github.com/KytyPS5/KytyPS5). Studio can clone and build that source, as well as compatible forks. It does not include an emulator binary, games, or firmware.
 
-- Tauri 2 desktop shell with Home, Library, Emulators, Fork Manager, Community Builds, Build Studio, Diagnostics, and Settings.
-- Home features the most recently played imported game (or an imported game when there is no play history), uses local `pic0.png` artwork when available, and launches or opens that game’s details directly.
-- Renderer failures are contained by a visible recovery screen with a reload action; backend and job errors continue to surface in the app notices/logs.
-- GitHub fork discovery and custom GitHub HTTPS repositories.
-- Community Builds lists real pull requests for the selected tracked repository with GitHub counts, state filters, title/number/author search, label filtering, sorting, pagination, PR descriptions, commit lists, changed-file patches, checks, mergeability state, and direct GitHub links. Compatibility remains explicitly unverified until an actual build is registered.
-- Optional GitHub credentials are stored through Linux Secret Service (`secret-tool`); anonymous read-only access remains available. Token values are never persisted in SQLite.
-- Community PR builds pin a shared base SHA and each exact PR head SHA, support user-controlled merge ordering, create an isolated clone, perform deterministic Git merges, report conflict files and Git errors, validate submodule paths/HTTPS GitHub URLs, and use the existing CMake/Ninja/Clang build, cancellation, executable verification, build registration, and game launcher services. Before compilation Studio displays changed files (flagging build scripts and submodule configuration) and requires a separate confirmation; community build code executes and a Git clone is not a security sandbox.
-- Community build history preserves the selected PR order and SHAs, configuration, build/install result, and failure details. Verified experimental builds appear in Emulators and can be activated or assigned per game through existing controls. History compares selected PR SHAs with currently loaded GitHub results and flags changed heads; rebuilding is always explicit.
-- SQLite migration v9 adds community PR cache, configuration, ordered PR, and build-result records while retaining existing repository, build, game, profile, and session IDs.
-- Current SQLite schema version is 15. Migrations v10–v15 remove only the legacy SQLite GitHub token, add inheritable CLI profile/global-default storage, preserve reversible game-entry removal, store separate manual compatibility observations, and retain exact emulator build configuration. They extend the existing database in transactions and keep existing game, repository, build, profile, and session records.
-- Recursive Git clone with submodules into the XDG data directory.
-- Checked-out source inspection before the KytyPS5 CMake/launcher adapter enables compilation; unmatched repositories remain unverified and disabled.
-- Versioned CMake/Ninja/Clang emulator-only build and install with required tool and platform pkg-config preflights; Studio disables KytyPS5's optional Qt launcher when the selected source supports `KYTY_BUILD_LAUNCHER=OFF`. Builds stream logs, support process-tree cancellation, validate `--help`/`--game` before registration or activation, and roll back failed activation.
-- Build Studio shows the active stage and elapsed time from actual job events; it does not invent percentage progress.
-- Build Studio exposes clean versus incremental builds, build type, and bounded parallel jobs; the verified Linux adapter uses Clang/Clang++ and reports that requirement explicitly.
-- Emulator comparison records install size and CLI-verification status for new builds; existing registrations retain an explicit unmeasured/unverified state until rechecked. The build list shows the latest recorded process outcome per build without implying gameplay success. SQLite migration v7 adds these fields while retaining existing build records.
-- On startup, registered builds with an unchecked CLI status are revalidated asynchronously, active first; missing and non-executable paths are surfaced immediately from filesystem checks without delaying the initial UI render.
-- KDE/Linux folder actions open imported game locations, emulator installations, and cloned repositories through `xdg-open`, using canonical registered paths and argument-safe process launching.
-- Diagnostics can export managed emulator session logs through the native save dialog; exports are path-checked, size-limited, and written atomically.
-- Startup and configurable periodic update checks compare each tracked branch with the newest registered build. Settings can notify only or opt in to automatic Release fetch/builds; automatic builds wait for Studio-tracked emulator sessions to finish, retain prior installations, verify the emulator CLI, skip an already verified commit, and leave activation manual. Build Studio also provides the same update operation on demand.
-- Game path registration by file picker or native file drop, plus directory scanning without copying game data; scans detect game folders, signature-checked ELF files, and KytyPS5 ZArchives; recursive scans and install-size walks run in the background with entry/title progress. Local PS5 `sce_sys/param.json` title, title ID, version, `icon0.png` icons, and `pic0.png` backgrounds; a virtualized library grid with lazy-loaded, in-memory-cached local icons; `--game` launch against a verified build; per-game resolution, present mode, performance overlay, fullscreen, controller color/volume/vibration, keyboard-player options, and capability-gated additional CLI settings discovered from the selected executable's real `--help` output. Dynamic options include graphics, console/user, content/patch, keymap, and advanced diagnostics; profile values are validated and passed as separate process arguments. Global defaults have the same grouped controls as per-game overrides, with per-game values taking precedence and inherited values labeled. The GPU picker uses device indexes and names reported by Vulkan diagnostics when available. Versioned migrations preserve existing profiles and add profile option JSON, global defaults, and reversible hidden-library entries. Session logs, exit codes, and playtime remain attached to game sessions. Artwork reads are constrained to the imported game directory and size-limited. A dedicated Game Details view separates overview, settings, compatibility evidence, and session logs. Removing an entry hides it reversibly while preserving its database profile, session history, logs, and original game files. Manual compatibility observations are stored separately from automatic process evidence and are tied to the exact repository, build commit, configuration, and patch-file SHA-256. Studio still does not infer gameplay or playability from process exits.
-- The last UI page, selected game/repository, and library search are restored from local webview storage on startup; invalid saved pages fall back to Home and missing game/repository selections fall back to available data.
-- Host diagnostics for CPU model, available/total RAM, GPU, Linux input-controller names, build tools, and XDG data paths; live emulator process CPU, resident RAM, runtime, PID, and status from Linux `/proc`; polling backs off when idle or when the window is hidden, while launch/stop and visibility changes trigger an immediate refresh.
-- On-demand graphics diagnostics report Vulkan loader/device/driver details from `vulkaninfo`, connected DRM displays and modes, and loaded kernel GPU drivers. The Vulkan probe runs only when Diagnostics is opened, drains stdout and stderr concurrently with a 1 MiB cap per stream, and stops its isolated process group after six seconds.
-- In-Studio gamepad navigation through the browser Gamepad API: D-pad/stick moves focus, A activates focused buttons, and shoulder buttons change pages. This is UI navigation only and does not imply KytyPS5 game-input compatibility.
-- SQLite persistence under `$XDG_DATA_HOME/kytyps5-studio` (defaults to `~/.local/share/kytyps5-studio`).
+## Screenshots
 
-## Build and run on Arch / CachyOS
+| Games | Emulator builds | Build Studio |
+| --- | --- | --- |
+| <img src="docs/screenshots/games-home.png" alt="KytyPS5 Studio games home page" width="320"> | <img src="docs/screenshots/emulator-builds.png" alt="Installed KytyPS5 emulator builds" width="320"> | <img src="docs/screenshots/build-studio.png" alt="KytyPS5 Studio build page" width="320"> |
 
-Install the development prerequisites using your package manager. The emulator-only upstream build needs `git cmake ninja clang lld glslang python vulkan-headers pkgconf` plus SDL3 backend development libraries for X11, Wayland, audio, and udev. It disables the optional KytyPS5 Qt launcher when that CMake option is advertised, so `qt6-base` is not required for the supported emulator-only build. Studio itself needs `webkit2gtk-4.1 gtk3 libayatana-appindicator librsvg xdg-utils libnotify libsecret` for Tauri, desktop folder actions, and KDE notifications. Confirm package names against your distribution before installing. Studio never runs a privileged package installation. Desktop notifications are best-effort and use the host's `notify-send`; in-app notices remain available if the desktop service is unavailable. On NVIDIA Wayland sessions, Studio disables WebKit's DMA-BUF renderer when the user has not set `WEBKIT_DISABLE_DMABUF_RENDERER`; this avoids a GBM buffer failure observed on the target host.
+The screenshots show the games home page, installed emulator builds, and the source build interface.
 
-For a CachyOS development checkout, install the Arch package prerequisites and run the app with:
+## What it does
+
+- Organizes imported games without moving or copying the original files.
+- Clones and manages the official KytyPS5 repository and compatible forks.
+- Builds and keeps separate emulator versions, with controls to activate, compare, update, and remove them.
+- Finds Community Pull Requests, reviews their changes, and can build compatible PR combinations while recording their exact commits.
+- Stores per-game launch options, session history, playtime, and emulator logs.
+- Shows host and Vulkan diagnostics to help troubleshoot build and launch problems.
+
+See the [0.2.0 release notes](CHANGELOG.md) for recent changes.
+
+Successful compilation or CLI verification does **not** guarantee that a game will run. Compatibility depends on the emulator, game, drivers, and system configuration.
+
+## Run the AppImage
+
+Download the Linux AppImage provided with the release, make it executable, and run it:
 
 ```sh
-sudo pacman -S --needed appmenu-gtk-module base-devel clang cmake curl file git glslang gtk3 libayatana-appindicator libnotify libpulse libsecret librsvg lld libx11 libxrandr ninja nodejs npm openssl pkgconf python rustup systemd-libs wayland wayland-protocols webkit2gtk-4.1 vulkan-headers vulkan-icd-loader vulkan-tools xdg-utils xdotool
-rustup default stable
-npm ci
-npm run tauri dev
+chmod +x "KytyPS5 Studio_0.2.0_amd64.AppImage"
+./"KytyPS5 Studio_0.2.0_amd64.AppImage"
 ```
 
-The emulator needs a working Vulkan driver/ICD; keep the NVIDIA driver and `nvidia-utils` installation matched to the running kernel. To build and install the Arch package from the checkout, run `./packaging/arch/build-package.sh`, then `sudo pacman -U packaging/arch/kytyps5-studio-0.1.0-1-x86_64.pkg.tar.zst`. Package installation uses `sudo`; running Studio does not.
+The AppImage filename may change between releases. KytyPS5 emulator builds require a working Vulkan driver. Building the emulator from Studio also requires the development tools and libraries listed in the Build Studio dependency check.
+
+## Build from source
+
+On Linux, install Node.js/npm, stable Rust, and the Tauri system dependencies for your distribution. Then run:
 
 ```sh
 npm ci
 npm run tauri dev
 ```
 
-Build a native application binary:
+To create a native AppImage:
 
 ```sh
-npm run tauri build -- --no-bundle
+npm run tauri build -- --bundles appimage
 ```
 
-The binary is at `src-tauri/target/release/kytyps5-studio`. Use `npm run tauri build -- --bundles appimage` for an AppImage. Run `./packaging/arch/build-package.sh` from the checkout to make a clean, checksummed source archive and package with `makepkg`; install the result with `sudo pacman -U packaging/arch/kytyps5-studio-0.1.0-1-x86_64.pkg.tar.zst`. The PKGBUILD disables LTO to avoid bundled ring/SQLite linker conflicts and normalizes native-only CachyOS compiler flags to baseline x86-64 for this package, without changing host configuration.
+The AppImage is written to:
 
-## Workflow
+```text
+src-tauri/target/release/bundle/appimage/
+```
 
-1. Add the official repository under Fork Manager and clone it.
-2. Inspect the source adapter (the official layout is detected automatically after clone).
-3. Build in Build Studio. On supported upstream sources Studio disables the optional Qt launcher and builds the `kyty_emulator` target directly; it checks `--help` and the advertised `--game` option before recording a build. Use **Fetch & build latest** to build the tracked branch update without replacing the active install.
-4. Activate a verified build under Emulators when ready.
-5. Scan a game folder or add an ELF/ZArchive in Library, then launch. The Studio verifies the executable format where applicable; the emulator still determines whether a particular game can initialize.
+For Arch Linux and CachyOS, the repository also includes a package recipe at [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD).
 
-Each checkout lives in `sources/<repository id>`, reusable compiler output in the XDG cache, and each verified installation in a distinct `builds/<repository id>/<commit>-<configuration>-<timestamp>` directory. Updating source or rebuilding keeps installed builds available. Game paths always point to the originals. Build verification runs the installed executable help command and checks for its game-launch option; it does not prove game compatibility.
+## Game files and privacy
 
-## Upstream research
+Game files stay at their existing paths; Studio keeps their paths and metadata in its local library. Application data is stored in the user’s XDG data directory, normally `~/.local/share/kytyps5-studio`. GitHub access works anonymously within GitHub’s rate limits; an optional token can be stored through Linux Secret Service.
 
-The [current KytyPS5 Linux instructions](https://github.com/KytyPS5/KytyPS5#building-on-linux) describe Clang, Ninja, CMake, Git submodules, glslang, Python, SDL3 system backends, and Qt 6 for its optional `launcher`. Studio instead requests `-DKYTY_BUILD_LAUNCHER=OFF` and builds `kyty_emulator` directly when that option exists. The current [`src/main.cpp`](https://github.com/KytyPS5/KytyPS5/blob/main/src/main.cpp) accepts `kyty_emulator --game <dir|elf|zar>`. The official repository is GPL-2.0. [AnyPS5 Studio](https://github.com/Ramzyayman/AnyPS5-Studio) is a separate static relinker, and no relinker code is included here. [SlunkySloth/kytyps5](https://github.com/SlunkySloth/kytyps5) is a fork; it is only enabled for building if inspection finds the supported layout.
+Only add games and other content that you are authorized to use. This project does not provide games, firmware, decryption keys, or copyrighted content.
 
-## Limits
+## AI assistance
 
-The current release is a Linux foundation. Additional fork adapters, signed Studio updates, external metadata providers, and Windows support are not implemented. Controller detection reports Linux input devices only and does not imply game compatibility. Standard Gamepad API controllers can navigate Studio with the D-pad or left stick, A activates the focused control, and B sends Escape; the browser/WebKit must expose the controller to the app. Community PR builds currently support repositories that pass the existing KytyPS5 CMake adapter check; an adapter check is not a compatibility claim. GitHub unauthenticated rate limits apply to discovery. PR head-change notices compare loaded GitHub results and do not trigger silent rebuilds. A conflict-free merge, successful compile, and CLI validation still do not establish that a game works. No emulator or game compatibility has been certified by this project. Profile capabilities are parsed from each selected executable’s --help output at runtime, including safe fork-specific Advanced options; game-execution mode switches stay reserved. This verifies advertised CLI flags, not their behavior inside every game.
+AI tools were used to help develop and document this project. The project owner directs the work and is responsible for reviewing changes and releases. This statement does not imply that the KytyPS5 emulator itself was made with AI.
 
-## Validation on CachyOS (2026-10-18)
+## License
 
-At upstream commit `099de8dea62cbf17c8e06a6c24e72b38475d1566`, a fresh recursive checkout configured with Clang and Ninja, built the `launcher` target, and installed both `kyty_launcher` and `kyty_emulator`. The installed emulator executed `--help` successfully, and `ldd` reported no missing shared libraries. The verified installation was copied to Studio's XDG data directory and registered as the active build. `npm run build`, Rust tests, the Tauri native release build, and AppImage bundling succeeded. No game files were supplied, so actual game launch and compatibility remain unverified.
-
-
-## Worktree validation (2026-10-19)
-
-On the current macOS development host, `npm ci`, `npm run check`, `npm test` (31 files, 84 tests), `npm run build`, `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`, `cargo check --locked --manifest-path src-tauri/Cargo.toml`, `cargo test --locked --manifest-path src-tauri/Cargo.toml` (66 tests), and `npm run tauri build -- --no-bundle` completed successfully. Shared frontend data types, display formatting, image services, virtualized library components, community search state and debounced data loading, and the Home, Diagnostics, Game Details, Build Studio, Emulator Manager, Game Library, Settings, Repository Manager, Community PR filters and filter model, PR table, PR review/selection, PR detail, Community build history, launcher session views, and the application shell are extracted into reusable modules. App-level startup coverage verifies navigation with an empty library, and profile-editor coverage ensures save/reset stay disabled during asynchronous profile loading. Library columns now follow measured CSS gaps and a shared card minimum width; virtualization tests exercise 10, 100, 500, and 1,000 entries across responsive column counts, and component tests exercise bounded scrolling and gamepad focus. Narrow windows expose the remaining navigation sections through a keyboard-focusable More menu instead of hiding the scrollbar. Unused sidebar, hero, and legacy navigation CSS was removed along with conflicting responsive overrides; the built CSS bundle is now 57.81 kB (12.53 kB gzipped), down from 61.1 kB. Profiles can be copied between registered games and unsaved changes restored from the last saved snapshot. Community PR search uses GitHub repository search rather than filtering only the current page; results are enriched with current PR heads, page through the first 1,000 matches, display that API limit, and have a stale-cache fallback. Controller key mappings can be added, edited, and removed in the visual profile editor. Game icons and backgrounds now use bounded caches that retain URLs while displayed, preserve the previous artwork while a replacement loads, and receive downscaled PNG thumbnails from Rust (icons up to 512×512; backgrounds up to 1600×900) under bounded decoder memory and IPC payload limits; artwork reads are limited to two concurrent requests. Recursive game scans now run on Tauri's blocking worker pool while retaining progress events, and skip file or directory symlinks to avoid importing content outside the selected scan root. The Settings page reports sizes for managed emulator installs, interrupted partial installs, compiler cache, session logs, and community worktrees; cleanup removes only unregistered generated install folders without an emulator executable; compiler cache cleanup is limited to that cache and disabled during an active job. Community build source checkouts are removed after each build and can be safely cleared after an interrupted application run. Session logs can be cleared after explicit confirmation; completed-session history remains and active sessions block deletion. Emulator output is drained on nonblocking reader threads, Linux Stop Game pins the verified group leader with pidfd before signaling its process group; remaining process-group children are terminated after the emulator exits, and session plus compiler logs are each capped at 32 MiB with an explicit truncation marker. Session recovery now closes stale session state and adds playtime in one idempotent SQLite transaction. Build records now retain compiler, parallel job count, clean/incremental choice, and exact CMake arguments in a forward migration; the Emulator Manager exposes this configuration and compares two selected builds. Repository, build, game, host, and session refreshes now live in a tested data hook that discards stale snapshots; profile loading, build switching, copying and restoring use a separate tested hook that discards stale asynchronous responses. Profile editors also list unsupported options as disabled and explain that the selected executable does not advertise them. Structured, timestamped job output distinguishes repository cloning and updates, emulator compilation, community PR builds, and runtime events. Build and clone events carry backend-assigned job IDs, and the renderer drops stale events and buffers fast events until the start command returns its ID. Update checks and recursive game scans run on Tauri's blocking worker pool to keep the WebView responsive. Git subprocess output is drained with an 8 MiB capture cap so unusually large output cannot grow Studio memory without bound. Build and Git runners drain both pipes concurrently and terminate remaining process-group children before waiting for reader threads; cancellation escalates from SIGTERM to SIGKILL after a three-second grace period, and non-cancellable Git checks have a two-minute process timeout. Linux AppImage/Arch package generation and graphical testing on CachyOS were not run for this worktree. A graphical startup check was also attempted on this Mac, but the host was locked and could not be unlocked by the automation tool.
-
-Follow-up validation on 2026-10-19 compared the current KytyPS5 upstream `src/main.cpp` at `e5f0ee7fc2fb4ce88c6abb2fa02296404e2fe2a` against Studio’s configurable options; a regression test now checks the full Linux option set, and every Linux-advertised launch option is represented, while the Windows-only `--redzone` remains excluded. A profile identity guard now hides stale values and disables saving immediately on game/build changes, with race coverage in the profile hook tests. Vulkan GPU selection displays automatic mode explicitly and preserves saved device indexes that are absent from current diagnostics. Typography tokens now scale with viewport width and raise normal labels, diagnostics, navigation, and table text to the documented readable sizes; short windows get a more compact header and page padding. After these changes, `npm ci` completed with 0 reported vulnerabilities, all 84 frontend tests and 66 Rust tests passed, TypeScript and Rust checks passed, the frontend and native Tauri release builds succeeded, and the native process stayed alive for a 12-second startup smoke interval. The host was locked during graphical inspection, and Linux package/AppImage builds still require Linux CI or an Arch/CachyOS host.
-
-The follow-up build audit also confirmed the current upstream `KYTY_BUILD_LAUNCHER=OFF` option is used for the emulator-only build. Qt was removed from the Studio's required build-dependency diagnostics and from the CachyOS setup instructions. The Arch packaging metadata and CI now include Tauri's `appmenu-gtk-module` and `xdotool`/`libxdo` dependencies. The Arch CI job tests the PKGBUILD CPU-flag normalizers against `native`, `znver4`, and `skylake` examples before packaging. These packaging changes have not yet been exercised on Arch Linux. The PKGBUILD also normalizes Rust, C, and C++ CPU target flags for the x86_64 package so CachyOS host tuning such as `znver4` does not leak into the distributed binary.
+KytyPS5 Studio is released under the [MIT License](LICENSE). The KytyPS5 emulator is a separate project with its own license and terms; see its [official repository](https://github.com/KytyPS5/KytyPS5).

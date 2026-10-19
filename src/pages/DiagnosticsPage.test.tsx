@@ -51,7 +51,22 @@ describe("DiagnosticsPage", () => {
   });
 
   it("filters logs and offers export only when a log path is selected", () => {
+    const session = {
+      id: 4,
+      game_id: 2,
+      build_id: 3,
+      title: "Example Game",
+      started_at: 1_700_000_000,
+      ended_at: 1_700_000_060,
+      exit_code: 0,
+      outcome: "exited",
+      log_path: "/managed/session.log",
+      commit_sha: "abc123",
+      build_type: "Release",
+      pid: 99,
+    };
     const page = props({
+      sessions: [session],
       selectedLog: "info: started\nerror: device lost",
       selectedLogPath: "/managed/session.log",
       logFilter: "Error",

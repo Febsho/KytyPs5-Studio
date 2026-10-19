@@ -21,6 +21,7 @@ export type DiagnosticsPageProps = {
   >;
   onSelectSessionLog: (session: Session) => void;
   onExportLog: () => void;
+  onCopyLog?: () => void;
 };
 
 function logDiagnosis(log: string) {
@@ -52,6 +53,7 @@ export function DiagnosticsPage({
   setLogFilter,
   onSelectSessionLog,
   onExportLog,
+  onCopyLog,
 }: DiagnosticsPageProps) {
   return (
     <section className="page">
@@ -193,8 +195,9 @@ export function DiagnosticsPage({
       </div>
       {sessions.length ? (
         <div className="session-list">
-          {sessions.map((s) => (
-            <button key={s.id} onClick={() => onSelectSessionLog(s)}>
+          {sessions.slice(0, 10).map((s) => (
+            <div className="session-entry" key={s.id}>
+            <button aria-expanded={selectedLogPath === s.log_path && !!selectedLog} onClick={() => onSelectSessionLog(s)}>
               <div>
                 <strong>{s.title}</strong>
                 <small>
@@ -204,46 +207,24 @@ export function DiagnosticsPage({
               </div>
               <ChevronRight size={18} />
             </button>
+            {selectedLogPath === s.log_path && selectedLog && <div className="panel terminal session-inline-log">
+              <div className="terminal-title"><Terminal size={16} /> Session log
+                <button className="outline" onClick={() => onCopyLog?.()}>Copy log</button>
+                {selectedLogPath && <button className="outline" onClick={onExportLog}>Export log</button>}
+                <select value={logFilter} onChange={(e) => setLogFilter(e.target.value as typeof logFilter)}>
+                  <option>All</option><option>Info</option><option>Warning</option><option>Error</option><option>Debug</option>
+                </select>
+              </div>
+              {logDiagnosis(selectedLog) && <p className="diagnosis-note">{logDiagnosis(selectedLog)}</p>}
+              <pre>{selectedLog.split("\n").filter((line) => logFilter === "All" || logLineLevel(line) === logFilter).join("\n") || `No ${logFilter.toLowerCase()} lines in this log.`}</pre>
+            </div>}
+            </div>
           ))}
         </div>
       ) : (
         <div className="empty compact">
           <Activity />
           <strong>No sessions recorded</strong>
-        </div>
-      )}
-      {selectedLog && (
-        <div className="panel terminal">
-          <div className="terminal-title">
-            <Terminal size={16} /> Selected session log
-            {selectedLogPath && (
-              <button className="outline" onClick={onExportLog}>
-                Export log
-              </button>
-            )}
-            <select
-              value={logFilter}
-              onChange={(e) => setLogFilter(e.target.value as typeof logFilter)}
-            >
-              <option>All</option>
-              <option>Info</option>
-              <option>Warning</option>
-              <option>Error</option>
-              <option>Debug</option>
-            </select>
-          </div>
-          {logDiagnosis(selectedLog) && (
-            <p className="diagnosis-note">{logDiagnosis(selectedLog)}</p>
-          )}
-          <pre>
-            {selectedLog
-              .split("\n")
-              .filter(
-                (line) =>
-                  logFilter === "All" || logLineLevel(line) === logFilter,
-              )
-              .join("\n") || `No ${logFilter.toLowerCase()} lines in this log.`}
-          </pre>
         </div>
       )}
     </section>

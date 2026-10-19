@@ -55,9 +55,17 @@ export function CommunityBuildHistory({
                   <small>
                     {entry.repository} · base {short(entry.base_sha)} (
                     {entry.base_branch})<br />
-                    {entry.pull_requests
-                      .map(([number, sha]) => `#${number} ${short(sha)}`)
-                      .join(" · ")}
+                    {entry.pull_requests.map(([number, sha]) => (
+                      <a
+                        className="community-pr-link"
+                        key={`${number}-${sha}`}
+                        href={`https://github.com/${entry.repository}/pull/${number}`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        #{number} · {short(sha)} ↗
+                      </a>
+                    ))}
                     <br />
                     {hasNewHeads
                       ? "PR commits updated on GitHub · rebuild available"

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SettingsPageProps } from "./SettingsPage";
 import { SettingsPage } from "./SettingsPage";
@@ -73,23 +73,23 @@ describe("SettingsPage", () => {
     });
   });
 
-  it("keeps credential storage and cache cleanup actions explicit", () => {
+  it("keeps credential storage and cache cleanup actions explicit", async () => {
     const page = props();
     render(<SettingsPage {...page} />);
 
     fireEvent.click(screen.getByRole("button", { name: "Save securely" }));
     expect(page.onSaveGithubToken).toHaveBeenCalledWith("secret-value");
     fireEvent.click(screen.getByRole("button", { name: "Refresh sizes" }));
-    expect(page.onRefreshStorage).toHaveBeenCalledOnce();
+    await waitFor(() => expect(page.onRefreshStorage).toHaveBeenCalledOnce());
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     fireEvent.click(
       screen.getByRole("button", { name: "Clear compiler cache" }),
     );
     expect(confirm).toHaveBeenCalledOnce();
-    expect(page.onClearCompilerCache).toHaveBeenCalledOnce();
+    await waitFor(() => expect(page.onClearCompilerCache).toHaveBeenCalledOnce());
   });
 
-  it("confirms temporary community checkout cleanup using the measured size", () => {
+  it("confirms temporary community checkout cleanup using the measured size", async () => {
     const page = props({
       storageReport: {
         categories: [
@@ -109,10 +109,10 @@ describe("SettingsPage", () => {
     expect(confirm).toHaveBeenCalledWith(
       expect.stringContaining("Remove 2048 B"),
     );
-    expect(page.onClearCommunityWorktrees).toHaveBeenCalledOnce();
+    await waitFor(() => expect(page.onClearCommunityWorktrees).toHaveBeenCalledOnce());
   });
 
-  it("requires explicit confirmation before deleting session logs", () => {
+  it("requires explicit confirmation before deleting session logs", async () => {
     const page = props({
       storageReport: {
         categories: [
@@ -126,10 +126,10 @@ describe("SettingsPage", () => {
     expect(confirm).toHaveBeenCalledWith(
       expect.stringContaining("Session history and outcomes will remain"),
     );
-    expect(page.onClearSessionLogs).toHaveBeenCalledOnce();
+    await waitFor(() => expect(page.onClearSessionLogs).toHaveBeenCalledOnce());
   });
 
-  it("confirms cleanup of measured incomplete installations", () => {
+  it("confirms cleanup of measured incomplete installations", async () => {
     const page = props({
       storageReport: {
         categories: [
@@ -141,7 +141,7 @@ describe("SettingsPage", () => {
     render(<SettingsPage {...page} />);
     fireEvent.click(screen.getByRole("button", { name: "Clear incomplete builds" }));
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining("Remove 8192 B"));
-    expect(page.onCleanIncompleteBuilds).toHaveBeenCalledOnce();
+    await waitFor(() => expect(page.onCleanIncompleteBuilds).toHaveBeenCalledOnce());
   });
 
   it("disables session-log cleanup while an emulator session is active", () => {

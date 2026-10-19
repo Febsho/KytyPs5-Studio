@@ -43,7 +43,7 @@ describe("App startup", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    expect(await screen.findByText("No imported games")).toBeTruthy();
+    expect(await screen.findByRole("button", { name: /import game folder/i })).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Library" }));
     await waitFor(() => expect(screen.getByText("Your library is empty")).toBeTruthy());
   });

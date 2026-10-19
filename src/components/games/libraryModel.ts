@@ -12,6 +12,12 @@ export type GameLibraryItem = {
 export type LibraryFilter = 'all' | 'favorites' | 'recent';
 export type LibrarySort = 'title' | 'recent' | 'playtime' | 'size';
 
+const genericExecutableTitles = /^(?:app(?:0)?|eboot(?:\.bin)?|unknown(?: game)?|game)$/i;
+
+export function isPubliclyRecognizedGame(game: Pick<GameLibraryItem, 'title' | 'title_id'>): boolean {
+  return Boolean(game.title_id?.trim()) && !genericExecutableTitles.test(game.title.trim());
+}
+
 export function filterAndSortGames<T extends GameLibraryItem>(
   games: readonly T[],
   query: string,

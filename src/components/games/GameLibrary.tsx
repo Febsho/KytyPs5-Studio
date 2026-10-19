@@ -1,19 +1,72 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Gamepad2 } from "lucide-react";
+import type { MouseEvent as ReactMouseEvent } from "react";
+import { Gamepad2, Trash2 } from "lucide-react";
 import type { Game } from "../../types/studio";
 import { getGridColumnCount, getVirtualWindow } from "./virtualWindow";
 import { date, formatBytes } from "../../utils/format";
 import { loadGameIcon, retainGameIcon } from "../../services/gameArtwork";
 
+export function GameContextMenu({
+  game,
+  x,
+  y,
+  onClose,
+  onDetails,
+  onRemove,
+}: {
+  game: Game;
+  x: number;
+  y: number;
+  onClose: () => void;
+  onDetails: (game: Game) => void;
+  onRemove?: (game: Game) => void;
+}) {
+  const menu = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const dismiss = (event: PointerEvent) => {
+      if (!menu.current?.contains(event.target as Node)) onClose();
+    };
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("pointerdown", dismiss);
+    document.addEventListener("keydown", keydown);
+    return () => {
+      document.removeEventListener("pointerdown", dismiss);
+      document.removeEventListener("keydown", keydown);
+    };
+  }, [onClose]);
+  return (
+    <div
+      ref={menu}
+      className="game-context-menu"
+      role="menu"
+      aria-label={`${game.title} actions`}
+      style={{ left: Math.min(x, window.innerWidth - 216), top: Math.min(y, window.innerHeight - 112) }}
+    >
+      <button role="menuitem" onClick={() => onDetails(game)}>
+        Game details
+      </button>
+      {onRemove && (
+        <button className="danger-action" role="menuitem" onClick={() => onRemove(game)}>
+          <Trash2 size={14} /> Remove from library
+        </button>
+      )}
+    </div>
+  );
+}
+
 export function GameCard({
   game,
   selected,
   onSelect,
+  onContextMenu,
   mode,
 }: {
   game: Game;
   selected: boolean;
   onSelect: () => void;
+  onContextMenu?: (game: Game, event: ReactMouseEvent<HTMLButtonElement>) => void;
   mode: "grid" | "list";
 }) {
   const element = useRef<HTMLButtonElement>(null);
@@ -60,6 +113,7 @@ export function GameCard({
       data-game-id={game.id}
       className={`game-card ${mode} ${selected ? "selected" : ""}`}
       onClick={onSelect}
+      onContextMenu={(event) => onContextMenu?.(game, event)}
     >
       <div className="game-art">
         {icon ? (
@@ -85,10 +139,12 @@ export function HomeGameTile({
   game,
   selected,
   onSelect,
+  onContextMenu,
 }: {
   game: Game;
   selected: boolean;
   onSelect: () => void;
+  onContextMenu?: (game: Game, event: ReactMouseEvent<HTMLButtonElement>) => void;
 }) {
   const [icon, setIcon] = useState<string | null>(null);
   useEffect(() => {
@@ -106,7 +162,9 @@ export function HomeGameTile({
     <button
       className={`home-game-tile ${selected ? "selected" : ""}`}
       onClick={onSelect}
+      onContextMenu={(event) => onContextMenu?.(game, event)}
       aria-pressed={selected}
+      aria-label={game.title}
     >
       <span className="home-game-art">
         {icon ? (
@@ -114,8 +172,8 @@ export function HomeGameTile({
         ) : (
           <Gamepad2 size={25} />
         )}
+        <span className="home-game-title">{game.title}</span>
       </span>
-      <strong title={game.title}>{game.title}</strong>
     </button>
   );
 }
@@ -123,11 +181,13 @@ export function VirtualGameGrid({
   games,
   selectedId,
   onSelect,
+  onContextMenu,
   mode,
 }: {
   games: Game[];
   selectedId: number | undefined;
   onSelect: (id: number) => void;
+  onContextMenu?: (game: Game, event: ReactMouseEvent<HTMLButtonElement>) => void;
   mode: "grid" | "list";
 }) {
   const grid = useRef<HTMLDivElement>(null);
@@ -287,6 +347,7 @@ export function VirtualGameGrid({
           game={game}
           selected={selectedId === game.id}
           onSelect={() => onSelect(game.id)}
+          onContextMenu={onContextMenu}
           mode={mode}
         />
       ))}

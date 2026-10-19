@@ -1,0 +1,32 @@
+pkgname=kytyps5-studio
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Linux desktop manager for KytyPS5 sources, builds, and games'
+arch=('x86_64')
+url='https://github.com/KytyPS5/KytyPS5'
+license=('MIT')
+options=('!lto')
+depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'librsvg' 'xdg-utils' 'libnotify' 'libsecret')
+makedepends=('nodejs' 'npm' 'rust' 'cargo')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  npm ci
+  # CachyOS may inject target-cpu=native through /etc/makepkg.conf's Rust config.
+  # Keep Rust artifacts usable across x86_64 Arch machines without changing host config.
+  export RUSTFLAGS="${RUSTFLAGS//-C target-cpu=native/-C target-cpu=x86-64}"
+  # The host makepkg C/C++ flags can also target the build CPU (for example znver4).
+  export CFLAGS="${CFLAGS/-march=native/-march=x86-64}"
+  export CXXFLAGS="${CXXFLAGS/-march=native/-march=x86-64}"
+  npm run tauri build -- --no-bundle
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+  install -Dm755 src-tauri/target/release/kytyps5-studio "$pkgdir/usr/bin/kytyps5-studio"
+  install -Dm644 src-tauri/icons/icon.png "$pkgdir/usr/share/icons/hicolor/512x512/apps/kytyps5-studio.png"
+  install -Dm644 packaging/arch/kytyps5-studio.desktop "$pkgdir/usr/share/applications/kytyps5-studio.desktop"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/kytyps5-studio/LICENSE"
+}

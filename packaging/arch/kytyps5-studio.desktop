@@ -1,0 +1,9 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Type=Application
+Name=KytyPS5 Studio
+Comment=Manage KytyPS5 builds and games
+Exec=kytyps5-studio
+Icon=kytyps5-studio
+Terminal=false
+Categories=Game;

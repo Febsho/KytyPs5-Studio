@@ -1,15 +1,20 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
-    env, fs,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    collections::{BTreeMap, HashMap, HashSet},
+    env,
+    ffi::OsString,
+    fs,
+    io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write},
+    os::fd::AsRawFd,
+    os::unix::fs::MetadataExt,
     os::unix::fs::PermissionsExt,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicI32, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -293,6 +298,134 @@ fn migrate(db: &mut Connection) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
     }
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version < 10 {
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        // GitHub credentials belong in Secret Service. Remove only the
+        // insecure legacy generic-setting copy; existing Secret Service
+        // credentials and all other settings remain intact.
+        let settings_table_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if settings_table_exists {
+            tx.execute("DELETE FROM settings WHERE key='github_token'", [])
+                .map_err(|e| e.to_string())?;
+        }
+        tx.pragma_update(None, "user_version", 10)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version < 11 {
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        let table_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='profiles')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let exists: bool = table_exists && tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('profiles') WHERE name='options_json')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if table_exists && !exists {
+            tx.execute_batch(
+                "ALTER TABLE profiles ADD COLUMN options_json TEXT NOT NULL DEFAULT '{}';",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.pragma_update(None, "user_version", 11)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version < 12 {
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS global_profile_defaults(id INTEGER PRIMARY KEY CHECK(id=1), options_json TEXT NOT NULL DEFAULT '{}'); INSERT OR IGNORE INTO global_profile_defaults(id,options_json) VALUES(1,'{}');")
+            .map_err(|e| e.to_string())?;
+        tx.pragma_update(None, "user_version", 12)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version < 13 {
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        let has_games: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='games')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if has_games {
+            let has_hidden: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('games') WHERE name='hidden')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if !has_hidden {
+                tx.execute_batch("ALTER TABLE games ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;")
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.pragma_update(None, "user_version", 13)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version < 14 {
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS manual_compatibility_observations(id INTEGER PRIMARY KEY,game_id INTEGER NOT NULL REFERENCES games(id),repo_id INTEGER NOT NULL REFERENCES repositories(id),build_id INTEGER NOT NULL REFERENCES builds(id),commit_sha TEXT NOT NULL,build_type TEXT NOT NULL,patch_config_json TEXT NOT NULL, outcome TEXT NOT NULL,notes TEXT NOT NULL DEFAULT '',observed_at INTEGER NOT NULL);")
+            .map_err(|e| e.to_string())?;
+        tx.pragma_update(None, "user_version", 14)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version < 15 {
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        let columns = {
+            let mut statement = tx
+                .prepare("PRAGMA table_info(builds)")
+                .map_err(|e| e.to_string())?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        if !columns.is_empty() && !columns.iter().any(|column| column == "configuration_json") {
+            tx.execute_batch(
+                "ALTER TABLE builds ADD COLUMN configuration_json TEXT NOT NULL DEFAULT '{}';",
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.pragma_update(None, "user_version", 15)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 #[derive(Serialize)]
@@ -318,9 +451,17 @@ struct Build {
     executable_status: String,
     install_size_bytes: Option<u64>,
     validation_status: String,
+    configuration: BuildConfiguration,
     last_session_at: Option<i64>,
     last_session_outcome: Option<String>,
     last_session_exit_code: Option<i32>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct BuildConfiguration {
+    compiler: Option<String>,
+    jobs: Option<u16>,
+    clean: Option<bool>,
+    cmake_arguments: Vec<String>,
 }
 #[derive(Serialize)]
 struct Game {
@@ -335,6 +476,7 @@ struct Game {
     game_version: Option<String>,
     icon_path: Option<String>,
     install_size: Option<i64>,
+    file_status: String,
 }
 #[derive(Serialize)]
 struct GameCompatibility {
@@ -348,6 +490,18 @@ struct GameCompatibility {
     gameplay_status: String,
     playable_status: String,
 }
+#[derive(Serialize)]
+struct ManualCompatibilityObservation {
+    id: i64,
+    outcome: String,
+    notes: String,
+    observed_at: i64,
+    repository: String,
+    build_id: i64,
+    build_commit: String,
+    build_type: String,
+    patch_config_json: String,
+}
 #[derive(Deserialize, Serialize, Default)]
 struct Profile {
     screen_width: Option<u32>,
@@ -359,6 +513,77 @@ struct Profile {
     controller_volume: Option<u32>,
     controller_vibration: Option<u32>,
     keyboard_player: Option<u32>,
+    #[serde(default)]
+    options: BTreeMap<String, String>,
+}
+
+fn merge_legacy_profile_options(profile: &mut Profile) {
+    let mut insert = |flag: &str, value: Option<String>| {
+        if let Some(value) = value {
+            profile.options.entry(flag.to_string()).or_insert(value);
+        }
+    };
+    insert(
+        "--screen-width",
+        profile.screen_width.map(|value| value.to_string()),
+    );
+    insert(
+        "--screen-height",
+        profile.screen_height.map(|value| value.to_string()),
+    );
+    insert("--present-mode", profile.present_mode.clone());
+    if profile.perf_overlay {
+        insert("--perf-overlay", Some("true".into()));
+    }
+    if profile.fullscreen {
+        insert("--fullscreen", Some("true".into()));
+    }
+    insert("--controller-color", profile.controller_color.clone());
+    insert(
+        "--controller-volume",
+        profile.controller_volume.map(|value| value.to_string()),
+    );
+    insert(
+        "--controller-vibration",
+        profile.controller_vibration.map(|value| value.to_string()),
+    );
+    insert(
+        "--keyboard-player",
+        profile.keyboard_player.map(|value| value.to_string()),
+    );
+}
+
+fn sync_legacy_profile_fields(profile: &mut Profile) {
+    profile.screen_width = profile
+        .options
+        .get("--screen-width")
+        .and_then(|v| v.parse().ok());
+    profile.screen_height = profile
+        .options
+        .get("--screen-height")
+        .and_then(|v| v.parse().ok());
+    profile.present_mode = profile.options.get("--present-mode").cloned();
+    profile.perf_overlay = profile
+        .options
+        .get("--perf-overlay")
+        .is_some_and(|value| value == "true");
+    profile.fullscreen = profile
+        .options
+        .get("--fullscreen")
+        .is_some_and(|value| value == "true");
+    profile.controller_color = profile.options.get("--controller-color").cloned();
+    profile.controller_volume = profile
+        .options
+        .get("--controller-volume")
+        .and_then(|v| v.parse().ok());
+    profile.controller_vibration = profile
+        .options
+        .get("--controller-vibration")
+        .and_then(|v| v.parse().ok());
+    profile.keyboard_player = profile
+        .options
+        .get("--keyboard-player")
+        .and_then(|v| v.parse().ok());
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -372,10 +597,113 @@ struct ProfileCapabilities {
     controller_volume: bool,
     controller_vibration: bool,
     keyboard_player: bool,
+    options: Vec<String>,
+    switch_options: Vec<String>,
+}
+
+const CONFIGURABLE_CLI_OPTIONS: &[&str] = &[
+    "--addcont-dir",
+    "--amd-cpu",
+    "--command-buffer-dump",
+    "--command-buffer-dump-folder",
+    "--console-language",
+    "--controller-color",
+    "--controller-volume",
+    "--controller-vibration",
+    "--fullscreen",
+    "--game-patch",
+    "--gpu",
+    "--gpu-assisted-validation",
+    "--graphics-debug-dump",
+    "--hdr",
+    "--hide-cursor",
+    "--keyboard-player",
+    "--keymap",
+    "--mic",
+    "--network-connected",
+    "--no-splash",
+    "--playgo-hack",
+    "--perf-overlay",
+    "--present-mode",
+    "--printf-direction",
+    "--printf-output-file",
+    "--profile",
+    "--readback-linear-images",
+    "--rd",
+    "--shader-log-direction",
+    "--shader-log-folder",
+    "--shader-optimization-type",
+    "--shader-validation",
+    "--screen-height",
+    "--screen-width",
+    "--skip-notice-screen",
+    "--spirv-debug-printf",
+    "--sync-raw-image-buffers",
+    "--tessellation",
+    "--trophy-duration",
+    "--trophy-notifications",
+    "--user-id",
+    "--user-name",
+    "--vblank-frequency",
+    "--vr",
+    "--vulkan-validation",
+];
+
+fn cli_switch_options() -> &'static [&'static str] {
+    &[
+        "--amd-cpu",
+        "--fullscreen",
+        "--hdr",
+        "--hide-cursor",
+        "--no-splash",
+        "--playgo-hack",
+        "--profile",
+        "--rd",
+        "--tessellation",
+        "--vr",
+    ]
+}
+
+fn cli_boolean_options() -> &'static [&'static str] {
+    &[
+        "--command-buffer-dump",
+        "--gpu-assisted-validation",
+        "--graphics-debug-dump",
+        "--network-connected",
+        "--readback-linear-images",
+        "--perf-overlay",
+        "--shader-validation",
+        "--skip-notice-screen",
+        "--spirv-debug-printf",
+        "--sync-raw-image-buffers",
+        "--trophy-notifications",
+        "--vulkan-validation",
+    ]
 }
 
 fn profile_capabilities(help: &str) -> ProfileCapabilities {
-    let has = |flag: &str| help.lines().any(|line| line.trim_start().starts_with(flag));
+    let parsed: Vec<(&str, bool)> = help
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let flag = words.next()?;
+            if !flag.starts_with("--")
+                || !flag[2..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                return None;
+            }
+            let takes_value = words
+                .next()
+                .is_some_and(|word| word.starts_with('<') || word.starts_with('['));
+            Some((flag, takes_value))
+        })
+        .collect();
+    let supported: HashSet<&str> = parsed.iter().map(|(flag, _)| *flag).collect();
+    let reserved = ["--game", "--guest-exec", "--help"];
+    let configurable = |flag: &&str| !reserved.contains(flag);
+    let has = |flag: &str| supported.contains(flag);
     ProfileCapabilities {
         screen_width: has("--screen-width"),
         screen_height: has("--screen-height"),
@@ -386,6 +714,17 @@ fn profile_capabilities(help: &str) -> ProfileCapabilities {
         controller_volume: has("--controller-volume"),
         controller_vibration: has("--controller-vibration"),
         keyboard_player: has("--keyboard-player"),
+        options: parsed
+            .iter()
+            .map(|(flag, _)| *flag)
+            .filter(configurable)
+            .map(str::to_string)
+            .collect(),
+        switch_options: parsed
+            .iter()
+            .filter(|(flag, takes_value)| !takes_value && configurable(flag))
+            .map(|(flag, _)| (*flag).to_string())
+            .collect(),
     }
 }
 
@@ -404,12 +743,42 @@ fn build_for_game(c: &Connection, game_id: i64) -> Result<Build, String> {
 
 fn capabilities_for_build(b: &Build) -> Result<ProfileCapabilities, String> {
     let exe = Path::new(&b.path).join("kyty_emulator");
-    let help = emulator_help(&exe)?;
-    Ok(profile_capabilities(&help))
+    let canonical = fs::canonicalize(&exe).map_err(|e| e.to_string())?;
+    let metadata = fs::metadata(&canonical).map_err(|e| e.to_string())?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let key = format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}",
+        canonical.display(),
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        modified,
+        metadata.permissions().mode(),
+        metadata.ctime(),
+        metadata.ctime_nsec()
+    );
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<String, ProfileCapabilities>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(capabilities) = cache.lock().map_err(|e| e.to_string())?.get(&key).cloned() {
+        return Ok(capabilities);
+    }
+    let capabilities = profile_capabilities(&emulator_help(&canonical)?);
+    let mut cache = cache.lock().map_err(|e| e.to_string())?;
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(key, capabilities.clone());
+    Ok(capabilities)
 }
 fn profile(c: &Connection, game_id: i64) -> Result<Profile, String> {
-    Ok(c.query_row(
-        "SELECT screen_width,screen_height,present_mode,perf_overlay,fullscreen,controller_color,controller_volume,controller_vibration,keyboard_player FROM profiles WHERE game_id=?",
+    let mut profile = c.query_row(
+        "SELECT screen_width,screen_height,present_mode,perf_overlay,fullscreen,controller_color,controller_volume,controller_vibration,keyboard_player,options_json FROM profiles WHERE game_id=?",
         [game_id],
         |r| {
             Ok(Profile {
@@ -419,12 +788,335 @@ fn profile(c: &Connection, game_id: i64) -> Result<Profile, String> {
                 perf_overlay: r.get::<_, i64>(3)? != 0,
                 fullscreen: r.get::<_, i64>(4)? != 0,
                 controller_color: r.get(5)?, controller_volume: r.get(6)?, controller_vibration: r.get(7)?, keyboard_player: r.get(8)?,
+                options: serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default(),
             })
         },
     )
     .optional()
     .map_err(|e| e.to_string())?
-    .unwrap_or_default())
+    .unwrap_or_default();
+    merge_legacy_profile_options(&mut profile);
+    Ok(profile)
+}
+fn global_profile_options(c: &Connection) -> Result<BTreeMap<String, String>, String> {
+    let json: String = c
+        .query_row(
+            "SELECT options_json FROM global_profile_defaults WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::from_str(&json).unwrap_or_default())
+}
+fn validate_extra_profile_options(
+    options: &BTreeMap<String, String>,
+    capabilities: &ProfileCapabilities,
+) -> Result<(), String> {
+    for (flag, value) in options {
+        if !capabilities
+            .options
+            .iter()
+            .any(|supported| supported == flag)
+        {
+            return Err(format!("The selected emulator does not support {flag}"));
+        }
+        if !CONFIGURABLE_CLI_OPTIONS.contains(&flag.as_str()) {
+            if flag.len() > 128
+                || !flag.strip_prefix("--").is_some_and(|name| {
+                    !name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+            {
+                return Err(format!("Invalid emulator option name: {flag}"));
+            }
+            if capabilities.switch_options.contains(flag) {
+                if !["true", "false"].contains(&value.as_str()) {
+                    return Err(format!("{flag} must be true or false"));
+                }
+            } else if value.trim().is_empty() || value.len() > 4096 {
+                return Err(format!("{flag} must have a value between 1 and 4096 bytes"));
+            }
+            continue;
+        }
+        if cli_switch_options().contains(&flag.as_str()) {
+            if !["true", "false"].contains(&value.as_str()) {
+                return Err(format!("{flag} must be true or false"));
+            }
+            continue;
+        }
+        if cli_boolean_options().contains(&flag.as_str()) {
+            if !["true", "false"].contains(&value.as_str()) {
+                return Err(format!("{flag} must be true or false"));
+            }
+            continue;
+        }
+        match flag.as_str() {
+            "--screen-width" | "--screen-height" => {
+                let pixels = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("{flag} must be a positive 32-bit integer"))?;
+                if pixels == 0 {
+                    return Err(format!("{flag} must be greater than zero"));
+                }
+            }
+            "--present-mode" => {
+                if !["Fifo", "Mailbox", "Immediate"].contains(&value.as_str()) {
+                    return Err("Present mode must be Fifo, Mailbox, or Immediate".into());
+                }
+            }
+            "--controller-color" => {
+                if value.len() != 7
+                    || !value.starts_with('#')
+                    || !value.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+                {
+                    return Err("Controller color must use #RRGGBB format".into());
+                }
+            }
+            "--controller-volume" | "--controller-vibration" => {
+                let amount = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("{flag} must be between 0 and 100"))?;
+                if amount > 100 {
+                    return Err(format!("{flag} must be between 0 and 100"));
+                }
+            }
+            "--keyboard-player" => {
+                let player = value
+                    .parse::<u32>()
+                    .map_err(|_| "Keyboard player must be between 0 and 4".to_string())?;
+                if player > 4 {
+                    return Err("Keyboard player must be between 0 and 4".into());
+                }
+            }
+            "--gpu" => {
+                let index = value
+                    .parse::<i32>()
+                    .map_err(|_| "GPU index must be a signed integer".to_string())?;
+                if index < -1 {
+                    return Err("GPU index must be -1 for automatic selection or a non-negative device index".into());
+                }
+            }
+            "--vblank-frequency" => {
+                let frequency = value
+                    .parse::<u32>()
+                    .map_err(|_| "VBlank frequency must be between 30 and 360 Hz".to_string())?;
+                if !(30..=360).contains(&frequency) {
+                    return Err("VBlank frequency must be between 30 and 360 Hz".into());
+                }
+            }
+            "--trophy-duration" => {
+                let seconds = value
+                    .parse::<u32>()
+                    .map_err(|_| "Trophy duration must be an integer".to_string())?;
+                if !(5..=10).contains(&seconds) {
+                    return Err("Trophy duration must be between 5 and 10 seconds".into());
+                }
+            }
+            "--console-language" => {
+                let language = value
+                    .parse::<u32>()
+                    .map_err(|_| "Console language must be between 0 and 29".to_string())?;
+                if language > 29 {
+                    return Err("Console language must be between 0 and 29".into());
+                }
+            }
+            "--shader-optimization-type" => {
+                if !["None", "Size", "Performance"].contains(&value.as_str()) {
+                    return Err("Shader optimization must be None, Size, or Performance".into());
+                }
+            }
+            "--shader-log-direction" | "--printf-direction" => {
+                if !["Silent", "Console", "File"].contains(&value.as_str()) {
+                    return Err(format!("{flag} must be Silent, Console, or File"));
+                }
+            }
+            "--user-name" => {
+                if value.is_empty() || value.len() > 16 {
+                    return Err("Username must contain 1 to 16 UTF-8 bytes".into());
+                }
+            }
+            "--user-id" => {
+                let id = value
+                    .parse::<i32>()
+                    .map_err(|_| "User ID must be a valid signed integer".to_string())?;
+                let max_user_id = i32::MAX - 3 * 0x100;
+                if id < 0 || id > max_user_id || id == 0xfe || id == 0xff {
+                    return Err(format!(
+                        "User ID must be between 0 and {max_user_id} and cannot use the reserved IDs 254 or 255"
+                    ));
+                }
+            }
+            "--keymap" => {
+                let mappings = value.lines().filter(|line| !line.trim().is_empty());
+                let mut count = 0;
+                for mapping in mappings {
+                    let Some((control, input)) = mapping.split_once('=') else {
+                        return Err("Each controller mapping must use Control=Input format".into());
+                    };
+                    if control.trim().is_empty() || input.trim().is_empty() {
+                        return Err(
+                            "Controller mappings cannot have an empty control or input".into()
+                        );
+                    }
+                    count += 1;
+                }
+                if count == 0 {
+                    return Err("Add at least one controller mapping or reset the option".into());
+                }
+            }
+            "--mic" => {
+                if value.trim().is_empty() || value.len() > 256 {
+                    return Err("Microphone name must contain 1 to 256 bytes".into());
+                }
+            }
+            "--game-patch" => {
+                let path = fs::canonicalize(value)
+                    .map_err(|_| format!("{flag} must point to an existing file"))?;
+                if !path.is_file() {
+                    return Err(format!("{flag} must point to an existing file"));
+                }
+            }
+            "--printf-output-file" => {
+                let path = Path::new(value);
+                let parent = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                if path.file_name().is_none() || !parent.is_dir() {
+                    return Err(
+                        "Guest printf output must be a file inside an existing directory".into(),
+                    );
+                }
+                if path
+                    .symlink_metadata()
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err("Guest printf output cannot be a symbolic link".into());
+                }
+                if path.exists() && !path.is_file() {
+                    return Err("Guest printf output path must be a file".into());
+                }
+            }
+            "--addcont-dir" | "--shader-log-folder" | "--command-buffer-dump-folder" => {
+                let path = fs::canonicalize(value)
+                    .map_err(|_| format!("{flag} must point to an existing directory"))?;
+                if !path.is_dir() {
+                    return Err(format!("{flag} must point to an existing directory"));
+                }
+            }
+            _ => {
+                if value.trim().is_empty() {
+                    return Err(format!("{flag} cannot be empty"));
+                }
+            }
+        }
+    }
+    if options
+        .get("--gpu-assisted-validation")
+        .is_some_and(|v| v == "true")
+        && options
+            .get("--vulkan-validation")
+            .is_some_and(|v| v == "false")
+    {
+        return Err("GPU-assisted validation requires Vulkan validation".into());
+    }
+    if options
+        .get("--gpu-assisted-validation")
+        .is_some_and(|v| v == "true")
+        && !capabilities
+            .options
+            .iter()
+            .any(|v| v == "--vulkan-validation")
+    {
+        return Err(
+            "GPU-assisted validation requires Vulkan validation support in this emulator".into(),
+        );
+    }
+    Ok(())
+}
+fn effective_profile_options(
+    global: &BTreeMap<String, String>,
+    game: &BTreeMap<String, String>,
+    capabilities: &ProfileCapabilities,
+) -> Result<BTreeMap<String, String>, String> {
+    if let Some(unsupported) = game.keys().find(|flag| {
+        !capabilities
+            .options
+            .iter()
+            .any(|supported| supported == *flag)
+    }) {
+        return Err(format!(
+            "The selected emulator build no longer supports {unsupported}; clear unsupported game options before launching"
+        ));
+    }
+    let mut effective: BTreeMap<_, _> = global
+        .iter()
+        .filter(|(flag, _)| {
+            capabilities
+                .options
+                .iter()
+                .any(|supported| supported == *flag)
+        })
+        .map(|(flag, value)| (flag.clone(), value.clone()))
+        .collect();
+    effective.extend(
+        game.iter()
+            .map(|(flag, value)| (flag.clone(), value.clone())),
+    );
+    validate_extra_profile_options(&effective, capabilities)?;
+    Ok(effective)
+}
+fn canonicalize_option_path(flag: &str, value: &str) -> Result<String, String> {
+    if flag == "--printf-output-file" {
+        let path = Path::new(value);
+        let name = path
+            .file_name()
+            .ok_or("Guest printf output needs a file name")?;
+        let parent_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent =
+            fs::canonicalize(parent_path).map_err(|e| format!("Invalid output folder: {e}"))?;
+        return Ok(parent.join(name).display().to_string());
+    }
+    fs::canonicalize(value)
+        .map(|path| path.display().to_string())
+        .map_err(|e| format!("Invalid path for {flag}: {e}"))
+}
+fn extra_profile_arguments(
+    options: &BTreeMap<String, String>,
+    dynamic_switches: &[String],
+) -> Vec<OsString> {
+    let mut args = Vec::new();
+    if options
+        .get("--gpu-assisted-validation")
+        .is_some_and(|value| value == "true")
+        && !options.contains_key("--vulkan-validation")
+    {
+        args.push(OsString::from("--vulkan-validation"));
+        args.push(OsString::from("true"));
+    }
+    for (flag, value) in options {
+        if cli_switch_options().contains(&flag.as_str())
+            || dynamic_switches.iter().any(|switch| switch == flag)
+        {
+            if value == "true" {
+                args.push(flag.into());
+            }
+        } else if flag == "--keymap" {
+            for mapping in value.lines().filter(|line| !line.trim().is_empty()) {
+                args.push(flag.into());
+                args.push(mapping.trim().into());
+            }
+        } else {
+            args.push(flag.into());
+            args.push(value.into());
+        }
+    }
+    args
 }
 #[derive(Serialize)]
 struct SystemInfo {
@@ -453,20 +1145,49 @@ struct Dependency {
 }
 #[derive(Serialize, Clone)]
 struct JobEvent {
+    job_id: u64,
+    timestamp_ms: u64,
+    channel: String,
     kind: String,
     phase: String,
     line: String,
     done: bool,
     success: bool,
 }
+#[derive(Serialize, Clone)]
+struct GameScanEvent {
+    scan_id: u64,
+    phase: String,
+    completed: u64,
+    total: u64,
+    current: String,
+    done: bool,
+}
+#[derive(Serialize)]
+struct GameScanResult {
+    imported: usize,
+    already_registered: usize,
+    rejected: usize,
+}
+static NEXT_GAME_SCAN_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_JOB_ID: AtomicU64 = AtomicU64::new(0);
+static SESSION_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
 struct Jobs {
     pid: AtomicI32,
     active: AtomicBool,
+    job_id: AtomicU64,
+    event_kind: Mutex<String>,
     cancel_requested: AtomicBool,
     cancellable: AtomicBool,
     control: Mutex<()>,
 }
-fn begin_job(jobs: &Jobs, message: &str, cancellable: bool) -> Result<(), String> {
+fn begin_job(
+    jobs: &Jobs,
+    message: &str,
+    cancellable: bool,
+    event_kind: &str,
+) -> Result<u64, String> {
     let _control = jobs.control.lock().map_err(|error| error.to_string())?;
     if jobs.active.swap(true, Ordering::SeqCst) {
         return Err(message.to_string());
@@ -474,7 +1195,11 @@ fn begin_job(jobs: &Jobs, message: &str, cancellable: bool) -> Result<(), String
     jobs.cancel_requested.store(false, Ordering::SeqCst);
     jobs.cancellable.store(cancellable, Ordering::SeqCst);
     jobs.pid.store(0, Ordering::SeqCst);
-    Ok(())
+    *jobs.event_kind.lock().map_err(|error| error.to_string())? = event_kind.to_string();
+    let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::SeqCst).max(1);
+    jobs.job_id.store(job_id, Ordering::SeqCst);
+    ACTIVE_JOB_ID.store(job_id, Ordering::SeqCst);
+    Ok(job_id)
 }
 fn terminate_process_group(pid: i32) -> std::io::Result<()> {
     let result = unsafe { libc::kill(-pid, libc::SIGTERM) };
@@ -484,6 +1209,123 @@ fn terminate_process_group(pid: i32) -> std::io::Result<()> {
         Err(std::io::Error::last_os_error())
     }
 }
+fn process_group_exists(pgid: i32) -> bool {
+    if Path::new("/proc").is_dir() {
+        return fs::read_dir("/proc").ok().is_some_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                    return false;
+                };
+                proc_stat(pid).is_some_and(|stat| {
+                    stat.process_group == pgid && !matches!(stat.state, 'Z' | 'X')
+                })
+            })
+        });
+    }
+    let result = unsafe { libc::kill(-pgid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+fn child_exit_observed(pid: u32) -> Result<bool, String> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            let signal = unsafe { *(std::ptr::addr_of!(info).cast::<libc::c_int>()) };
+            return Ok(signal == libc::SIGCHLD);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(format!("Could not inspect child process status: {error}"));
+    }
+}
+fn stop_process_group(pid: i32) -> Result<(), String> {
+    // The caller has verified that pid is the session leader for this exact
+    // process incarnation. Launches use process_group(0), so this group is
+    // owned by the emulator session rather than the Studio process.
+    if let Err(error) = terminate_process_group(pid) {
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(format!("Could not send SIGTERM: {error}"));
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if !process_group_exists(pid) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            // A process-group ID cannot be reused while any member of that
+            // group remains, so a positive group probe still identifies the
+            // isolated session even if its leader exited before its children.
+            let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(format!(
+                        "Could not force-stop emulator process group: {error}"
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+#[cfg(target_os = "linux")]
+fn wait_for_child_and_cleanup_group(
+    child: &mut std::process::Child,
+    group_cleaned: impl FnOnce(),
+) -> Result<(std::process::ExitStatus, Result<(), String>), String> {
+    let pid = child.id() as i32;
+    loop {
+        match child_exit_observed(pid as u32) {
+            Ok(true) => break,
+            Ok(false) => thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                let cleanup = stop_process_group(pid);
+                group_cleaned();
+                let _ = child.wait();
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(cleanup_error) => {
+                        format!("{error}; process cleanup failed: {cleanup_error}")
+                    }
+                });
+            }
+        }
+    }
+    let cleanup = stop_process_group(pid);
+    group_cleaned();
+    match child.wait() {
+        Ok(status) => Ok((status, cleanup)),
+        Err(wait_error) => Err(match cleanup {
+            Ok(()) => format!("Could not reap emulator process: {wait_error}"),
+            Err(cleanup_error) => format!(
+                "Could not reap emulator process ({wait_error}) or clean its process group ({cleanup_error})"
+            ),
+        }),
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn wait_for_child_and_cleanup_group(
+    child: &mut std::process::Child,
+    group_cleaned: impl FnOnce(),
+) -> Result<(std::process::ExitStatus, Result<(), String>), String> {
+    let pid = child.id() as i32;
+    let status = child.wait().map_err(|error| error.to_string())?;
+    let cleanup = stop_process_group(pid);
+    group_cleaned();
+    Ok((status, cleanup))
+}
 #[derive(Default)]
 struct ProcessSamples(Mutex<HashMap<i64, ProcessSample>>);
 #[derive(Default)]
@@ -491,9 +1333,271 @@ struct ProcessSample {
     previous: Option<(u64, Instant)>,
     missing_samples: u8,
 }
+const PROCESS_MISSING_SAMPLE_LIMIT: u8 = 5;
+
+fn record_lost_session(
+    connection: &mut Connection,
+    session_id: i64,
+    ended_at: i64,
+    started_at: Option<i64>,
+    outcome: &str,
+) -> Result<bool, String> {
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let changed = transaction
+        .execute(
+            "UPDATE sessions SET ended_at=?,outcome=? WHERE id=? AND ended_at IS NULL",
+            params![ended_at, outcome, session_id],
+        )
+        .map_err(|error| error.to_string())?;
+    if changed == 1 {
+        if let Some(started_at) = started_at {
+            transaction
+                .execute(
+                    "UPDATE games SET play_seconds=play_seconds+?,last_played=? WHERE id=(SELECT game_id FROM sessions WHERE id=?)",
+                    params![ended_at.saturating_sub(started_at).max(0), started_at, session_id],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(changed == 1)
+}
+
+const SESSION_LOG_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const SESSION_LOG_TRUNCATION_MARKER: &[u8] =
+    b"\n[Studio] Session log reached its 32 MiB limit; further output was omitted.\n";
+const BUILD_LOG_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const BUILD_LOG_TRUNCATION_MARKER: &[u8] =
+    b"\n[Studio] Build log reached its 32 MiB limit; further output was omitted.\n";
+struct BuildLogWriter {
+    file: fs::File,
+    max_bytes: u64,
+    written: u64,
+    truncated: bool,
+}
+impl BuildLogWriter {
+    fn new(file: fs::File, max_bytes: u64) -> Self {
+        let written = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        let max_bytes = max_bytes.max(BUILD_LOG_TRUNCATION_MARKER.len() as u64);
+        Self {
+            file,
+            max_bytes,
+            written,
+            truncated: written >= max_bytes,
+        }
+    }
+    fn append_line(&mut self, stream: &str, line: &str) -> std::io::Result<()> {
+        if self.truncated {
+            return Ok(());
+        }
+        let record = format!("[{stream}] {line}\n");
+        let content_limit = self
+            .max_bytes
+            .saturating_sub(BUILD_LOG_TRUNCATION_MARKER.len() as u64);
+        let remaining = content_limit.saturating_sub(self.written) as usize;
+        let bytes = record.as_bytes();
+        let count = bytes.len().min(remaining);
+        self.file.write_all(&bytes[..count])?;
+        self.written += count as u64;
+        if count < bytes.len() {
+            self.file.write_all(BUILD_LOG_TRUNCATION_MARKER)?;
+            self.written += BUILD_LOG_TRUNCATION_MARKER.len() as u64;
+            self.truncated = true;
+        }
+        Ok(())
+    }
+}
+struct SessionLogWriter {
+    file: fs::File,
+    max_bytes: u64,
+    written: u64,
+    truncated: bool,
+}
+impl SessionLogWriter {
+    fn new(file: fs::File, max_bytes: u64) -> Self {
+        Self {
+            file,
+            max_bytes: max_bytes.max(SESSION_LOG_TRUNCATION_MARKER.len() as u64),
+            written: 0,
+            truncated: false,
+        }
+    }
+    fn append_line(&mut self, stream: &str, line: &str) -> std::io::Result<()> {
+        if self.truncated {
+            return Ok(());
+        }
+        let record = format!("[{stream}] {line}\n");
+        let content_limit = self
+            .max_bytes
+            .saturating_sub(SESSION_LOG_TRUNCATION_MARKER.len() as u64);
+        let remaining = content_limit.saturating_sub(self.written) as usize;
+        let bytes = record.as_bytes();
+        let count = bytes.len().min(remaining);
+        self.file.write_all(&bytes[..count])?;
+        self.written += count as u64;
+        if count < bytes.len() {
+            self.file.write_all(SESSION_LOG_TRUNCATION_MARKER)?;
+            self.truncated = true;
+        }
+        Ok(())
+    }
+}
+fn set_nonblocking_fd(fd: i32) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+const PROCESS_OUTPUT_LINE_MAX_BYTES: usize = 64 * 1024;
+struct CappedOutputLine {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+impl CappedOutputLine {
+    fn text(self) -> String {
+        let mut text = String::from_utf8_lossy(&self.bytes)
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        if self.truncated {
+            text.push_str(" [line truncated at configured limit]");
+        }
+        text
+    }
+}
+struct CappedOutputReader<R: Read> {
+    reader: BufReader<R>,
+    pending: Vec<u8>,
+    max_bytes: usize,
+    truncated: bool,
+    eof: bool,
+}
+impl<R: Read> CappedOutputReader<R> {
+    fn new(reader: R) -> Self {
+        Self::with_limit(reader, PROCESS_OUTPUT_LINE_MAX_BYTES)
+    }
+    fn with_limit(reader: R, max_bytes: usize) -> Self {
+        Self {
+            reader: BufReader::new(reader),
+            pending: Vec::with_capacity(4096),
+            max_bytes: max_bytes.max(1),
+            truncated: false,
+            eof: false,
+        }
+    }
+    fn take_pending(&mut self) -> Option<CappedOutputLine> {
+        if self.pending.is_empty() && !self.truncated {
+            return None;
+        }
+        Some(CappedOutputLine {
+            bytes: std::mem::take(&mut self.pending),
+            truncated: std::mem::take(&mut self.truncated),
+        })
+    }
+    fn append(&mut self, bytes: &[u8]) {
+        let remaining = self.max_bytes.saturating_sub(self.pending.len());
+        self.pending
+            .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+        self.truncated |= bytes.len() > remaining;
+    }
+    fn next_line(&mut self) -> std::io::Result<Option<CappedOutputLine>> {
+        if self.eof {
+            return Ok(self.take_pending());
+        }
+        loop {
+            let (bytes, consumed, complete, reached_eof) = {
+                let available = self.reader.fill_buf()?;
+                if available.is_empty() {
+                    (Vec::new(), 0, false, true)
+                } else if let Some(index) = available.iter().position(|byte| *byte == b'\n') {
+                    let consumed = index + 1;
+                    (available[..consumed].to_vec(), consumed, true, false)
+                } else {
+                    let consumed = available.len();
+                    (available.to_vec(), consumed, false, false)
+                }
+            };
+            if reached_eof {
+                self.eof = true;
+                return Ok(self.take_pending());
+            }
+            self.reader.consume(consumed);
+            self.append(&bytes);
+            if complete {
+                return Ok(self.take_pending());
+            }
+        }
+    }
+}
+fn spawn_session_output_reader<R>(
+    stream: R,
+    label: &'static str,
+    log: Arc<Mutex<SessionLogWriter>>,
+    app: tauri::AppHandle,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()>
+where
+    R: Read + std::os::fd::AsRawFd + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = CappedOutputReader::new(stream);
+        let mut stopped_at = None;
+        loop {
+            if stop.load(Ordering::SeqCst) && stopped_at.is_none() {
+                stopped_at = Some(Instant::now());
+            }
+            if stopped_at
+                .is_some_and(|instant: Instant| instant.elapsed() >= Duration::from_millis(250))
+            {
+                if let Some(line) = reader.take_pending() {
+                    write_session_output(&log, &app, label, line.text().as_bytes());
+                }
+                break;
+            }
+            match reader.next_line() {
+                Ok(Some(line)) => {
+                    write_session_output(&log, &app, label, line.text().as_bytes());
+                }
+                Ok(None) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stopped_at.is_some() {
+                        if let Some(line) = reader.take_pending() {
+                            write_session_output(&log, &app, label, line.text().as_bytes());
+                        }
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    let text = format!("output reader error: {error}");
+                    let _ = log.lock().unwrap().append_line(label, &text);
+                    break;
+                }
+            }
+        }
+    })
+}
+fn write_session_output(
+    log: &Arc<Mutex<SessionLogWriter>>,
+    app: &tauri::AppHandle,
+    label: &str,
+    bytes: &[u8],
+) {
+    let line = String::from_utf8_lossy(bytes);
+    let line = line.trim_end_matches(['\r', '\n']);
+    let _ = log.lock().unwrap().append_line(label, line);
+    emit(app, "game", label, line.to_string(), false, true);
+}
 #[derive(Clone, Copy, Debug)]
 struct ProcStat {
     state: char,
+    process_group: i32,
     cpu_ticks: u64,
     start_ticks: u64,
     resident_bytes: u64,
@@ -502,12 +1606,14 @@ fn parse_proc_stat(contents: &str, page_size: u64) -> Option<ProcStat> {
     let close = contents.rfind(')')?;
     let fields: Vec<_> = contents.get(close + 1..)?.split_whitespace().collect();
     let state = fields.first()?.chars().next()?;
+    let process_group = fields.get(2)?.parse::<i32>().ok()?;
     let user_ticks = fields.get(11)?.parse::<u64>().ok()?;
     let system_ticks = fields.get(12)?.parse::<u64>().ok()?;
     let start_ticks = fields.get(19)?.parse::<u64>().ok()?;
     let resident_pages = fields.get(21)?.parse::<i64>().ok()?.max(0) as u64;
     Some(ProcStat {
         state,
+        process_group,
         cpu_ticks: user_ticks.saturating_add(system_ticks),
         start_ticks,
         resident_bytes: resident_pages.saturating_mul(page_size),
@@ -527,6 +1633,114 @@ fn process_executable_matches(pid: u32, expected_executable: &Path) -> bool {
         .zip(fs::canonicalize(expected_executable).ok())
         .is_some_and(|(actual, expected)| actual == expected)
 }
+fn verified_session_process(
+    pid: i32,
+    expected_start: Option<i64>,
+    actual: ProcStat,
+    executable_matches: bool,
+) -> bool {
+    let Some(expected_start) = expected_start.and_then(|ticks| u64::try_from(ticks).ok()) else {
+        return false;
+    };
+    pid > 1
+        && actual.process_group == pid
+        && actual.start_ticks == expected_start
+        && executable_matches
+}
+#[cfg(target_os = "linux")]
+struct PidFd(std::os::fd::RawFd);
+#[cfg(target_os = "linux")]
+impl Drop for PidFd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+#[cfg(target_os = "linux")]
+fn send_pidfd_signal(pidfd: &PidFd, signal: libc::c_int) -> std::io::Result<()> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.0,
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+#[cfg(target_os = "linux")]
+fn stop_verified_session_group(
+    pid: i32,
+    expected_start: Option<i64>,
+    expected_executable: &Path,
+) -> Result<(), String> {
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if descriptor < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOSYS) {
+            return Err(
+                "Safe process-group stop requires Linux pidfd support (Linux 5.3 or newer)".into(),
+            );
+        }
+        return Err(format!(
+            "Could not safely pin the emulator process identity: {error}"
+        ));
+    }
+    let pidfd = PidFd(descriptor as std::os::fd::RawFd);
+    let actual = proc_stat(pid as u32).ok_or("The emulator process has already exited")?;
+    if !verified_session_process(
+        pid,
+        expected_start,
+        actual,
+        process_executable_matches(pid as u32, expected_executable),
+    ) {
+        return Err("The process identity or isolated process group no longer matches this registered emulator session".into());
+    }
+
+    // Freeze the pidfd-pinned group leader before using its numeric PGID. This
+    // keeps that PGID reserved across the group signal, even if PID reuse is
+    // possible between /proc inspection and signal delivery.
+    send_pidfd_signal(&pidfd, libc::SIGSTOP)
+        .map_err(|error| format!("Could not pin emulator process group: {error}"))?;
+    let freeze_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match proc_stat(pid as u32) {
+            Some(stat)
+                if stat.start_ticks == actual.start_ticks && matches!(stat.state, 'T' | 't') =>
+            {
+                break;
+            }
+            Some(stat)
+                if stat.start_ticks == actual.start_ticks && Instant::now() < freeze_deadline =>
+            {
+                thread::sleep(Duration::from_millis(2));
+            }
+            _ => {
+                let _ = send_pidfd_signal(&pidfd, libc::SIGCONT);
+                return Err("The emulator exited or could not be safely pinned before signaling its process group".into());
+            }
+        }
+    }
+    let terminate = unsafe { libc::kill(-pid, libc::SIGTERM) };
+    if terminate != 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = send_pidfd_signal(&pidfd, libc::SIGCONT);
+        return Err(format!(
+            "Could not send SIGTERM to emulator process group: {error}"
+        ));
+    }
+    if let Err(error) = send_pidfd_signal(&pidfd, libc::SIGCONT) {
+        let _ = send_pidfd_signal(&pidfd, libc::SIGKILL);
+        return Err(format!(
+            "Could not resume emulator for graceful shutdown: {error}"
+        ));
+    }
+    stop_process_group(pid)
+}
 fn cpu_percent(
     previous_ticks: u64,
     current_ticks: u64,
@@ -545,6 +1759,362 @@ fn cpu_percent(
 }
 fn state_paths(app: &tauri::AppHandle) -> Result<Paths, String> {
     Ok(app.state::<Paths>().inner().clone())
+}
+#[derive(Serialize)]
+struct StorageCategory {
+    name: String,
+    path: String,
+    size_bytes: u64,
+}
+#[derive(Serialize)]
+struct StorageReport {
+    categories: Vec<StorageCategory>,
+}
+fn directory_size(path: &Path) -> u64 {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if metadata.file_type().is_symlink() {
+        return 0;
+    }
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    if !metadata.is_dir() {
+        return 0;
+    }
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| directory_size(&entry.path()))
+        .sum()
+}
+fn has_generated_build_install_name(name: &str) -> bool {
+    let mut parts = name.splitn(3, '-');
+    let Some(commit) = parts.next() else {
+        return false;
+    };
+    let Some(build_type) = parts.next() else {
+        return false;
+    };
+    let Some(timestamp) = parts.next() else {
+        return false;
+    };
+    commit.len() == 12
+        && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && ["Release", "Debug", "RelWithDebInfo"].contains(&build_type)
+        && !timestamp.is_empty()
+        && timestamp.bytes().all(|byte| byte.is_ascii_digit())
+}
+fn incomplete_build_installations(
+    builds_root: &Path,
+    registered_paths: &HashSet<PathBuf>,
+) -> Vec<PathBuf> {
+    let Ok(root_metadata) = fs::symlink_metadata(builds_root) else {
+        return Vec::new();
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Vec::new();
+    }
+    let Ok(canonical_root) = fs::canonicalize(builds_root) else {
+        return Vec::new();
+    };
+    let Ok(repositories) = fs::read_dir(&canonical_root) else {
+        return Vec::new();
+    };
+    repositories
+        .flatten()
+        .filter_map(|repository| {
+            let repository_path = repository.path();
+            let metadata = fs::symlink_metadata(&repository_path).ok()?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || repository
+                    .file_name()
+                    .to_string_lossy()
+                    .parse::<i64>()
+                    .ok()?
+                    <= 0
+            {
+                return None;
+            }
+            fs::read_dir(repository_path).ok()
+        })
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name();
+            if !has_generated_build_install_name(&name.to_string_lossy()) {
+                return None;
+            }
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return None;
+            }
+            let canonical = fs::canonicalize(path).ok()?;
+            if canonical == canonical_root
+                || !canonical.starts_with(&canonical_root)
+                || registered_paths.contains(&canonical)
+                || canonical.join("kyty_emulator").exists()
+            {
+                return None;
+            }
+            Some(canonical)
+        })
+        .collect()
+}
+fn registered_build_paths(
+    connection: &Connection,
+    builds_root: &Path,
+) -> Result<HashSet<PathBuf>, String> {
+    let canonical_root = fs::canonicalize(builds_root).ok();
+    let mut statement = connection
+        .prepare("SELECT path FROM builds")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let mut paths = HashSet::new();
+    for row in rows {
+        if let Ok(path) = fs::canonicalize(row.map_err(|error| error.to_string())?) {
+            if canonical_root
+                .as_ref()
+                .is_some_and(|root| path.starts_with(root) && path != *root)
+            {
+                paths.insert(path);
+            }
+        }
+    }
+    Ok(paths)
+}
+fn clean_incomplete_build_installations(
+    builds_root: &Path,
+    registered_paths: &HashSet<PathBuf>,
+) -> Result<u64, String> {
+    let mut removed = 0_u64;
+    for path in incomplete_build_installations(builds_root, registered_paths) {
+        let size = directory_size(&path);
+        fs::remove_dir_all(&path)
+            .map_err(|error| format!("Could not remove incomplete installation: {error}"))?;
+        removed = removed.saturating_add(size);
+    }
+    Ok(removed)
+}
+#[tauri::command]
+fn storage_report(app: tauri::AppHandle) -> Result<StorageReport, String> {
+    let paths = state_paths(&app)?;
+    let builds_root = paths.data.join("builds");
+    let connection = db(&app)?;
+    let registered = registered_build_paths(&connection, &builds_root)?;
+    let installed_size = registered.iter().map(|path| directory_size(path)).sum();
+    let incomplete = incomplete_build_installations(&builds_root, &registered);
+    let incomplete_size = incomplete.iter().map(|path| directory_size(path)).sum();
+    let mut categories = vec![
+        StorageCategory {
+            name: "Installed emulator builds".into(),
+            path: builds_root.display().to_string(),
+            size_bytes: installed_size,
+        },
+        StorageCategory {
+            name: "Incomplete build installs".into(),
+            path: builds_root.display().to_string(),
+            size_bytes: incomplete_size,
+        },
+    ];
+    categories.extend(
+        [
+            ("Compiler build cache", paths.cache.join("builds")),
+            ("Session logs", paths.data.join("logs")),
+            (
+                "Community build worktrees",
+                paths.cache.join("community-worktrees"),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, path)| StorageCategory {
+            name: name.into(),
+            size_bytes: directory_size(&path),
+            path: path.display().to_string(),
+        }),
+    );
+    Ok(StorageReport { categories })
+}
+#[tauri::command]
+fn clean_incomplete_builds(
+    app: tauri::AppHandle,
+    jobs: tauri::State<'_, Jobs>,
+) -> Result<u64, String> {
+    let _control = jobs.control.lock().map_err(|error| error.to_string())?;
+    if jobs.active.load(Ordering::SeqCst) {
+        return Err("Wait for the active repository or build job to finish before cleaning incomplete installations".into());
+    }
+    let paths = state_paths(&app)?;
+    let connection = db(&app)?;
+    let registered = registered_build_paths(&connection, &paths.data.join("builds"))?;
+    clean_incomplete_build_installations(&paths.data.join("builds"), &registered)
+}
+fn remove_managed_temp_directory(path: &Path, root: &Path) -> Result<u64, String> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(0);
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Temporary build path is not a managed directory".into());
+    }
+    let canonical_root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let canonical_path = fs::canonicalize(path).map_err(|error| error.to_string())?;
+    if canonical_path == canonical_root || !canonical_path.starts_with(&canonical_root) {
+        return Err("Temporary build path is outside Studio's managed cache".into());
+    }
+    let bytes = directory_size(&canonical_path);
+    fs::remove_dir_all(&canonical_path)
+        .map_err(|error| format!("Could not remove temporary build files: {error}"))?;
+    Ok(bytes)
+}
+fn clear_managed_session_logs(
+    connection: &mut Connection,
+    logs_root: &Path,
+    data_root: &Path,
+) -> Result<u64, String> {
+    let Ok(metadata) = fs::symlink_metadata(logs_root) else {
+        return Ok(0);
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Session log path is not a managed directory".into());
+    }
+    let canonical_data = fs::canonicalize(data_root).map_err(|error| error.to_string())?;
+    let canonical_logs = fs::canonicalize(logs_root).map_err(|error| error.to_string())?;
+    if canonical_logs == canonical_data || !canonical_logs.starts_with(&canonical_data) {
+        return Err("Session log path is outside Studio's managed data directory".into());
+    }
+    let bytes = directory_size(&canonical_logs);
+    let mut statement = connection
+        .prepare("SELECT id,log_path FROM sessions WHERE log_path<>''")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut session_ids = Vec::new();
+    for row in rows {
+        let (id, path) = row.map_err(|error| error.to_string())?;
+        let path = PathBuf::from(path);
+        let in_root =
+            fs::canonicalize(&path).is_ok_and(|canonical| canonical.starts_with(&canonical_logs));
+        if in_root {
+            session_ids.push(id);
+        }
+    }
+    drop(statement);
+
+    let tombstone = canonical_data.join(format!(".session-logs-removing-{}", now()));
+    if tombstone.exists() {
+        return Err("A previous session log cleanup is still present".into());
+    }
+    fs::rename(&canonical_logs, &tombstone)
+        .map_err(|error| format!("Could not stage session log cleanup: {error}"))?;
+    if let Err(error) = fs::create_dir(&canonical_logs) {
+        let _ = fs::rename(&tombstone, &canonical_logs);
+        return Err(format!(
+            "Could not recreate the session log directory: {error}"
+        ));
+    }
+    let update_result = (|| {
+        let tx = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        for id in &session_ids {
+            tx.execute("UPDATE sessions SET log_path='' WHERE id=?", [id])
+                .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())
+    })();
+    if let Err(error) = update_result {
+        let _ = fs::remove_dir(&canonical_logs);
+        let _ = fs::rename(&tombstone, &canonical_logs);
+        return Err(error);
+    }
+    fs::remove_dir_all(&tombstone)
+        .map_err(|error| format!("Session logs were unlinked, but staged files remain: {error}"))?;
+    Ok(bytes)
+}
+struct ManagedTemporaryDirectory {
+    path: PathBuf,
+    root: PathBuf,
+}
+impl Drop for ManagedTemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = remove_managed_temp_directory(&self.path, &self.root);
+    }
+}
+#[tauri::command]
+fn clean_compiler_cache(
+    app: tauri::AppHandle,
+    jobs: tauri::State<'_, Jobs>,
+) -> Result<u64, String> {
+    let _control = jobs.control.lock().map_err(|error| error.to_string())?;
+    if jobs.active.load(Ordering::SeqCst) {
+        return Err("Wait for the active repository or build job to finish before cleaning the compiler cache".into());
+    }
+    let cache_root = state_paths(&app)?.cache;
+    clear_managed_compiler_cache(&cache_root.join("builds"), &cache_root)
+}
+#[tauri::command]
+fn clean_community_worktrees(
+    app: tauri::AppHandle,
+    jobs: tauri::State<'_, Jobs>,
+) -> Result<u64, String> {
+    let _control = jobs.control.lock().map_err(|error| error.to_string())?;
+    if jobs.active.load(Ordering::SeqCst) {
+        return Err("Wait for the active repository or build job to finish before cleaning community worktrees".into());
+    }
+    let cache_root = state_paths(&app)?.cache;
+    remove_managed_temp_directory(&cache_root.join("community-worktrees"), &cache_root)
+}
+#[tauri::command]
+fn clean_session_logs(app: tauri::AppHandle, jobs: tauri::State<'_, Jobs>) -> Result<u64, String> {
+    let _control = jobs.control.lock().map_err(|error| error.to_string())?;
+    if jobs.active.load(Ordering::SeqCst) {
+        return Err(
+            "Wait for active repository and build jobs to finish before clearing session logs"
+                .into(),
+        );
+    }
+    let _session_lifecycle = SESSION_LIFECYCLE_LOCK
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let mut connection = db(&app)?;
+    let active_sessions: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if active_sessions > 0 {
+        return Err("Stop active emulator sessions before clearing session logs".into());
+    }
+    let paths = state_paths(&app)?;
+    clear_managed_session_logs(&mut connection, &paths.data.join("logs"), &paths.data)
+}
+fn clear_managed_compiler_cache(root: &Path, cache_root: &Path) -> Result<u64, String> {
+    let Ok(metadata) = fs::symlink_metadata(&root) else {
+        return Ok(0);
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Compiler cache path is not a managed directory".into());
+    }
+    let canonical = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let canonical_cache_root = fs::canonicalize(cache_root).map_err(|error| error.to_string())?;
+    if canonical == canonical_cache_root || !canonical.starts_with(&canonical_cache_root) {
+        return Err("Compiler cache path is outside Studio's managed cache".into());
+    }
+    let bytes = directory_size(&canonical);
+    fs::remove_dir_all(&canonical)
+        .map_err(|error| format!("Could not clean compiler cache: {error}"))?;
+    Ok(bytes)
 }
 fn db(app: &tauri::AppHandle) -> Result<Connection, String> {
     state_paths(app)?.db()
@@ -611,76 +2181,68 @@ fn graphics_diagnostics() -> GraphicsDiagnostics {
                 format!("Could not start vulkaninfo: {error}"),
             ),
             Ok(mut child) => {
-                let deadline = Instant::now() + Duration::from_secs(6);
-                let mut poll_error = None;
-                let status = loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => break Some(status),
-                        Ok(None) if Instant::now() < deadline => {
-                            thread::sleep(Duration::from_millis(30));
-                        }
-                        Ok(None) => {
-                            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-                            let _ = child.wait();
-                            break None;
-                        }
-                        Err(error) => {
-                            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-                            let _ = child.wait();
-                            poll_error = Some(error.to_string());
-                            break None;
-                        }
-                    }
-                };
-                if let Some(error) = poll_error {
-                    (
-                        "Failed".into(),
-                        format!("Could not check vulkaninfo status: {error}"),
-                    )
-                } else if status.is_none() {
-                    (
+                let stdout = child.stdout.take().expect("stdout was piped");
+                let stderr = child.stderr.take().expect("stderr was piped");
+                let stdout_reader = thread::spawn(move || {
+                    read_capped_output(BufReader::new(stdout), VULKANINFO_MAX_BYTES)
+                });
+                let stderr_reader = thread::spawn(move || {
+                    read_capped_output(BufReader::new(stderr), VULKANINFO_MAX_BYTES)
+                });
+                let status =
+                    wait_for_child_with_timeout(&mut child, Duration::from_secs(6), "vulkaninfo");
+                let stdout = stdout_reader.join();
+                let stderr = stderr_reader.join();
+                match (status, stdout, stderr) {
+                    (Err(error), _, _) if error.contains("time limit") => (
                         "Timed out".into(),
-                        "vulkaninfo did not finish within six seconds.".into(),
-                    )
-                } else {
-                    match child.wait_with_output() {
-                        Err(error) => (
-                            "Failed".into(),
-                            format!("Could not read vulkaninfo output: {error}"),
-                        ),
-                        Ok(output) => {
-                            let stdout = String::from_utf8_lossy(&output.stdout);
-                            let lines = stdout
-                                .lines()
-                                .filter(|line| {
-                                    let line = line.trim_start();
-                                    line.starts_with("Vulkan Instance Version:")
-                                        || line.starts_with("GPU")
-                                        || line.starts_with("deviceName")
-                                        || line.starts_with("driverName")
-                                        || line.starts_with("driverInfo")
-                                        || line.starts_with("apiVersion")
-                                })
-                                .take(20)
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            if !output.status.success() {
-                                let stderr = String::from_utf8_lossy(&output.stderr);
-                                (
-                                    "Failed".into(),
-                                    format!(
-                                        "{}\n{}",
-                                        lines,
-                                        stderr.lines().take(8).collect::<Vec<_>>().join("\n")
-                                    ),
-                                )
-                            } else if !stdout.contains("GPU") && !stdout.contains("deviceName") {
-                                ("No device found".into(), "vulkaninfo ran, but no Vulkan physical device was reported. Check the installed Vulkan ICD and active GPU driver.".into())
-                            } else {
-                                ("Available".into(), lines)
-                            }
+                        "vulkaninfo did not finish within six seconds; its process group was stopped.".into(),
+                    ),
+                    (Err(error), _, _) => (
+                        "Failed".into(),
+                        format!("Could not inspect vulkaninfo: {error}"),
+                    ),
+                    (Ok(status), Ok(Ok((stdout, stdout_truncated))), Ok(Ok((stderr, stderr_truncated)))) => {
+                        let stdout = String::from_utf8_lossy(&stdout);
+                        let lines = stdout
+                            .lines()
+                            .filter(|line| {
+                                let line = line.trim_start();
+                                line.starts_with("Vulkan Instance Version:")
+                                    || line.starts_with("GPU")
+                                    || line.starts_with("deviceName")
+                                    || line.starts_with("driverName")
+                                    || line.starts_with("driverInfo")
+                                    || line.starts_with("apiVersion")
+                            })
+                            .take(40)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let stderr = String::from_utf8_lossy(&stderr);
+                        let truncated = stdout_truncated || stderr_truncated;
+                        let details = if !status.success() {
+                            format!("{}\n{}", lines, stderr.lines().take(8).collect::<Vec<_>>().join("\n"))
+                        } else if truncated {
+                            format!("{lines}\n[vulkaninfo output truncated for safety]")
+                        } else {
+                            lines
+                        };
+                        if !status.success() {
+                            ("Failed".into(), details)
+                        } else if !stdout.contains("GPU") && !stdout.contains("deviceName") {
+                            ("No device found".into(), "vulkaninfo ran, but no Vulkan physical device was reported. Check the installed Vulkan ICD and active GPU driver.".into())
+                        } else {
+                            ("Available".into(), details)
                         }
                     }
+                    (_, Ok(Err(error)), _) | (_, _, Ok(Err(error))) => (
+                        "Failed".into(),
+                        format!("Could not read vulkaninfo output: {error}"),
+                    ),
+                    (_, Err(_), _) | (_, _, Err(_)) => (
+                        "Failed".into(),
+                        "Could not collect vulkaninfo output: reader thread failed".into(),
+                    ),
                 }
             }
         }
@@ -771,11 +2333,147 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
     if let Some(d) = dir {
         c.arg("-C").arg(d);
     }
-    let o = c.args(args).output().map_err(|e| e.to_string())?;
-    if !o.status.success() {
-        return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
+    let mut child = c
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let stdout = child.stdout.take().ok_or("Git stdout unavailable")?;
+    let stderr = child.stderr.take().ok_or("Git stderr unavailable")?;
+    let stdout_reader =
+        thread::spawn(move || read_capped_output(BufReader::new(stdout), GIT_CAPTURE_MAX_BYTES));
+    let stderr_reader =
+        thread::spawn(move || read_capped_output(BufReader::new(stderr), GIT_CAPTURE_MAX_BYTES));
+    let wait_result =
+        wait_for_child_with_timeout(&mut child, Duration::from_secs(120), "Git command");
+    let (stdout, stdout_truncated) = stdout_reader
+        .join()
+        .map_err(|_| "Git output reader failed")?
+        .map_err(|error| format!("Could not read Git output: {error}"))?;
+    let (stderr, stderr_truncated) = stderr_reader
+        .join()
+        .map_err(|_| "Git error reader failed")?
+        .map_err(|error| format!("Could not read Git error output: {error}"))?;
+    let status = wait_result.map_err(|error| format!("Could not wait for Git: {error}"))?;
+    if stdout_truncated || stderr_truncated {
+        return Err(format!(
+            "Git command output exceeded the {} MiB safety limit",
+            GIT_CAPTURE_MAX_BYTES / (1024 * 1024)
+        ));
     }
-    Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+    if !status.success() {
+        return Err(String::from_utf8_lossy(&stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+}
+#[cfg(target_os = "linux")]
+fn wait_for_child_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    description: &str,
+) -> Result<std::process::ExitStatus, String> {
+    let pid = child.id() as i32;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child_exit_observed(pid as u32) {
+            Ok(true) => {
+                let cleanup = stop_process_group(pid);
+                let status = child
+                    .wait()
+                    .map_err(|error| format!("Could not reap {description}: {error}"))?;
+                cleanup?;
+                return Ok(status);
+            }
+            Ok(false) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(false) => {
+                let cleanup = stop_process_group(pid);
+                let _ = child.wait();
+                return Err(format!(
+                    "{description} exceeded its {} second time limit{}",
+                    timeout.as_secs(),
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process cleanup failed: {error}"))
+                        .unwrap_or_default()
+                ));
+            }
+            Err(error) => {
+                let cleanup = stop_process_group(pid);
+                let _ = child.wait();
+                return Err(format!(
+                    "Could not wait for {description}: {error}{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process cleanup failed: {error}"))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn wait_for_child_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    description: &str,
+) -> Result<std::process::ExitStatus, String> {
+    let pid = child.id() as i32;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                stop_process_group(pid)?;
+                return Ok(status);
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                let cleanup = stop_process_group(pid);
+                let _ = child.wait();
+                return Err(format!(
+                    "{description} exceeded its {} second time limit{}",
+                    timeout.as_secs(),
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process cleanup failed: {error}"))
+                        .unwrap_or_default()
+                ));
+            }
+            Err(error) => {
+                let cleanup = stop_process_group(pid);
+                let _ = child.wait();
+                return Err(format!(
+                    "Could not wait for {description}: {error}{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process cleanup failed: {error}"))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+    }
+}
+const GIT_CAPTURE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const VULKANINFO_MAX_BYTES: usize = 1024 * 1024;
+const EMULATOR_HELP_MAX_BYTES: usize = 1024 * 1024;
+fn read_capped_output<R: Read>(mut reader: R, maximum: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut output = Vec::with_capacity(maximum.min(64 * 1024));
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut truncated = false;
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = maximum.saturating_sub(output.len());
+        let retained = count.min(remaining);
+        output.extend_from_slice(&buffer[..retained]);
+        truncated |= retained < count;
+    }
+    Ok((output, truncated))
 }
 fn git_cancellable(
     app: &tauri::AppHandle,
@@ -810,32 +2508,46 @@ fn git_cancellable_env(
     jobs.pid.store(pid, Ordering::SeqCst);
     let stdout = child.stdout.take().ok_or("Git stdout unavailable")?;
     let stderr = child.stderr.take().ok_or("Git stderr unavailable")?;
-    let stdout_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        let _ = BufReader::new(stdout).read_to_end(&mut output);
-        output
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        let _ = BufReader::new(stderr).read_to_end(&mut output);
-        output
-    });
-    let status = loop {
-        if jobs.cancel_requested.load(Ordering::SeqCst) {
-            let _ = terminate_process_group(pid);
+    let stdout_reader =
+        thread::spawn(move || read_capped_output(BufReader::new(stdout), GIT_CAPTURE_MAX_BYTES));
+    let stderr_reader =
+        thread::spawn(move || read_capped_output(BufReader::new(stderr), GIT_CAPTURE_MAX_BYTES));
+    let mut cancellation_sent = false;
+    let observed = loop {
+        if jobs.cancel_requested.load(Ordering::SeqCst) && !cancellation_sent {
+            cancellation_sent = true;
+            let _ = stop_process_group(pid);
         }
-        if let Some(exit) = child.try_wait().map_err(|error| error.to_string())? {
-            break exit;
+        match child_exit_observed(pid as u32) {
+            Ok(true) => break Ok(()),
+            Ok(false) => thread::sleep(Duration::from_millis(100)),
+            Err(error) => break Err(format!("Could not wait for Git: {error}")),
         }
-        thread::sleep(Duration::from_millis(100));
     };
+    let cleanup_result = stop_process_group(pid);
+    // Keep the unreaped child as the owner of its PID until its process group
+    // has been cleaned, then clear the cancellation target before reaping it.
     jobs.pid.store(0, Ordering::SeqCst);
-    let stdout = stdout_reader
+    let wait_result = child
+        .wait()
+        .map_err(|error| format!("Could not reap Git: {error}"));
+    let (stdout, stdout_truncated) = stdout_reader
         .join()
-        .map_err(|_| "Git output reader failed")?;
-    let stderr = stderr_reader
+        .map_err(|_| "Git output reader failed")?
+        .map_err(|error| format!("Could not read Git output: {error}"))?;
+    let (stderr, stderr_truncated) = stderr_reader
         .join()
-        .map_err(|_| "Git error reader failed")?;
+        .map_err(|_| "Git error reader failed")?
+        .map_err(|error| format!("Could not read Git error output: {error}"))?;
+    cleanup_result?;
+    observed?;
+    let status = wait_result?;
+    if stdout_truncated || stderr_truncated {
+        return Err(format!(
+            "Git command output exceeded the {} MiB safety limit",
+            GIT_CAPTURE_MAX_BYTES / (1024 * 1024)
+        ));
+    }
     let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
     if jobs.cancel_requested.load(Ordering::SeqCst) {
@@ -848,11 +2560,16 @@ fn git_cancellable_env(
             stderr
         });
     }
+    let event_kind = jobs
+        .event_kind
+        .lock()
+        .map(|kind| kind.clone())
+        .unwrap_or_else(|_| "build".into());
     if !stdout.is_empty() {
-        emit(app, "build", "Git", stdout.clone(), false, true);
+        emit(app, &event_kind, "Git", stdout.clone(), false, true);
     }
     if !stderr.is_empty() {
-        emit(app, "build", "Git", stderr, false, true);
+        emit(app, &event_kind, "Git", stderr, false, true);
     }
     Ok(stdout)
 }
@@ -1014,7 +2731,8 @@ fn build(conn: &Connection, id: i64) -> Result<Build, String> {
         "SELECT id,repo_id,commit_sha,build_type,path,created_at,active,install_size_bytes,validation_status,
          (SELECT started_at FROM sessions WHERE build_id=builds.id ORDER BY started_at DESC,id DESC LIMIT 1),
          (SELECT outcome FROM sessions WHERE build_id=builds.id ORDER BY started_at DESC,id DESC LIMIT 1),
-         (SELECT exit_code FROM sessions WHERE build_id=builds.id ORDER BY started_at DESC,id DESC LIMIT 1)
+         (SELECT exit_code FROM sessions WHERE build_id=builds.id ORDER BY started_at DESC,id DESC LIMIT 1),
+         configuration_json
          FROM builds WHERE id=?",
         [id],
         |r| {
@@ -1042,6 +2760,8 @@ fn build(conn: &Connection, id: i64) -> Result<Build, String> {
                 last_session_at: r.get(9)?,
                 last_session_outcome: r.get(10)?,
                 last_session_exit_code: r.get(11)?,
+                configuration: serde_json::from_str(&r.get::<_, String>(12)?)
+                    .unwrap_or_default(),
             })
         },
     )
@@ -1064,10 +2784,18 @@ fn game(conn: &Connection, id: i64) -> Result<Game, String> {
                 game_version: r.get(8)?,
                 icon_path: r.get(9)?,
                 install_size: r.get(10)?,
+                file_status: game_file_status(Path::new(&r.get::<_, String>(1)?)).into(),
             })
         },
     )
     .map_err(|e| e.to_string())
+}
+fn game_file_status(path: &Path) -> &'static str {
+    if fs::metadata(path).is_ok() {
+        "Available"
+    } else {
+        "Missing"
+    }
 }
 #[tauri::command]
 fn list_repos(app: tauri::AppHandle) -> Result<Vec<Repo>, String> {
@@ -1097,7 +2825,7 @@ fn list_builds(app: tauri::AppHandle) -> Result<Vec<Build>, String> {
 fn list_games(app: tauri::AppHandle) -> Result<Vec<Game>, String> {
     let c = db(&app)?;
     let mut s = c
-        .prepare("SELECT id FROM games ORDER BY favorite DESC, title COLLATE NOCASE")
+        .prepare("SELECT id FROM games WHERE hidden=0 ORDER BY favorite DESC, title COLLATE NOCASE")
         .map_err(|e| e.to_string())?;
     let rows = s.query_map([], |r| r.get(0)).map_err(|e| e.to_string())?;
     let result = rows
@@ -1146,6 +2874,106 @@ fn game_compatibility(app: tauri::AppHandle, game_id: i64) -> Result<GameCompati
         gameplay_status: "Not measured by Studio".into(),
         playable_status: "Unconfirmed".into(),
     })
+}
+fn compatibility_outcome(value: &str) -> bool {
+    matches!(
+        value,
+        "launch_failed" | "reached_menu" | "reached_gameplay" | "playable" | "playable_with_issues"
+    )
+}
+fn sanitize_compatibility_notes(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .take(2000)
+        .collect()
+}
+fn patch_configuration_for_game(
+    c: &Connection,
+    game_id: i64,
+    build: &Build,
+) -> Result<String, String> {
+    let mut options = global_profile_options(c)?;
+    for (flag, value) in profile(c, game_id)?.options {
+        options.insert(flag, value);
+    }
+    let capabilities = capabilities_for_build(build)?;
+    options.retain(|flag, _| {
+        capabilities
+            .options
+            .iter()
+            .any(|supported| supported == flag)
+    });
+    let mut relevant: BTreeMap<_, _> = options
+        .into_iter()
+        .filter(|(flag, _)| {
+            matches!(
+                flag.as_str(),
+                "--game-patch" | "--addcont-dir" | "--playgo-hack" | "--amd-cpu" | "--vr"
+            )
+        })
+        .collect();
+    if let Some(patch_path) = relevant.get("--game-patch") {
+        let mut file = fs::File::open(patch_path)
+            .map_err(|e| format!("Could not read game patch for compatibility record: {e}"))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0; 16384];
+        loop {
+            let count = file.read(&mut buffer).map_err(|e| e.to_string())?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        relevant.insert(
+            "--game-patch-sha256".into(),
+            format!("{:x}", hasher.finalize()),
+        );
+    }
+    serde_json::to_string(&relevant).map_err(|e| e.to_string())
+}
+#[tauri::command]
+fn record_compatibility_observation(
+    app: tauri::AppHandle,
+    game_id: i64,
+    outcome: String,
+    notes: String,
+) -> Result<(), String> {
+    if !compatibility_outcome(&outcome) {
+        return Err("Choose a supported manual test outcome".into());
+    }
+    let c = db(&app)?;
+    game(&c, game_id)?;
+    let b = build_for_game(&c, game_id)?;
+    let patch_config = patch_configuration_for_game(&c, game_id, &b)?;
+    c.execute("INSERT INTO manual_compatibility_observations(game_id,repo_id,build_id,commit_sha,build_type,patch_config_json,outcome,notes,observed_at) VALUES(?,?,?,?,?,?,?,?,?)", params![game_id,b.repo_id,b.id,b.commit_sha,b.build_type,patch_config,outcome,sanitize_compatibility_notes(&notes),now()]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+#[tauri::command]
+fn compatibility_observations(
+    app: tauri::AppHandle,
+    game_id: i64,
+) -> Result<Vec<ManualCompatibilityObservation>, String> {
+    let c = db(&app)?;
+    game(&c, game_id)?;
+    let mut statement = c.prepare("SELECT observation.id,observation.outcome,observation.notes,observation.observed_at,repositories.owner || '/' || repositories.name,observation.build_id,observation.commit_sha,observation.build_type,observation.patch_config_json FROM manual_compatibility_observations observation JOIN repositories ON repositories.id=observation.repo_id WHERE observation.game_id=? ORDER BY observation.observed_at DESC,observation.id DESC LIMIT 100").map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([game_id], |row| {
+            Ok(ManualCompatibilityObservation {
+                id: row.get(0)?,
+                outcome: row.get(1)?,
+                notes: row.get(2)?,
+                observed_at: row.get(3)?,
+                repository: row.get(4)?,
+                build_id: row.get(5)?,
+                build_commit: row.get(6)?,
+                build_type: row.get(7)?,
+                patch_config_json: row.get(8)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 fn log_reports_title_id(log_root: &Path, log_path: &Path) -> bool {
     let Ok(root) = fs::canonicalize(log_root) else {
@@ -1354,6 +3182,7 @@ struct CommunityPrPage {
     page: u32,
     per_page: u32,
     has_more: bool,
+    truncated: bool,
     stale: bool,
     refresh_error: Option<String>,
 }
@@ -1366,6 +3195,15 @@ struct CommunityBuildSelection {
 #[derive(Deserialize)]
 struct GithubSearchCount {
     total_count: u64,
+}
+#[derive(Deserialize)]
+struct GithubSearchPullRequests {
+    total_count: u64,
+    items: Vec<GithubSearchPullRequest>,
+}
+#[derive(Deserialize)]
+struct GithubSearchPullRequest {
+    number: u64,
 }
 #[derive(Deserialize)]
 struct GithubCheckRuns {
@@ -1539,12 +3377,37 @@ fn community_pr_total(owner: &str, name: &str, state: &str) -> Result<u64, Strin
         github_json(&format!("https://api.github.com/search/issues?{encoded}"))?;
     Ok(response.total_count)
 }
+fn github_pull_request_search_url(
+    owner: &str,
+    name: &str,
+    state: &str,
+    search: &str,
+    page: u32,
+    per_page: usize,
+) -> String {
+    let state_qualifier = match state {
+        "open" => " state:open",
+        "closed" => " state:closed",
+        _ => "",
+    };
+    let query = format!("repo:{owner}/{name} is:pr{state_qualifier} {search}");
+    let encoded = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("q", &query)
+        .append_pair("per_page", &per_page.to_string())
+        .append_pair("page", &page.to_string())
+        .finish();
+    format!("https://api.github.com/search/issues?{encoded}")
+}
+fn github_search_has_more(page: u32, page_size: u64, total_count: u64) -> bool {
+    u64::from(page) * page_size < total_count.min(1000)
+}
 #[tauri::command]
 fn list_community_pull_requests(
     app: tauri::AppHandle,
     repository_id: i64,
     page: u32,
     state: String,
+    search: String,
 ) -> Result<CommunityPrPage, String> {
     if page == 0 || page > 1000 {
         return Err("Pull request page must be between 1 and 1000".into());
@@ -1552,12 +3415,28 @@ fn list_community_pull_requests(
     if !["open", "closed", "all"].contains(&state.as_str()) {
         return Err("Pull request state must be open, closed, or all".into());
     }
+    if search.len() > 128 || search.chars().any(char::is_control) {
+        return Err(
+            "Pull request search must be at most 128 characters without control characters".into(),
+        );
+    }
     let conn = db(&app)?;
     let repository = repo(&conn, repository_id)?;
     if repository.source_path.is_none() {
         return Err("Clone the selected repository before browsing its pull requests".into());
     }
     let (owner, name, _) = parse_repo(&repository.url)?;
+    if !search.trim().is_empty() {
+        return search_community_pull_requests(
+            &conn,
+            repository_id,
+            &owner,
+            &name,
+            &state,
+            search.trim(),
+            page,
+        );
+    }
     let endpoint = format!(
         "https://api.github.com/repos/{owner}/{name}/pulls?state={state}&sort=updated&direction=desc&per_page=100&page={page}"
     );
@@ -1590,6 +3469,7 @@ fn list_community_pull_requests(
             page,
             per_page: 100,
             has_more,
+            truncated: false,
             stale: false,
             refresh_error,
         });
@@ -1618,9 +3498,103 @@ fn list_community_pull_requests(
         page,
         per_page: 100,
         has_more,
+        truncated: false,
         stale: true,
         refresh_error: Some(error),
     })
+}
+fn search_community_pull_requests(
+    conn: &Connection,
+    repository_id: i64,
+    owner: &str,
+    name: &str,
+    state: &str,
+    search: &str,
+    page: u32,
+) -> Result<CommunityPrPage, String> {
+    const SEARCH_PAGE_SIZE: usize = 20;
+    if page > 50 {
+        return Err(
+            "GitHub search can page through only its first 1000 matches; refine the search".into(),
+        );
+    }
+    let url = github_pull_request_search_url(owner, name, state, search, page, SEARCH_PAGE_SIZE);
+    let results: GithubSearchPullRequests = match github_json(&url) {
+        Ok(results) => results,
+        Err(error) => {
+            let mut cached = cached_community_prs(conn, repository_id)?;
+            let needle = search.to_lowercase();
+            cached.retain(|pr| {
+                (state == "all" || pr.state == state)
+                    && (pr.title.to_lowercase().contains(&needle)
+                        || pr.author.to_lowercase().contains(&needle)
+                        || pr
+                            .body
+                            .as_deref()
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .contains(&needle))
+            });
+            let total_count = cached.len();
+            let truncated = total_count > 1000;
+            let start = ((page - 1) as usize).saturating_mul(SEARCH_PAGE_SIZE);
+            let items = cached
+                .drain(start.min(total_count)..)
+                .take(SEARCH_PAGE_SIZE)
+                .collect::<Vec<_>>();
+            let has_more = start.saturating_add(items.len()) < total_count.min(1000);
+            return Ok(CommunityPrPage {
+                repository: format!("{owner}/{name}"),
+                items,
+                total_count: None,
+                page,
+                per_page: (SEARCH_PAGE_SIZE as u32),
+                has_more,
+                truncated,
+                stale: true,
+                refresh_error: Some(error),
+            });
+        }
+    };
+    let mut items = Vec::with_capacity(results.items.len());
+    for item in results.items {
+        let pr: GithubPullRequestApi = github_json(&format!(
+            "https://api.github.com/repos/{owner}/{name}/pulls/{}",
+            item.number
+        ))?;
+        items.push(pr.into());
+    }
+    cache_community_pull_requests(conn, repository_id, &items)?;
+    let total_count = results.total_count;
+    Ok(CommunityPrPage {
+        repository: format!("{owner}/{name}"),
+        has_more: github_search_has_more(page, SEARCH_PAGE_SIZE as u64, total_count),
+        items,
+        total_count: Some(total_count),
+        page,
+        per_page: (SEARCH_PAGE_SIZE as u32),
+        truncated: total_count > 1000,
+        stale: false,
+        refresh_error: None,
+    })
+}
+fn cache_community_pull_requests(
+    conn: &Connection,
+    repository_id: i64,
+    items: &[CommunityPullRequest],
+) -> Result<(), String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    for pr in items {
+        let payload = serde_json::to_string(pr).map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO community_pr_cache(repo_id,number,payload,cached_at) VALUES(?,?,?,?) ON CONFLICT(repo_id,number) DO UPDATE SET payload=excluded.payload,cached_at=excluded.cached_at",
+            params![repository_id, pr.number as i64, payload, now()],
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    tx.commit().map_err(|error| error.to_string())
 }
 #[tauri::command]
 fn community_pull_request_details(
@@ -1709,7 +3683,7 @@ fn start_community_build(
     repository_id: i64,
     pull_requests: Vec<CommunityBuildSelection>,
     options: BuildOptions,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let compiler = validate_build_options(&options)?;
     if pull_requests.is_empty()
         || pull_requests.len() > 12
@@ -1747,12 +3721,12 @@ fn start_community_build(
             .source_path
             .ok_or("Clone this repository first")?,
     );
-    if !source.is_dir() || !git(Some(&source), &["status", "--porcelain"])?.is_empty() {
+    if validate_clean_source_checkout(&source).is_err() {
         return Err("The tracked source checkout is missing or has local changes; community builds use a clean isolated clone".into());
     }
     let (owner, name, _) = parse_repo(&repository.url)?;
     let jobs = jobs.inner().clone();
-    begin_job(&jobs, "Another job is running", true)?;
+    let job_id = begin_job(&jobs, "Another job is running", true, "community-build")?;
     thread::spawn(move || {
         let mut history_result_id: Option<i64> = None;
         let result = (|| -> Result<String, String> {
@@ -1763,7 +3737,7 @@ fn start_community_build(
                 let number = selection.number;
                 emit(
                     &app,
-                    "build",
+                    "community-build",
                     "Fetching PRs",
                     format!("Resolving {owner}/{name} PR #{number}"),
                     false,
@@ -1844,7 +3818,17 @@ fn start_community_build(
             history_result_id = Some(history_db.query_row("INSERT INTO community_build_results(config_id,status,started_at) VALUES(?,'preparing',?) RETURNING id", params![config_id, now()], |row| row.get(0)).map_err(|e| e.to_string())?);
             let paths = state_paths(&app)?;
             let work_root = paths.cache.join("community-worktrees");
+            if fs::symlink_metadata(&work_root)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return Err("Community worktree cache cannot be a symbolic link".into());
+            }
             fs::create_dir_all(&work_root).map_err(|e| e.to_string())?;
+            let work_root = fs::canonicalize(&work_root).map_err(|error| error.to_string())?;
+            let cache_root = fs::canonicalize(&paths.cache).map_err(|error| error.to_string())?;
+            if !work_root.starts_with(&cache_root) {
+                return Err("Community worktree cache is outside Studio's managed cache".into());
+            }
             let worktree = work_root.join(format!(
                 "repo-{repository_id}-{}",
                 SystemTime::now()
@@ -1852,11 +3836,15 @@ fn start_community_build(
                     .unwrap_or_default()
                     .as_nanos()
             ));
+            let _worktree_cleanup = ManagedTemporaryDirectory {
+                path: worktree.clone(),
+                root: work_root.clone(),
+            };
             let source_text = source.to_string_lossy().to_string();
             let work_text = worktree.to_string_lossy().to_string();
             emit(
                 &app,
-                "build",
+                "community-build",
                 "Preparing repository",
                 "Creating an isolated Git clone; the registered source checkout remains untouched",
                 false,
@@ -1932,7 +3920,7 @@ fn start_community_build(
                 let source_ref = format!("+refs/pull/{}/head:{}", pr.number, reference);
                 emit(
                     &app,
-                    "build",
+                    "community-build",
                     "Applying PRs",
                     format!(
                         "Fetching and applying PR #{} at {}",
@@ -2017,7 +4005,7 @@ fn start_community_build(
             if !submodule_paths.trim().is_empty() {
                 emit(
                     &app,
-                    "build",
+                    "community-build",
                     "Submodule update",
                     "Updating validated GitHub submodules in the isolated source clone",
                     false,
@@ -2035,7 +4023,7 @@ fn start_community_build(
             let result_id =
                 history_result_id.ok_or("Community build history row was not created")?;
             db(&app)?.execute("UPDATE community_build_results SET final_commit=?,status='building' WHERE id=?", params![final_commit, result_id]).map_err(|e| e.to_string())?;
-            emit(&app, "build", "Checking merge conflicts", format!("All {} selected PRs applied in the chosen order. Git merge success does not establish runtime or gameplay compatibility.", prs.len()), false, true);
+            emit(&app, "community-build", "Checking merge conflicts", format!("All {} selected PRs applied in the chosen order. Git merge success does not establish runtime or gameplay compatibility.", prs.len()), false, true);
             let build_options = BuildOptions {
                 clean: options.clean,
                 ..options.clone()
@@ -2048,6 +4036,7 @@ fn start_community_build(
                 &final_commit,
                 &build_options,
                 &compiler,
+                "community-build",
             ) {
                 Ok(install) => {
                     let connection = db(&app)?;
@@ -2089,9 +4078,9 @@ fn start_community_build(
                 );
             }
         }
-        finish_job(&app, &jobs, "build", result);
+        finish_job(&app, &jobs, "community-build", result);
     });
-    Ok(())
+    Ok(job_id)
 }
 #[derive(Serialize)]
 struct CommunityBuildHistoryEntry {
@@ -2272,18 +4261,7 @@ fn system_info(app: tauri::AppHandle) -> Result<SystemInfo, String> {
         present: command_exists(n),
     })
     .collect();
-    for name in [
-        "Qt6Core",
-        "Qt6Widgets",
-        "Qt6Network",
-        "Qt6Concurrent",
-        "Qt6DBus",
-        "vulkan",
-        "x11",
-        "wayland-client",
-        "libpulse",
-        "libudev",
-    ] {
+    for name in ["vulkan", "x11", "wayland-client", "libpulse", "libudev"] {
         dependencies.push(Dependency {
             name: name.into(),
             present: Command::new("pkg-config")
@@ -2324,9 +4302,21 @@ fn emit(
     done: bool,
     success: bool,
 ) {
+    let channel = job_event_channel(kind, phase);
     let _ = app.emit(
         "studio-job",
         JobEvent {
+            job_id: if kind == "build" || kind == "clone" || kind == "community-build" {
+                ACTIVE_JOB_ID.load(Ordering::SeqCst)
+            } else {
+                0
+            },
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            channel: channel.into(),
             kind: kind.into(),
             phase: phase.into(),
             line: line.into(),
@@ -2334,6 +4324,57 @@ fn emit(
             success,
         },
     );
+}
+fn job_event_channel(kind: &str, phase: &str) -> &'static str {
+    match kind {
+        "game" => "runtime",
+        "clone" => "repository-clone",
+        "community-build" => "community-pr-build",
+        "build"
+            if matches!(
+                phase,
+                "Git" | "Fetching" | "Updating source" | "Updating submodules"
+            ) =>
+        {
+            "repository-update"
+        }
+        "build" => "emulator-build",
+        _ => "diagnostics",
+    }
+}
+fn drain_job_output<R: Read>(
+    stream: R,
+    label: &str,
+    app: &tauri::AppHandle,
+    kind: &str,
+    phase: &str,
+    logfile: Option<&Arc<Mutex<BuildLogWriter>>>,
+) {
+    let mut reader = CappedOutputReader::new(stream);
+    loop {
+        match reader.next_line() {
+            Ok(Some(output)) => {
+                let line = output.text();
+                if let Some(file) = logfile {
+                    let _ = file.lock().unwrap().append_line(label, &line);
+                }
+                emit(app, kind, phase, line, false, true);
+            }
+            Ok(None) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                let line = format!("output reader error: {error}");
+                if let Some(file) = logfile {
+                    let _ = file.lock().unwrap().append_line(label, &line);
+                }
+                emit(app, kind, phase, line, false, false);
+                break;
+            }
+        }
+    }
 }
 fn execute(
     app: &tauri::AppHandle,
@@ -2348,24 +4389,27 @@ fn execute(
     if jobs.cancel_requested.load(Ordering::SeqCst) {
         return Err("Job cancelled".into());
     }
-    let logfile = log_path
+    let logfile: Option<Arc<Mutex<BuildLogWriter>>> = log_path
         .map(|path| {
             fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
-                .map(|f| Arc::new(Mutex::new(f)))
+                .map(|file| Arc::new(Mutex::new(BuildLogWriter::new(file, BUILD_LOG_MAX_BYTES))))
                 .map_err(|e| e.to_string())
         })
         .transpose()?;
     if let Some(file) = &logfile {
-        let _ = writeln!(file.lock().unwrap(), "$ {} {}", program, args.join(" "));
+        let _ = file
+            .lock()
+            .unwrap()
+            .append_line("command", &format!("{program} {args:?}"));
     }
     emit(
         app,
         kind,
         phase,
-        format!("$ {} {}", program, args.join(" ")),
+        format!("$ {program} {args:?}"),
         false,
         true,
     );
@@ -2379,32 +4423,42 @@ fn execute(
     let pid = child.id() as i32;
     jobs.pid.store(pid, Ordering::SeqCst);
     if jobs.cancel_requested.load(Ordering::SeqCst) {
-        let _ = terminate_process_group(pid);
+        let _ = stop_process_group(pid);
     }
     let stderr = child.stderr.take().ok_or("Missing stderr")?;
     let a = app.clone();
     let k = kind.to_string();
     let p = phase.to_string();
     let error_log = logfile.clone();
-    let err = thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if let Some(file) = &error_log {
-                let _ = writeln!(file.lock().unwrap(), "[stderr] {line}");
-            }
-            emit(&a, &k, &p, line, false, true)
-        }
+    let stderr_reader = thread::spawn(move || {
+        drain_job_output(stderr, "stderr", &a, &k, &p, error_log.as_ref());
     });
-    if let Some(stdout) = child.stdout.take() {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(file) = &logfile {
-                let _ = writeln!(file.lock().unwrap(), "[stdout] {line}");
-            }
-            emit(app, kind, phase, line, false, true)
+    let stdout = child.stdout.take().ok_or("Missing stdout")?;
+    let a = app.clone();
+    let k = kind.to_string();
+    let p = phase.to_string();
+    let output_log = logfile.clone();
+    let stdout_reader = thread::spawn(move || {
+        drain_job_output(stdout, "stdout", &a, &k, &p, output_log.as_ref());
+    });
+    let waited = wait_for_child_and_cleanup_group(&mut child, || {
+        jobs.pid.store(0, Ordering::SeqCst);
+    });
+    let stdout_result = stdout_reader
+        .join()
+        .map_err(|_| "Build stdout reader thread panicked".to_string());
+    let stderr_result = stderr_reader
+        .join()
+        .map_err(|_| "Build stderr reader thread panicked".to_string());
+    let (status, cleanup) = waited?;
+    stdout_result?;
+    stderr_result?;
+    if let Err(error) = cleanup {
+        if let Some(file) = &logfile {
+            let _ = file.lock().unwrap().append_line("cleanup", &error);
         }
+        return Err(format!("Could not clean up build process group: {error}"));
     }
-    let status = child.wait().map_err(|e| e.to_string())?;
-    let _ = err.join();
-    jobs.pid.store(0, Ordering::SeqCst);
     if jobs.cancel_requested.load(Ordering::SeqCst) {
         return Err("Job cancelled".into());
     }
@@ -2429,6 +4483,8 @@ fn finish_job(app: &tauri::AppHandle, jobs: &Jobs, kind: &str, result: Result<St
         Err(error) => ("Complete", error, false),
     };
     emit(app, kind, phase, line, true, success);
+    ACTIVE_JOB_ID.store(0, Ordering::SeqCst);
+    jobs.job_id.store(0, Ordering::SeqCst);
 }
 fn ensure_job_not_cancelled(jobs: &Jobs) -> Result<(), String> {
     if jobs.cancel_requested.load(Ordering::SeqCst) {
@@ -2445,7 +4501,7 @@ fn start_clone(
     app: tauri::AppHandle,
     jobs: tauri::State<'_, Arc<Jobs>>,
     id: i64,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let c = db(&app)?;
     let r = repo(&c, id)?;
     let p = state_paths(&app)?;
@@ -2454,7 +4510,7 @@ fn start_clone(
         return Err("Source checkout already exists".into());
     }
     let jobs = jobs.inner().clone();
-    begin_job(&jobs, "Another job is running", true)?;
+    let job_id = begin_job(&jobs, "Another job is running", true, "clone")?;
     thread::spawn(move || {
         let result = (|| -> Result<(), String> {
             fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
@@ -2494,7 +4550,7 @@ fn start_clone(
             result.map(|()| "Repository ready".into()),
         );
     });
-    Ok(())
+    Ok(job_id)
 }
 fn inspect_adapter(path: &Path) -> String {
     let cmake = fs::read_to_string(path.join("CMakeLists.txt")).unwrap_or_default();
@@ -2522,12 +4578,23 @@ fn inspect_repository(app: tauri::AppHandle, id: i64) -> Result<Repo, String> {
     repo(&c, id)
 }
 #[tauri::command]
-fn check_updates(
+async fn check_updates(
     app: tauri::AppHandle,
     jobs: tauri::State<'_, Arc<Jobs>>,
     id: i64,
 ) -> Result<String, String> {
-    begin_job(&jobs, "A build or update job is already running", false)?;
+    let jobs = jobs.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || check_updates_sync(app, jobs, id))
+        .await
+        .map_err(|error| format!("Update check task failed: {error}"))?
+}
+fn check_updates_sync(app: tauri::AppHandle, jobs: Arc<Jobs>, id: i64) -> Result<String, String> {
+    let _job_id = begin_job(
+        &jobs,
+        "A build or update job is already running",
+        false,
+        "build",
+    )?;
     let result = (|| -> Result<String, String> {
         let c = db(&app)?;
         let r = repo(&c, id)?;
@@ -2558,6 +4625,8 @@ fn check_updates(
         let _control = jobs.control.lock().map_err(|error| error.to_string())?;
         jobs.cancellable.store(false, Ordering::SeqCst);
         jobs.active.store(false, Ordering::SeqCst);
+        jobs.job_id.store(0, Ordering::SeqCst);
+        ACTIVE_JOB_ID.store(0, Ordering::SeqCst);
     }
     result
 }
@@ -2638,10 +4707,7 @@ fn inspect_build_source(
         .cache
         .join("builds")
         .join(repository_id.to_string())
-        .join(format!(
-            "{}-{build_type}",
-            &commit_sha[..commit_sha.len().min(12)]
-        ));
+        .join(format!("{commit_sha}-{build_type}-clang-emulator"));
     let compiler = "clang";
     let mut cmake_arguments = vec![
         "-G Ninja".into(),
@@ -2691,7 +4757,7 @@ const BUILD_DEPENDENCIES: &[&str] = &[
     "python3",
 ];
 const BUILD_PKG_CONFIG_DEPENDENCIES: &[&str] =
-    &["Qt6Concurrent", "Qt6Network", "Qt6Widgets", "Qt6DBus"];
+    &["vulkan", "x11", "wayland-client", "libpulse", "libudev"];
 fn missing_build_dependencies<F>(mut available: F) -> Vec<&'static str>
 where
     F: FnMut(&str) -> bool,
@@ -2719,10 +4785,10 @@ fn linux_x86_64_cmake_cpu_flags(target_os: &str, target_arch: &str) -> Vec<Strin
         Vec::new()
     }
 }
-fn verify_build_dependencies(app: &tauri::AppHandle) -> Result<(), String> {
+fn verify_build_dependencies(app: &tauri::AppHandle, job_kind: &str) -> Result<(), String> {
     emit(
         app,
-        "build",
+        job_kind,
         "Dependency verification",
         "Checking required Linux build tools",
         false,
@@ -2748,7 +4814,11 @@ fn verify_build_dependencies(app: &tauri::AppHandle) -> Result<(), String> {
     } else {
         let mut issues = missing;
         issues.extend(missing_packages.into_iter().map(|name| match name {
-            "Qt6DBus" => "Qt6DBus development files",
+            "vulkan" => "Vulkan development files",
+            "x11" => "X11 development files",
+            "wayland-client" => "Wayland development files",
+            "libpulse" => "PulseAudio development files",
+            "libudev" => "libudev development files",
             _ => name,
         }));
         Err(format!(
@@ -2756,6 +4826,74 @@ fn verify_build_dependencies(app: &tauri::AppHandle) -> Result<(), String> {
             issues.join(", ")
         ))
     }
+}
+fn validate_clean_source_checkout(source: &Path) -> Result<(), String> {
+    if !source.is_dir() {
+        return Err("The registered source checkout is missing".into());
+    }
+    if !git(
+        Some(source),
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--ignore-submodules=all",
+        ],
+    )?
+    .is_empty()
+    {
+        return Err("Source checkout has modified or untracked files. Commit or remove them before building so the recorded commit matches the built source.".into());
+    }
+    let submodules = git(Some(source), &["submodule", "status", "--recursive"])?;
+    if submodules
+        .lines()
+        .any(|line| line.starts_with('-') || line.starts_with('+') || line.starts_with('U'))
+    {
+        return Err("One or more Git submodules are uninitialized or differ from the recorded commit. Update them before building.".into());
+    }
+    let dirty_submodules = git(
+        Some(source),
+        &[
+            "submodule",
+            "foreach",
+            "--quiet",
+            "--recursive",
+            "git status --porcelain --untracked-files=normal",
+        ],
+    )?;
+    if !dirty_submodules.trim().is_empty() {
+        return Err("One or more Git submodules contain modified or untracked files. Clean them before building so the recorded commit matches the built source.".into());
+    }
+    Ok(())
+}
+struct IncompleteInstall {
+    path: PathBuf,
+    keep: bool,
+}
+impl Drop for IncompleteInstall {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+fn insert_registered_build(
+    connection: &Connection,
+    repository_id: i64,
+    commit: &str,
+    build_type: &str,
+    path: &Path,
+    created_at: i64,
+    install_size_bytes: Option<u64>,
+    configuration_json: &str,
+) -> Result<bool, String> {
+    let inserted = connection
+        .execute(
+            "INSERT OR IGNORE INTO builds(repo_id,commit_sha,build_type,path,created_at,install_size_bytes,validation_status,configuration_json) VALUES(?,?,?,?,?,?,'verified',?)",
+            params![repository_id, commit, build_type, path.display().to_string(), created_at, install_size_bytes.map(|size| size.min(i64::MAX as u64) as i64), configuration_json],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(inserted == 1)
 }
 fn build_and_register(
     app: &tauri::AppHandle,
@@ -2765,17 +4903,18 @@ fn build_and_register(
     commit: &str,
     options: &BuildOptions,
     compiler: &str,
+    job_kind: &str,
 ) -> Result<PathBuf, String> {
     ensure_job_not_cancelled(jobs)?;
-    verify_build_dependencies(app)?;
+    validate_clean_source_checkout(source)?;
+    verify_build_dependencies(app, job_kind)?;
     let paths = state_paths(app)?;
     let build_dir = paths
         .cache
         .join("builds")
         .join(repository_id.to_string())
         .join(format!(
-            "{}-{}",
-            &commit[..commit.len().min(12)],
+            "{commit}-{}-{compiler}-emulator",
             options.build_type
         ));
     let install = paths
@@ -2789,8 +4928,15 @@ fn build_and_register(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis()
+                .as_nanos()
         ));
+    if install.exists() {
+        return Err("Refusing to overwrite an existing emulator installation".into());
+    }
+    let mut install_guard = IncompleteInstall {
+        path: install.clone(),
+        keep: false,
+    };
     if build_dir.exists() && options.clean {
         fs::remove_dir_all(&build_dir).map_err(|e| e.to_string())?;
     }
@@ -2808,6 +4954,7 @@ fn build_and_register(
         format!("-DCMAKE_BUILD_TYPE={}", options.build_type),
         format!("-DCMAKE_C_COMPILER={compiler}"),
         format!("-DCMAKE_CXX_COMPILER={cxx}"),
+        "-DKYTY_BUILD_LAUNCHER=OFF".into(),
     ];
     conf.extend(linux_x86_64_cmake_cpu_flags(
         std::env::consts::OS,
@@ -2818,7 +4965,7 @@ fn build_and_register(
     execute(
         app,
         jobs,
-        "build",
+        job_kind,
         "Configure",
         "cmake",
         &conf,
@@ -2828,14 +4975,14 @@ fn build_and_register(
     execute(
         app,
         jobs,
-        "build",
+        job_kind,
         "Compile",
         "cmake",
         &[
             "--build".into(),
             build_dir_s.clone(),
             "--target".into(),
-            "launcher".into(),
+            "kyty_emulator".into(),
             "--parallel".into(),
             options.jobs.to_string(),
         ],
@@ -2845,7 +4992,7 @@ fn build_and_register(
     execute(
         app,
         jobs,
-        "build",
+        job_kind,
         "Install",
         "cmake",
         &[
@@ -2860,7 +5007,7 @@ fn build_and_register(
     ensure_job_not_cancelled(jobs)?;
     emit(
         app,
-        "build",
+        job_kind,
         "Validation",
         "Checking the installed emulator executable and game CLI support",
         false,
@@ -2870,11 +5017,29 @@ fn build_and_register(
     ensure_job_not_cancelled(jobs)?;
     fs::copy(&log_path, install.join("build.log")).map_err(|e| e.to_string())?;
     let install_size_bytes = directory_size_bytes(&install);
+    let configuration_json = serde_json::to_string(&BuildConfiguration {
+        compiler: Some(compiler.to_string()),
+        jobs: Some(options.jobs),
+        clean: Some(options.clean),
+        cmake_arguments: conf.clone(),
+    })
+    .map_err(|error| error.to_string())?;
     ensure_job_not_cancelled(jobs)?;
-    paths.db()?.execute(
-        "INSERT OR IGNORE INTO builds(repo_id,commit_sha,build_type,path,created_at,install_size_bytes,validation_status) VALUES(?,?,?,?,?,?,'verified')",
-        params![repository_id, commit, options.build_type, install.display().to_string(), now(), install_size_bytes.map(|size| size.min(i64::MAX as u64) as i64)],
-    ).map_err(|e| e.to_string())?;
+    if !insert_registered_build(
+        &paths.db()?,
+        repository_id,
+        commit,
+        &options.build_type,
+        &install,
+        now(),
+        install_size_bytes,
+        &configuration_json,
+    )? {
+        return Err(
+            "Build output was not registered because its installation path already exists".into(),
+        );
+    }
+    install_guard.keep = true;
     Ok(install)
 }
 fn directory_size_bytes(path: &Path) -> Option<u64> {
@@ -2908,7 +5073,7 @@ fn start_build(
     jobs: tauri::State<'_, Arc<Jobs>>,
     id: i64,
     options: BuildOptions,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let compiler = validate_build_options(&options)?;
     let c = db(&app)?;
     let r = repo(&c, id)?;
@@ -2916,16 +5081,19 @@ fn start_build(
         return Err("No verified build adapter for this checkout".into());
     }
     let source = PathBuf::from(r.source_path.ok_or("Clone the repository first")?);
+    validate_clean_source_checkout(&source)?;
     let commit = git(Some(&source), &["rev-parse", "HEAD"])?;
     let branch = checked_out_branch(&source)?;
     let jobs = jobs.inner().clone();
-    begin_job(&jobs, "Another job is running", true)?;
+    let job_id = begin_job(&jobs, "Another job is running", true, "build")?;
     thread::spawn(move || {
-        let result = build_and_register(&app, &jobs, id, &source, &commit, &options, &compiler)
-            .and_then(|path| {
-                mark_repository_build_commit(&app, id, &commit, &branch)?;
-                Ok(path)
-            });
+        let result = build_and_register(
+            &app, &jobs, id, &source, &commit, &options, &compiler, "build",
+        )
+        .and_then(|path| {
+            mark_repository_build_commit(&app, id, &commit, &branch)?;
+            Ok(path)
+        });
         finish_job(
             &app,
             &jobs,
@@ -2933,7 +5101,7 @@ fn start_build(
             result.map(|path| format!("Build verified and registered at {}", path.display())),
         );
     });
-    Ok(())
+    Ok(job_id)
 }
 #[tauri::command]
 fn start_update_build(
@@ -2941,7 +5109,7 @@ fn start_update_build(
     jobs: tauri::State<'_, Arc<Jobs>>,
     id: i64,
     options: BuildOptions,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let compiler = validate_build_options(&options)?;
     let c = db(&app)?;
     let repository = repo(&c, id)?;
@@ -2950,7 +5118,7 @@ fn start_update_build(
     }
     let source = PathBuf::from(repository.source_path.ok_or("Clone the repository first")?);
     let jobs = jobs.inner().clone();
-    begin_job(&jobs, "Another job is running", true)?;
+    let job_id = begin_job(&jobs, "Another job is running", true, "build")?;
     thread::spawn(move || {
         let result = (|| -> Result<String, String> {
             let branch = checked_out_branch(&source)?;
@@ -2960,12 +5128,7 @@ fn start_update_build(
                     repository.branch
                 ));
             }
-            if !git(Some(&source), &["status", "--porcelain"])?.is_empty() {
-                return Err(
-                    "Local source changes found. Commit or remove them before building an update"
-                        .into(),
-                );
-            }
+            validate_clean_source_checkout(&source)?;
             execute(
                 &app,
                 &jobs,
@@ -3028,7 +5191,9 @@ fn start_update_build(
                     ));
                 }
             }
-            let path = build_and_register(&app, &jobs, id, &source, &commit, &options, &compiler)?;
+            let path = build_and_register(
+                &app, &jobs, id, &source, &commit, &options, &compiler, "build",
+            )?;
             mark_repository_build_commit(&app, id, &commit, &branch)?;
             Ok(format!(
                 "Update build verified at {}. The active build was left unchanged.",
@@ -3037,7 +5202,7 @@ fn start_update_build(
         })();
         finish_job(&app, &jobs, "build", result);
     });
-    Ok(())
+    Ok(job_id)
 }
 #[tauri::command]
 fn cancel_job(jobs: tauri::State<'_, Arc<Jobs>>) -> Result<(), String> {
@@ -3050,12 +5215,7 @@ fn cancel_job(jobs: tauri::State<'_, Arc<Jobs>>) -> Result<(), String> {
     if pid <= 0 {
         return Ok(());
     }
-    if let Err(error) = terminate_process_group(pid) {
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error.to_string());
-        }
-    }
-    Ok(())
+    stop_process_group(pid)
 }
 #[tauri::command]
 fn validate_build(app: tauri::AppHandle, id: i64) -> Result<String, String> {
@@ -3098,6 +5258,71 @@ fn activate_build(app: tauri::AppHandle, id: i64) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
 }
+#[tauri::command]
+fn remove_build(app: tauri::AppHandle, id: i64) -> Result<(), String> {
+    let mut c = db(&app)?;
+    let root = state_paths(&app)?.data.join("builds");
+    remove_managed_build(&mut c, id, &root)
+}
+fn remove_managed_build(c: &mut Connection, id: i64, managed_root: &Path) -> Result<(), String> {
+    let (path, active): (String, i64) = c
+        .query_row("SELECT path,active FROM builds WHERE id=?", [id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(|_| "Emulator build was not found".to_string())?;
+    if active != 0 {
+        return Err("The active emulator build cannot be removed".into());
+    }
+    for (table, column) in [
+        ("games", "build_id"),
+        ("sessions", "build_id"),
+        ("community_build_results", "build_id"),
+        ("manual_compatibility_observations", "build_id"),
+    ] {
+        let sql = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column}=?)");
+        let referenced: bool = c
+            .query_row(&sql, [id], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if referenced {
+            return Err(format!("This build is still referenced by {table}; keep it to preserve game assignments and history"));
+        }
+    }
+    let root = fs::canonicalize(managed_root)
+        .map_err(|_| "Managed emulator build directory is unavailable".to_string())?;
+    let original = PathBuf::from(path);
+    let metadata = fs::symlink_metadata(&original)
+        .map_err(|e| format!("Build installation is unavailable: {e}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("Build path is not a managed installation directory".into());
+    }
+    let canonical = fs::canonicalize(&original).map_err(|e| e.to_string())?;
+    if canonical == root || !canonical.starts_with(&root) {
+        return Err("Build path is outside Studio's managed installations".into());
+    }
+    let name = canonical
+        .file_name()
+        .ok_or("Invalid installation directory")?
+        .to_string_lossy();
+    let tombstone = canonical.with_file_name(format!(".{name}.removing-{id}-{}", now()));
+    fs::rename(&canonical, &tombstone)
+        .map_err(|e| format!("Could not safely stage build removal: {e}"))?;
+    let result = (|| {
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        let changed = tx
+            .execute("DELETE FROM builds WHERE id=? AND active=0", [id])
+            .map_err(|e| e.to_string())?;
+        if changed != 1 {
+            return Err("Build changed while removal was being prepared".to_string());
+        }
+        tx.commit().map_err(|e| e.to_string())
+    })();
+    if let Err(error) = result {
+        let _ = fs::rename(&tombstone, &canonical);
+        return Err(error);
+    }
+    fs::remove_dir_all(&tombstone)
+        .map_err(|e| format!("Build entry removed, but staged files could not be cleaned up: {e}"))
+}
 fn emulator_help(executable: &Path) -> Result<String, String> {
     let metadata =
         fs::metadata(executable).map_err(|_| "Emulator executable is missing".to_string())?;
@@ -3111,24 +5336,44 @@ fn emulator_help(executable: &Path) -> Result<String, String> {
         .process_group(0)
         .spawn()
         .map_err(|e| format!("Could not run emulator validation: {e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-            let _ = child.wait();
-            return Err("Emulator --help timed out after 5 seconds".into());
-        }
-        thread::sleep(Duration::from_millis(25));
-    };
-    let output = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !status.success() {
-        return Err(format!("Emulator --help exited with {status}"));
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Emulator --help stdout unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("Emulator --help stderr unavailable")?;
+    let stdout_reader =
+        thread::spawn(move || read_capped_output(BufReader::new(stdout), EMULATOR_HELP_MAX_BYTES));
+    let stderr_reader =
+        thread::spawn(move || read_capped_output(BufReader::new(stderr), EMULATOR_HELP_MAX_BYTES));
+    let wait_result =
+        wait_for_child_with_timeout(&mut child, Duration::from_secs(5), "Emulator --help");
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "Emulator --help stdout reader failed")?
+        .map_err(|error| format!("Could not read emulator help: {error}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "Emulator --help stderr reader failed")?
+        .map_err(|error| format!("Could not read emulator help errors: {error}"))?;
+    let status = wait_result?;
+    if stdout.1 || stderr.1 {
+        return Err(format!(
+            "Emulator --help output exceeded the {} MiB safety limit",
+            EMULATOR_HELP_MAX_BYTES / (1024 * 1024)
+        ));
     }
-    String::from_utf8(output.stdout)
-        .map_err(|_| "Emulator --help output is not valid UTF-8".to_string())
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr.0).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("Emulator --help exited with {status}")
+        } else {
+            format!("Emulator --help exited with {status}: {detail}")
+        });
+    }
+    String::from_utf8(stdout.0).map_err(|_| "Emulator --help output is not valid UTF-8".to_string())
 }
 
 fn verify_emulator(executable: &Path) -> Result<(), String> {
@@ -3140,6 +5385,43 @@ fn verify_emulator(executable: &Path) -> Result<(), String> {
 }
 #[tauri::command]
 fn add_game(app: tauri::AppHandle, path: String) -> Result<Game, String> {
+    let (game, _) = add_game_with_size(app.clone(), path, false)?;
+    spawn_game_size_task(
+        app,
+        NEXT_GAME_SCAN_ID.fetch_add(1, Ordering::Relaxed),
+        vec![(game.id, game.path.clone())],
+        false,
+    );
+    Ok(game)
+}
+#[tauri::command]
+fn refresh_game_metadata(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
+    let c = db(&app)?;
+    let registered = game(&c, game_id)?;
+    let path = fs::canonicalize(&registered.path)
+        .map_err(|_| "The registered game path is missing or inaccessible".to_string())?;
+    if !supported_game_path(&path) {
+        return Err("The registered game no longer has a supported game layout".into());
+    }
+    let (title, title_id, game_version, icon_path) = game_metadata(&path);
+    c.execute(
+        "UPDATE games SET title=CASE WHEN ?<>'' THEN ? ELSE title END,title_id=COALESCE(?,title_id),game_version=COALESCE(?,game_version),icon_path=COALESCE(?,icon_path),install_size=NULL WHERE id=?",
+        params![title, title, title_id, game_version, icon_path, game_id],
+    )
+    .map_err(|error| error.to_string())?;
+    spawn_game_size_task(
+        app.clone(),
+        NEXT_GAME_SCAN_ID.fetch_add(1, Ordering::Relaxed),
+        vec![(game_id, path.display().to_string())],
+        true,
+    );
+    Ok(())
+}
+fn add_game_with_size(
+    app: tauri::AppHandle,
+    path: String,
+    calculate_install_size: bool,
+) -> Result<(Game, bool), String> {
     let p = fs::canonicalize(&path).map_err(|e| e.to_string())?;
     if !supported_game_path(&p) {
         return Err("Choose a game directory with eboot.bin, an ELF, or a .zar archive".into());
@@ -3153,28 +5435,31 @@ fn add_game(app: tauri::AppHandle, path: String) -> Result<Game, String> {
             .to_string_lossy()
             .to_string();
     }
-    let install_size = if p.is_dir() {
+    let install_size = if !calculate_install_size {
+        None
+    } else if p.is_dir() {
         walkdir::WalkDir::new(&p)
             .follow_links(false)
             .into_iter()
             .filter_map(Result::ok)
             .filter_map(|entry| entry.metadata().ok())
             .filter(|metadata| metadata.is_file())
-            .map(|metadata| metadata.len() as i64)
-            .sum()
+            .map(|metadata| metadata.len().min(i64::MAX as u64) as i64)
+            .fold(0_i64, i64::saturating_add)
+            .into()
     } else {
         fs::metadata(&p)
-            .map(|metadata| metadata.len() as i64)
-            .unwrap_or(0)
+            .map(|metadata| metadata.len().min(i64::MAX as u64) as i64)
+            .ok()
     };
     let c = db(&app)?;
-    c.execute(
+    let inserted = c.execute(
         "INSERT OR IGNORE INTO games(path,title,title_id,game_version,icon_path,install_size) VALUES(?,?,?,?,?,?)",
         params![p.display().to_string(), title, title_id, game_version, icon_path, install_size],
     )
     .map_err(|e| e.to_string())?;
     c.execute(
-        "UPDATE games SET title=CASE WHEN title_id IS NULL AND ? IS NOT NULL THEN ? ELSE title END, title_id=COALESCE(title_id,?), game_version=COALESCE(game_version,?), icon_path=COALESCE(icon_path,?), install_size=COALESCE(install_size,?) WHERE path=?",
+        "UPDATE games SET hidden=0,title=CASE WHEN title_id IS NULL AND ? IS NOT NULL THEN ? ELSE title END, title_id=COALESCE(title_id,?), game_version=COALESCE(game_version,?), icon_path=COALESCE(icon_path,?), install_size=COALESCE(install_size,?) WHERE path=?",
         params![title_id, title, title_id, game_version, icon_path, install_size, p.display().to_string()],
     ).map_err(|e| e.to_string())?;
     let id = c
@@ -3184,14 +5469,136 @@ fn add_game(app: tauri::AppHandle, path: String) -> Result<Game, String> {
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
-    game(&c, id)
+    Ok((game(&c, id)?, inserted != 0))
+}
+fn calculate_game_size(path: &Path) -> Option<i64> {
+    if path.is_dir() {
+        Some(
+            walkdir::WalkDir::new(path)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.metadata().ok())
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.len().min(i64::MAX as u64) as i64)
+                .fold(0_i64, i64::saturating_add),
+        )
+    } else {
+        fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.len().min(i64::MAX as u64) as i64)
+    }
+}
+fn emit_game_scan(app: &tauri::AppHandle, event: GameScanEvent) {
+    let _ = app.emit("studio-game-scan", event);
+}
+fn spawn_game_size_task(
+    app: tauri::AppHandle,
+    scan_id: u64,
+    games: Vec<(i64, String)>,
+    report_progress: bool,
+) {
+    thread::spawn(move || {
+        let total = games.len() as u64;
+        let mut completed = 0_u64;
+        for (game_id, path) in games {
+            let size = calculate_game_size(Path::new(&path));
+            if let (Some(size), Ok(c)) = (size, db(&app)) {
+                let _ = c.execute(
+                    "UPDATE games SET install_size=? WHERE id=? AND install_size IS NULL",
+                    params![size, game_id],
+                );
+            }
+            completed += 1;
+            if report_progress {
+                emit_game_scan(
+                    &app,
+                    GameScanEvent {
+                        scan_id,
+                        phase: "Calculating install sizes".into(),
+                        completed,
+                        total,
+                        current: path,
+                        done: completed == total,
+                    },
+                );
+            }
+        }
+        if report_progress && total == 0 {
+            emit_game_scan(
+                &app,
+                GameScanEvent {
+                    scan_id,
+                    phase: "Complete".into(),
+                    completed: 0,
+                    total: 0,
+                    current: String::new(),
+                    done: true,
+                },
+            );
+        }
+    });
+}
+#[tauri::command]
+fn remove_game_entry(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
+    let mut c = db(&app)?;
+    soft_remove_game_entry(&mut c, game_id)
+}
+fn soft_remove_game_entry(c: &mut Connection, game_id: i64) -> Result<(), String> {
+    let tx = c.transaction().map_err(|e| e.to_string())?;
+    tx.query_row(
+        "SELECT id FROM games WHERE id=? AND hidden=0",
+        [game_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_err(|_| "Game is not in the library".to_string())?;
+    let active: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE game_id=? AND ended_at IS NULL)",
+            [game_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if active {
+        return Err("Stop the active game session before removing its library entry".into());
+    }
+    tx.execute("UPDATE games SET hidden=1 WHERE id=?", [game_id])
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+fn create_game_session(
+    c: &mut Connection,
+    game_id: i64,
+    build_id: i64,
+    started: i64,
+    log_path: &str,
+) -> Result<i64, String> {
+    let tx = c.transaction().map_err(|e| e.to_string())?;
+    let visible: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM games WHERE id=? AND hidden=0)",
+            [game_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !visible {
+        return Err("This game entry is hidden or no longer registered".into());
+    }
+    tx.execute(
+        "INSERT INTO sessions(game_id,build_id,started_at,log_path) VALUES(?,?,?,?)",
+        params![game_id, build_id, started, log_path],
+    )
+    .map_err(|e| e.to_string())?;
+    let id = tx.last_insert_rowid();
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(id)
 }
 fn supported_game_path(path: &Path) -> bool {
     if path.is_dir() {
-        path.join("eboot.bin").is_file()
+        is_elf_file(&path.join("eboot.bin"))
     } else {
         if path.file_name().and_then(|s| s.to_str()) == Some("eboot.bin") {
-            true
+            is_elf_file(path)
         } else {
             match path
                 .extension()
@@ -3200,11 +5607,160 @@ fn supported_game_path(path: &Path) -> bool {
                 .as_deref()
             {
                 Some("elf") => is_elf_file(path),
-                Some("zar") => path.is_file(),
+                Some("zar") => is_zarchive_file(path),
                 _ => false,
             }
         }
     }
+}
+fn is_zarchive_file(path: &Path) -> bool {
+    const FOOTER_SIZE: u64 = 144;
+    const FOOTER_MAGIC: u32 = 0x169f_52d6;
+    const FOOTER_VERSION: u32 = 0x61bf_3a01;
+    const OFFSET_RECORD_SIZE: u64 = 40;
+    const FILE_TREE_ENTRY_SIZE: u64 = 16;
+
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() <= FOOTER_SIZE {
+        return false;
+    }
+    let file_size = metadata.len();
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    if file.seek(SeekFrom::End(-(FOOTER_SIZE as i64))).is_err() {
+        return false;
+    }
+    let mut footer = [0_u8; FOOTER_SIZE as usize];
+    if file.read_exact(&mut footer).is_err() {
+        return false;
+    }
+    let read_u32 = |offset: usize| {
+        u32::from_be_bytes(
+            footer[offset..offset + 4]
+                .try_into()
+                .expect("fixed footer slice"),
+        )
+    };
+    let read_u64 = |offset: usize| {
+        u64::from_be_bytes(
+            footer[offset..offset + 8]
+                .try_into()
+                .expect("fixed footer slice"),
+        )
+    };
+    if read_u64(128) != file_size
+        || read_u32(136) != FOOTER_VERSION
+        || read_u32(140) != FOOTER_MAGIC
+    {
+        return false;
+    }
+    let mut sections = [(0_u64, 0_u64); 6];
+    for (index, section) in sections.iter_mut().enumerate() {
+        let offset = index * 16;
+        *section = (read_u64(offset), read_u64(offset + 8));
+        if section
+            .0
+            .checked_add(section.1)
+            .is_none_or(|end| end > file_size)
+        {
+            return false;
+        }
+    }
+    let offset_records_size = sections[1].1;
+    let names_size = sections[2].1;
+    let file_tree_size = sections[3].1;
+    if offset_records_size == 0
+        || offset_records_size > u32::MAX as u64
+        || offset_records_size % OFFSET_RECORD_SIZE != 0
+        || names_size > 0x7fff_ffff
+        || names_size == 0
+        || file_tree_size == 0
+        || file_tree_size > u32::MAX as u64
+        || file_tree_size % FILE_TREE_ENTRY_SIZE != 0
+    {
+        return false;
+    }
+    if file.seek(SeekFrom::Start(sections[3].0)).is_err() {
+        return false;
+    }
+    let mut root = [0_u8; FILE_TREE_ENTRY_SIZE as usize];
+    if file.read_exact(&mut root).is_err() {
+        return false;
+    }
+    let root_name_type = u32::from_be_bytes(root[0..4].try_into().unwrap());
+    let root_start = u32::from_be_bytes(root[4..8].try_into().unwrap()) as u64;
+    let root_count = u32::from_be_bytes(root[8..12].try_into().unwrap()) as u64;
+    let entries = file_tree_size / FILE_TREE_ENTRY_SIZE;
+    if root_name_type & 0x8000_0000 != 0
+        || root_name_type & 0x7fff_ffff != 0x7fff_ffff
+        || root_count > 100_000
+        || !root_start
+            .checked_add(root_count)
+            .is_some_and(|end| end <= entries)
+    {
+        return false;
+    }
+    for child_index in root_start..root_start + root_count {
+        let Some(child_offset) = sections[3]
+            .0
+            .checked_add(child_index.saturating_mul(FILE_TREE_ENTRY_SIZE))
+        else {
+            return false;
+        };
+        if file.seek(SeekFrom::Start(child_offset)).is_err() {
+            return false;
+        }
+        let mut child = [0_u8; FILE_TREE_ENTRY_SIZE as usize];
+        if file.read_exact(&mut child).is_err() {
+            return false;
+        }
+        let name_and_type = u32::from_be_bytes(child[0..4].try_into().unwrap());
+        if name_and_type & 0x8000_0000 == 0 {
+            continue;
+        }
+        let name_offset = (name_and_type & 0x7fff_ffff) as u64;
+        if name_offset >= names_size {
+            return false;
+        }
+        let Some(name_position) = sections[2].0.checked_add(name_offset) else {
+            return false;
+        };
+        if file.seek(SeekFrom::Start(name_position)).is_err() {
+            return false;
+        }
+        let mut length_header = [0_u8; 2];
+        if file.read_exact(&mut length_header[..1]).is_err() {
+            return false;
+        }
+        let name_length = if length_header[0] & 0x80 == 0 {
+            length_header[0] as u64
+        } else {
+            if name_offset + 2 > names_size || file.read_exact(&mut length_header[1..]).is_err() {
+                return false;
+            }
+            ((length_header[0] & 0x7f) as u64) | ((length_header[1] as u64) << 7)
+        };
+        let name_start = name_position + if length_header[0] & 0x80 == 0 { 1 } else { 2 };
+        if name_length > names_size
+            || name_offset + (name_start - name_position) + name_length > names_size
+        {
+            return false;
+        }
+        if name_length != 9 {
+            continue;
+        }
+        let mut name = [0_u8; 9];
+        if file.seek(SeekFrom::Start(name_start)).is_err() || file.read_exact(&mut name).is_err() {
+            return false;
+        }
+        if name.eq_ignore_ascii_case(b"eboot.bin") {
+            return true;
+        }
+    }
+    false
 }
 fn is_elf_file(path: &Path) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
@@ -3257,29 +5813,50 @@ fn game_metadata(path: &Path) -> (String, Option<String>, Option<String>, Option
     (title, title_id, version, icon_path)
 }
 #[tauri::command]
-fn read_game_icon(app: tauri::AppHandle, game_id: i64) -> Result<Option<Vec<u8>>, String> {
-    let c = db(&app)?;
-    let game = game(&c, game_id)?;
-    let Some(icon) = game.icon_path else {
-        return Ok(None);
-    };
-    let Some(root) = game_artwork_root(Path::new(&game.path)) else {
-        return Ok(None);
-    };
-    Ok(read_game_png(Path::new(&icon), &root, 4 * 1024 * 1024))
+async fn read_game_icon(app: tauri::AppHandle, game_id: i64) -> Result<Option<Vec<u8>>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let c = db(&app)?;
+        let game = game(&c, game_id)?;
+        let Some(icon) = game.icon_path else {
+            return Ok(None);
+        };
+        let Some(root) = game_artwork_root(Path::new(&game.path)) else {
+            return Ok(None);
+        };
+        Ok(read_game_thumbnail(
+            Path::new(&icon),
+            &root,
+            4 * 1024 * 1024,
+            512,
+            512,
+            2 * 1024 * 1024,
+        ))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 #[tauri::command]
-fn read_game_background(app: tauri::AppHandle, game_id: i64) -> Result<Option<Vec<u8>>, String> {
-    let c = db(&app)?;
-    let game = game(&c, game_id)?;
-    let Some(root) = game_artwork_root(Path::new(&game.path)) else {
-        return Ok(None);
-    };
-    Ok(read_game_png(
-        &root.join("sce_sys/pic0.png"),
-        &root,
-        32 * 1024 * 1024,
-    ))
+async fn read_game_background(
+    app: tauri::AppHandle,
+    game_id: i64,
+) -> Result<Option<Vec<u8>>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let c = db(&app)?;
+        let game = game(&c, game_id)?;
+        let Some(root) = game_artwork_root(Path::new(&game.path)) else {
+            return Ok(None);
+        };
+        Ok(read_game_thumbnail(
+            &root.join("sce_sys/pic0.png"),
+            &root,
+            32 * 1024 * 1024,
+            1600,
+            900,
+            8 * 1024 * 1024,
+        ))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 fn game_artwork_root(game_path: &Path) -> Option<PathBuf> {
     if game_path.is_dir() {
@@ -3301,47 +5878,292 @@ fn read_game_png(path: &Path, game_root: &Path, maximum_size: u64) -> Option<Vec
     if !path.starts_with(&root) || !path.is_file() {
         return None;
     }
-    let metadata = fs::metadata(&path).ok()?;
+    let file = fs::File::open(&path).ok()?;
+    let metadata = file.metadata().ok()?;
     if metadata.len() > maximum_size {
         return None;
     }
-    let bytes = fs::read(path).ok()?;
+    let mut bytes = Vec::with_capacity(metadata.len().min(maximum_size) as usize);
+    file.take(maximum_size.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > maximum_size {
+        return None;
+    }
     bytes.starts_with(b"\x89PNG\r\n\x1a\n").then_some(bytes)
 }
+const MAX_ARTWORK_DECODED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ARTWORK_PIXELS: usize = MAX_ARTWORK_DECODED_BYTES / 4;
+fn read_game_thumbnail(
+    path: &Path,
+    game_root: &Path,
+    maximum_source_size: u64,
+    maximum_width: u32,
+    maximum_height: u32,
+    maximum_output_size: usize,
+) -> Option<Vec<u8>> {
+    let bytes = read_game_png(path, game_root, maximum_source_size)?;
+    let thumbnail = resize_png(&bytes, maximum_width, maximum_height)?;
+    (thumbnail.len() <= maximum_output_size).then_some(thumbnail)
+}
+fn resize_png(bytes: &[u8], maximum_width: u32, maximum_height: u32) -> Option<Vec<u8>> {
+    if maximum_width == 0 || maximum_height == 0 {
+        return None;
+    }
+    let limits = png::Limits {
+        bytes: MAX_ARTWORK_DECODED_BYTES,
+    };
+    let mut decoder = png::Decoder::new_with_limits(BufReader::new(Cursor::new(bytes)), limits);
+    let (source_width, source_height) = {
+        let info = decoder.read_header_info().ok()?;
+        (info.width, info.height)
+    };
+    let pixel_count = (source_width as usize).checked_mul(source_height as usize)?;
+    if source_width == 0 || source_height == 0 || pixel_count > MAX_ARTWORK_PIXELS {
+        return None;
+    }
+    decoder.set_transformations(
+        png::Transformations::normalize_to_color8() | png::Transformations::ALPHA,
+    );
+    let mut reader = decoder.read_info().ok()?;
+    let decoded_size = reader.output_buffer_size()?;
+    if decoded_size > MAX_ARTWORK_DECODED_BYTES {
+        return None;
+    }
+    let mut decoded = vec![0; decoded_size];
+    let frame = reader.next_frame(&mut decoded).ok()?;
+    let channels = match frame.color_type {
+        png::ColorType::Rgba => 4,
+        png::ColorType::Rgb => 3,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Grayscale => 1,
+        png::ColorType::Indexed => return None,
+    };
+    if frame.bit_depth != png::BitDepth::Eight
+        || frame.width != source_width
+        || frame.height != source_height
+    {
+        return None;
+    }
+    let source = &decoded[..frame.buffer_size()];
+    let scale = (maximum_width as f64 / source_width as f64)
+        .min(maximum_height as f64 / source_height as f64)
+        .min(1.0);
+    let output_width = ((source_width as f64 * scale).floor() as u32).max(1);
+    let output_height = ((source_height as f64 * scale).floor() as u32).max(1);
+    let output_pixels = (output_width as usize).checked_mul(output_height as usize)?;
+    let mut resized = vec![0_u8; output_pixels.checked_mul(4)?];
+    let scale_x = source_width as f64 / output_width as f64;
+    let scale_y = source_height as f64 / output_height as f64;
+    for y in 0..output_height {
+        let source_y =
+            ((y as f64 + 0.5) * scale_y - 0.5).clamp(0.0, source_height.saturating_sub(1) as f64);
+        let y0 = source_y.floor() as u32;
+        let y1 = (y0 + 1).min(source_height - 1);
+        let fy = source_y - y0 as f64;
+        for x in 0..output_width {
+            let source_x = ((x as f64 + 0.5) * scale_x - 0.5)
+                .clamp(0.0, source_width.saturating_sub(1) as f64);
+            let x0 = source_x.floor() as u32;
+            let x1 = (x0 + 1).min(source_width - 1);
+            let fx = source_x - x0 as f64;
+            let output_index = ((y * output_width + x) * 4) as usize;
+            for channel in 0..4 {
+                let sample = |sample_x: u32, sample_y: u32| {
+                    let index = ((sample_y * source_width + sample_x) as usize) * channels;
+                    (match frame.color_type {
+                        png::ColorType::Rgba => source[index + channel],
+                        png::ColorType::Rgb => {
+                            if channel == 3 {
+                                255
+                            } else {
+                                source[index + channel]
+                            }
+                        }
+                        png::ColorType::GrayscaleAlpha => {
+                            if channel == 3 {
+                                source[index + 1]
+                            } else {
+                                source[index]
+                            }
+                        }
+                        png::ColorType::Grayscale => {
+                            if channel == 3 {
+                                255
+                            } else {
+                                source[index]
+                            }
+                        }
+                        png::ColorType::Indexed => 0,
+                    }) as f64
+                };
+                let top = sample(x0, y0) * (1.0 - fx) + sample(x1, y0) * fx;
+                let bottom = sample(x0, y1) * (1.0 - fx) + sample(x1, y1) * fx;
+                resized[output_index + channel] = (top * (1.0 - fy) + bottom * fy).round() as u8;
+            }
+        }
+    }
+    let mut output = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut output, output_width, output_height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(&resized).ok()?;
+    }
+    Some(output)
+}
+fn has_game_ancestor(path: &Path, scan_root: &Path) -> bool {
+    let Some(mut directory) = path.parent() else {
+        return false;
+    };
+    loop {
+        if !directory.starts_with(scan_root) {
+            return false;
+        }
+        if is_elf_file(&directory.join("eboot.bin")) {
+            return true;
+        }
+        if directory == scan_root {
+            return false;
+        }
+        let Some(parent) = directory.parent() else {
+            return false;
+        };
+        directory = parent;
+    }
+}
+fn scan_entry_is_symlink(entry: &walkdir::DirEntry) -> bool {
+    entry.file_type().is_symlink()
+}
 #[tauri::command]
-fn scan_games(app: tauri::AppHandle, path: String) -> Result<usize, String> {
+async fn scan_games(app: tauri::AppHandle, path: String) -> Result<GameScanResult, String> {
+    tauri::async_runtime::spawn_blocking(move || scan_games_sync(app, path))
+        .await
+        .map_err(|error| format!("Game scan task failed: {error}"))?
+}
+
+fn scan_games_sync(app: tauri::AppHandle, path: String) -> Result<GameScanResult, String> {
     let root = fs::canonicalize(path).map_err(|e| e.to_string())?;
     if !root.is_dir() {
         return Err("Select a directory".into());
     }
-    let mut count = 0;
-    for entry in walkdir::WalkDir::new(root)
-        .max_depth(6)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
+    let scan_id = NEXT_GAME_SCAN_ID.fetch_add(1, Ordering::Relaxed);
+    emit_game_scan(
+        &app,
+        GameScanEvent {
+            scan_id,
+            phase: "Scanning folder".into(),
+            completed: 0,
+            total: 0,
+            current: root.display().to_string(),
+            done: false,
+        },
+    );
+    let mut imported = 0_usize;
+    let mut already_registered = 0_usize;
+    let mut rejected = 0_usize;
+    let mut candidates = HashSet::new();
+    let mut entries_seen = 0_u64;
+    let mut games_for_size = Vec::new();
+    for entry in walkdir::WalkDir::new(&root) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                rejected += 1;
+                continue;
+            }
+        };
+        entries_seen += 1;
         let p = entry.path();
-        let hit = entry.file_name() == "eboot.bin" && p.is_file();
-        let archive = p
+        if scan_entry_is_symlink(&entry) {
+            rejected += 1;
+            continue;
+        }
+        let is_eboot = entry.file_name() == "eboot.bin" && p.is_file();
+        if !is_eboot && has_game_ancestor(p, &root) {
+            continue;
+        }
+        let archive_extension = p
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.eq_ignore_ascii_case("zar"))
-            .unwrap_or(false)
-            && p.is_file();
-        let elf = p
+            .unwrap_or(false);
+        let elf_extension = p
             .extension()
             .and_then(|extension| extension.to_str())
             .map(|extension| extension.eq_ignore_ascii_case("elf"))
-            .unwrap_or(false)
-            && is_elf_file(p);
-        if hit || archive || elf {
-            let candidate = if hit { p.parent().unwrap() } else { p };
-            if add_game(app.clone(), candidate.display().to_string()).is_ok() {
-                count += 1
+            .unwrap_or(false);
+        if is_eboot && !is_elf_file(p)
+            || archive_extension && !is_zarchive_file(p)
+            || elf_extension && !is_elf_file(p)
+        {
+            rejected += 1;
+            continue;
+        }
+        if is_eboot || archive_extension || elf_extension {
+            let candidate = if is_eboot {
+                p.parent().unwrap_or(&root)
+            } else {
+                p
+            };
+            let Ok(candidate) = fs::canonicalize(candidate) else {
+                rejected += 1;
+                continue;
+            };
+            if !candidates.insert(candidate.clone()) {
+                continue;
+            }
+            match add_game_with_size(app.clone(), candidate.display().to_string(), false) {
+                Ok((game, was_inserted)) => {
+                    if was_inserted {
+                        imported += 1;
+                    } else {
+                        already_registered += 1;
+                    }
+                    if game.install_size.is_none() {
+                        games_for_size.push((game.id, game.path));
+                    }
+                }
+                Err(_) => rejected += 1,
             }
         }
+        if entries_seen % 64 == 0 {
+            emit_game_scan(
+                &app,
+                GameScanEvent {
+                    scan_id,
+                    phase: "Scanning folder".into(),
+                    completed: entries_seen,
+                    total: 0,
+                    current: p.display().to_string(),
+                    done: false,
+                },
+            );
+        }
     }
-    Ok(count)
+    emit_game_scan(
+        &app,
+        GameScanEvent {
+            scan_id,
+            phase: "Registering games".into(),
+            completed: imported.saturating_add(already_registered) as u64,
+            total: imported.saturating_add(already_registered) as u64,
+            current: if rejected == 0 {
+                String::new()
+            } else {
+                format!("{rejected} unsupported or inaccessible entries skipped")
+            },
+            done: false,
+        },
+    );
+    spawn_game_size_task(app.clone(), scan_id, games_for_size, true);
+    Ok(GameScanResult {
+        imported,
+        already_registered,
+        rejected,
+    })
 }
 #[tauri::command]
 fn set_game_build(
@@ -3381,13 +6203,59 @@ fn get_profile_capabilities(
     let c = db(&app)?;
     capabilities_for_build(&build_for_game(&c, game_id)?)
 }
+#[tauri::command]
+fn get_global_profile_options(app: tauri::AppHandle) -> Result<BTreeMap<String, String>, String> {
+    global_profile_options(&db(&app)?)
+}
+#[tauri::command]
+fn get_active_profile_capabilities(app: tauri::AppHandle) -> Result<ProfileCapabilities, String> {
+    let c = db(&app)?;
+    let id: i64 = c
+        .query_row("SELECT id FROM builds WHERE active=1 LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .map_err(|_| "No active emulator build".to_string())?;
+    capabilities_for_build(&build(&c, id)?)
+}
+#[tauri::command]
+fn set_global_profile_options(
+    app: tauri::AppHandle,
+    mut options: BTreeMap<String, String>,
+) -> Result<(), String> {
+    let c = db(&app)?;
+    let build_id: i64 = c
+        .query_row("SELECT id FROM builds WHERE active=1 LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .map_err(|_| {
+            "Select and activate an emulator build before configuring global defaults".to_string()
+        })?;
+    let capabilities = capabilities_for_build(&build(&c, build_id)?)?;
+    validate_extra_profile_options(&options, &capabilities)?;
+    for (flag, value) in &mut options {
+        if [
+            "--game-patch",
+            "--printf-output-file",
+            "--addcont-dir",
+            "--shader-log-folder",
+            "--command-buffer-dump-folder",
+        ]
+        .contains(&flag.as_str())
+        {
+            *value = canonicalize_option_path(flag, value)?;
+        }
+    }
+    let json = serde_json::to_string(&options).map_err(|e| e.to_string())?;
+    c.execute("INSERT INTO global_profile_defaults(id,options_json) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET options_json=excluded.options_json", [json]).map_err(|e| e.to_string())?;
+    Ok(())
+}
 fn validate_profile_values(profile: &Profile) -> Result<(), String> {
     for value in [profile.screen_width, profile.screen_height]
         .into_iter()
         .flatten()
     {
-        if !(320..=7680).contains(&value) {
-            return Err("Resolution must be between 320 and 7680".into());
+        if value == 0 {
+            return Err("Resolution must be greater than zero".into());
         }
     }
     if let Some(mode) = &profile.present_mode {
@@ -3415,11 +6283,27 @@ fn validate_profile_values(profile: &Profile) -> Result<(), String> {
     Ok(())
 }
 #[tauri::command]
-fn set_profile(app: tauri::AppHandle, game_id: i64, profile: Profile) -> Result<(), String> {
+fn set_profile(app: tauri::AppHandle, game_id: i64, mut profile: Profile) -> Result<(), String> {
+    merge_legacy_profile_options(&mut profile);
+    sync_legacy_profile_fields(&mut profile);
     validate_profile_values(&profile)?;
     let c = db(&app)?;
     game(&c, game_id)?;
     let capabilities = capabilities_for_build(&build_for_game(&c, game_id)?)?;
+    validate_extra_profile_options(&profile.options, &capabilities)?;
+    for (flag, value) in &mut profile.options {
+        if [
+            "--game-patch",
+            "--printf-output-file",
+            "--addcont-dir",
+            "--shader-log-folder",
+            "--command-buffer-dump-folder",
+        ]
+        .contains(&flag.as_str())
+        {
+            *value = canonicalize_option_path(flag, value)?;
+        }
+    }
     if profile.screen_width.is_some() && !capabilities.screen_width
         || profile.screen_height.is_some() && !capabilities.screen_height
         || profile.present_mode.is_some() && !capabilities.present_mode
@@ -3434,12 +6318,16 @@ fn set_profile(app: tauri::AppHandle, game_id: i64, profile: Profile) -> Result<
             "This emulator build does not support one or more selected profile options".into(),
         );
     }
-    c.execute("INSERT INTO profiles(game_id,screen_width,screen_height,present_mode,perf_overlay,fullscreen,controller_color,controller_volume,controller_vibration,keyboard_player) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(game_id) DO UPDATE SET screen_width=excluded.screen_width,screen_height=excluded.screen_height,present_mode=excluded.present_mode,perf_overlay=excluded.perf_overlay,fullscreen=excluded.fullscreen,controller_color=excluded.controller_color,controller_volume=excluded.controller_volume,controller_vibration=excluded.controller_vibration,keyboard_player=excluded.keyboard_player",params![game_id,profile.screen_width,profile.screen_height,profile.present_mode,profile.perf_overlay,profile.fullscreen,profile.controller_color,profile.controller_volume,profile.controller_vibration,profile.keyboard_player]).map_err(|e|e.to_string())?;
+    let options_json = serde_json::to_string(&profile.options).map_err(|e| e.to_string())?;
+    c.execute("INSERT INTO profiles(game_id,screen_width,screen_height,present_mode,perf_overlay,fullscreen,controller_color,controller_volume,controller_vibration,keyboard_player,options_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(game_id) DO UPDATE SET screen_width=excluded.screen_width,screen_height=excluded.screen_height,present_mode=excluded.present_mode,perf_overlay=excluded.perf_overlay,fullscreen=excluded.fullscreen,controller_color=excluded.controller_color,controller_volume=excluded.controller_volume,controller_vibration=excluded.controller_vibration,keyboard_player=excluded.keyboard_player,options_json=excluded.options_json",params![game_id,profile.screen_width,profile.screen_height,profile.present_mode,profile.perf_overlay,profile.fullscreen,profile.controller_color,profile.controller_volume,profile.controller_vibration,profile.keyboard_player,options_json]).map_err(|e|e.to_string())?;
     Ok(())
 }
 #[tauri::command]
 fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
-    let c = db(&app)?;
+    let _session_lifecycle = SESSION_LIFECYCLE_LOCK
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let mut c = db(&app)?;
     let g = game(&c, game_id)?;
     let game_profile = profile(&c, game_id)?;
     let build_id = if let Some(id) = g.build_id {
@@ -3452,6 +6340,24 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
     };
     let b = build(&c, build_id)?;
     let capabilities = capabilities_for_build(&b)?;
+    let mut effective_options = effective_profile_options(
+        &global_profile_options(&c)?,
+        &game_profile.options,
+        &capabilities,
+    )?;
+    for (flag, value) in &mut effective_options {
+        if [
+            "--game-patch",
+            "--printf-output-file",
+            "--addcont-dir",
+            "--shader-log-folder",
+            "--command-buffer-dump-folder",
+        ]
+        .contains(&flag.as_str())
+        {
+            *value = canonicalize_option_path(flag, value)?;
+        }
+    }
     if game_profile.screen_width.is_some() && !capabilities.screen_width
         || game_profile.screen_height.is_some() && !capabilities.screen_height
         || game_profile.present_mode.is_some() && !capabilities.present_mode
@@ -3483,51 +6389,29 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
     let log = state_paths(&app)?.data.join("logs");
     fs::create_dir_all(&log).map_err(|e| e.to_string())?;
     let log_path = log.join(format!("game-{}-{}.log", game_id, now()));
-    let logfile = Arc::new(Mutex::new(
+    let logfile = Arc::new(Mutex::new(SessionLogWriter::new(
         fs::File::create(&log_path).map_err(|e| e.to_string())?,
-    ));
+        SESSION_LOG_MAX_BYTES,
+    )));
     let started = now();
-    c.execute(
-        "INSERT INTO sessions(game_id,build_id,started_at,log_path) VALUES(?,?,?,?)",
-        params![game_id, build_id, started, log_path.display().to_string()],
-    )
-    .map_err(|e| e.to_string())?;
-    let session_id = c.last_insert_rowid();
+    let session_id = create_game_session(
+        &mut c,
+        game_id,
+        build_id,
+        started,
+        &log_path.display().to_string(),
+    )?;
     let mut command = Command::new(&exe);
     command.arg("--game").arg(&game_path);
-    if let Some(width) = game_profile.screen_width {
-        command.arg("--screen-width").arg(width.to_string());
-    }
-    if let Some(height) = game_profile.screen_height {
-        command.arg("--screen-height").arg(height.to_string());
-    }
-    if let Some(mode) = game_profile.present_mode {
-        command.arg("--present-mode").arg(mode);
-    }
-    if game_profile.perf_overlay {
-        command.arg("--perf-overlay").arg("true");
-    }
-    if game_profile.fullscreen {
-        command.arg("--fullscreen");
-    }
-    if let Some(color) = game_profile.controller_color {
-        command.arg("--controller-color").arg(color);
-    }
-    if let Some(volume) = game_profile.controller_volume {
-        command.arg("--controller-volume").arg(volume.to_string());
-    }
-    if let Some(vibration) = game_profile.controller_vibration {
-        command
-            .arg("--controller-vibration")
-            .arg(vibration.to_string());
-    }
-    if let Some(player) = game_profile.keyboard_player {
-        command.arg("--keyboard-player").arg(player.to_string());
-    }
+    command.args(extra_profile_arguments(
+        &effective_options,
+        &capabilities.switch_options,
+    ));
     command
         .current_dir(&b.path)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -3557,19 +6441,31 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
         }
         stat
     });
-    let tracking = if let Some(stat) = process {
-        c.execute(
-            "UPDATE sessions SET process_pid=?,process_start_ticks=? WHERE id=?",
-            params![pid as i64, stat.start_ticks as i64, session_id],
-        )
-    } else {
-        c.execute(
-            "UPDATE sessions SET process_pid=? WHERE id=?",
-            params![pid as i64, session_id],
-        )
+    let Some(process) = process else {
+        let cleanup = stop_process_group(pid as i32);
+        let wait = child.wait();
+        let message = "Could not verify the emulator process identity";
+        let _ = c.execute(
+            "UPDATE sessions SET ended_at=?,outcome='identity_error' WHERE id=? AND ended_at IS NULL",
+            params![now(), session_id],
+        );
+        return Err(match (cleanup, wait) {
+            (Ok(()), Ok(_)) => message.to_string(),
+            (cleanup, wait) => format!(
+                "{message}; process cleanup: {}; child wait: {}",
+                cleanup.err().unwrap_or_else(|| "ok".into()),
+                wait.err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "ok".into())
+            ),
+        });
     };
+    let tracking = c.execute(
+        "UPDATE sessions SET process_pid=?,process_start_ticks=? WHERE id=?",
+        params![pid as i64, process.start_ticks as i64, session_id],
+    );
     if let Err(error) = tracking {
-        let _ = child.kill();
+        let _ = stop_process_group(pid as i32);
         let _ = child.wait();
         let _ = c.execute(
             "UPDATE sessions SET ended_at=?,outcome='tracking_error' WHERE id=?",
@@ -3582,26 +6478,66 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
     emit(&app, "game", "Running", format!("PID {pid}"), false, true);
     thread::spawn(move || {
         let result = (|| -> Result<(Option<i32>, String), String> {
-            let stderr = child.stderr.take().unwrap();
-            let lf = logfile.clone();
-            let a = app.clone();
-            let err = thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    use std::io::Write;
-                    let _ = writeln!(lf.lock().unwrap(), "[stderr] {line}");
-                    emit(&a, "game", "stderr", line, false, true)
-                }
-            });
-            if let Some(stdout) = child.stdout.take() {
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    use std::io::Write;
-                    let _ = writeln!(logfile.lock().unwrap(), "[stdout] {line}");
-                    emit(&app, "game", "stdout", line, false, true)
-                }
+            let setup = child
+                .stdout
+                .as_ref()
+                .map(|stream| set_nonblocking_fd(stream.as_raw_fd()))
+                .transpose()
+                .and_then(|_| {
+                    child
+                        .stderr
+                        .as_ref()
+                        .map(|stream| set_nonblocking_fd(stream.as_raw_fd()))
+                        .transpose()
+                });
+            if let Err(error) = setup {
+                let _ = stop_process_group(pid as i32);
+                let _ = child.wait();
+                return Err(format!(
+                    "Could not prepare nonblocking emulator log pipes: {error}"
+                ));
             }
-            let status = child.wait().map_err(|e| e.to_string())?;
-            let _ = err.join();
-            let outcome = if status.success() {
+            let stop_readers = Arc::new(AtomicBool::new(false));
+            let stdout_reader = child.stdout.take().map(|stdout| {
+                spawn_session_output_reader(
+                    stdout,
+                    "stdout",
+                    logfile.clone(),
+                    app.clone(),
+                    stop_readers.clone(),
+                )
+            });
+            let stderr_reader = child.stderr.take().map(|stderr| {
+                spawn_session_output_reader(
+                    stderr,
+                    "stderr",
+                    logfile.clone(),
+                    app.clone(),
+                    stop_readers.clone(),
+                )
+            });
+            let wait_result = wait_for_child_and_cleanup_group(&mut child, || {});
+            stop_readers.store(true, Ordering::SeqCst);
+            let (status, cleanup) = wait_result?;
+            if let Err(error) = &cleanup {
+                let _ = logfile
+                    .lock()
+                    .unwrap()
+                    .append_line("process cleanup error", error);
+            }
+            if let Some(reader) = stdout_reader {
+                reader
+                    .join()
+                    .map_err(|_| "stdout reader thread panicked".to_string())?;
+            }
+            if let Some(reader) = stderr_reader {
+                reader
+                    .join()
+                    .map_err(|_| "stderr reader thread panicked".to_string())?;
+            }
+            let outcome = if cleanup.is_err() {
+                "cleanup_error"
+            } else if status.success() {
                 "normal"
             } else if status.code().is_some() {
                 "error"
@@ -3610,20 +6546,25 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
             };
             Ok((status.code(), outcome.into()))
         })();
-        if let Ok(c) = db(&app) {
+        if let Ok(mut c) = db(&app) {
             let (code, outcome) = result
                 .as_ref()
                 .map(|(code, outcome)| (*code, outcome.as_str()))
                 .unwrap_or((None, "launch_error"));
             let ended = now();
-            let _ = c.execute(
-                "UPDATE sessions SET ended_at=?,exit_code=?,outcome=? WHERE id=?",
-                params![ended, code, outcome, session_id],
-            );
-            let _ = c.execute(
-                "UPDATE games SET play_seconds=play_seconds+?,last_played=? WHERE id=?",
-                params![ended - started, started, game_id],
-            );
+            if let Ok(tx) = c.transaction() {
+                let recorded = tx.execute(
+                    "UPDATE sessions SET ended_at=?,exit_code=?,outcome=? WHERE id=? AND ended_at IS NULL",
+                    params![ended, code, outcome, session_id],
+                );
+                if recorded.is_ok_and(|count| count == 1) {
+                    let _ = tx.execute(
+                        "UPDATE games SET play_seconds=play_seconds+?,last_played=? WHERE id=?",
+                        params![ended.saturating_sub(started).max(0), started, game_id],
+                    );
+                }
+                let _ = tx.commit();
+            }
         }
         emit(
             &app,
@@ -3634,7 +6575,9 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
                 .map(|(_, o)| o.clone())
                 .unwrap_or_else(|e| e.clone()),
             true,
-            result.is_ok(),
+            result
+                .as_ref()
+                .is_ok_and(|(_, outcome)| outcome == "normal"),
         );
     });
     Ok(())
@@ -3729,32 +6672,20 @@ fn process_metrics(
         };
 
         let expected_executable = Path::new(&build_path).join("kyty_emulator");
-        let process_matches =
-            expected_start.is_none() && process_executable_matches(pid, &expected_executable);
-        let stat = proc_stat(pid).filter(|stat| match expected_start {
-            Some(expected) => expected as u64 == stat.start_ticks,
-            None => process_matches,
+        let stat = expected_start.and_then(|expected| {
+            proc_stat(pid).filter(|stat| {
+                verified_session_process(
+                    pid as i32,
+                    Some(expected),
+                    *stat,
+                    process_executable_matches(pid, &expected_executable),
+                )
+            })
         });
         let Some(stat) = stat else {
-            if process_matches {
-                result.push(ProcessMetric {
-                    session_id,
-                    game_id,
-                    build_id,
-                    title,
-                    commit_sha,
-                    build_type,
-                    pid: Some(pid),
-                    runtime_seconds: runtime,
-                    cpu_percent: None,
-                    resident_bytes: None,
-                    status: "Reading process telemetry".into(),
-                });
-                continue;
-            }
             let sample = previous.entry(session_id).or_default();
             sample.missing_samples = sample.missing_samples.saturating_add(1);
-            let status = if sample.missing_samples >= 2 {
+            let status = if sample.missing_samples >= PROCESS_MISSING_SAMPLE_LIMIT {
                 lost.push((session_id, Some(started_at), "process_lost"));
                 "Process ended; exit status unavailable"
             } else {
@@ -3777,12 +6708,6 @@ fn process_metrics(
         };
 
         let sample = previous.entry(session_id).or_default();
-        if expected_start.is_none() {
-            conn.execute(
-                "UPDATE sessions SET process_start_ticks=? WHERE id=? AND process_start_ticks IS NULL",
-                params![stat.start_ticks as i64, session_id],
-            ).map_err(|error| error.to_string())?;
-        }
         sample.missing_samples = 0;
         let cpu_percent = sample.previous.and_then(|(ticks, sampled_at)| {
             cpu_percent(
@@ -3820,22 +6745,9 @@ fn process_metrics(
     });
     drop(previous);
     if !lost.is_empty() {
-        let conn = db(&app)?;
+        let mut conn = db(&app)?;
         for (session_id, started_at, outcome) in lost {
-            let updated = conn
-                .execute(
-                    "UPDATE sessions SET ended_at=?,outcome=? WHERE id=? AND ended_at IS NULL",
-                    params![now_wall, outcome, session_id],
-                )
-                .map_err(|e| e.to_string())?;
-            if updated > 0 {
-                if let Some(started_at) = started_at {
-                    conn.execute(
-                        "UPDATE games SET play_seconds=play_seconds+?,last_played=? WHERE id=(SELECT game_id FROM sessions WHERE id=?)",
-                        params![now_wall.saturating_sub(started_at).max(0), started_at, session_id],
-                    ).map_err(|e| e.to_string())?;
-                }
-            }
+            record_lost_session(&mut conn, session_id, now_wall, started_at, outcome)?;
         }
     }
     Ok(result)
@@ -3858,14 +6770,21 @@ fn stop_game_session(app: tauri::AppHandle, session_id: i64) -> Result<String, S
         .filter(|value| *value > 1)
         .ok_or("The session has no verified emulator process ID")?;
     let expected_executable = Path::new(&build_path).join("kyty_emulator");
-    let actual = proc_stat(pid as u32).ok_or("The emulator process has already exited")?;
-    if expected_start.is_some_and(|expected| expected as u64 != actual.start_ticks)
-        || !process_executable_matches(pid as u32, &expected_executable)
+    #[cfg(target_os = "linux")]
+    stop_verified_session_group(pid, expected_start, &expected_executable)?;
+    #[cfg(not(target_os = "linux"))]
     {
-        return Err("The process no longer matches this registered emulator session".into());
+        let actual = proc_stat(pid as u32).ok_or("The emulator process has already exited")?;
+        if !verified_session_process(
+            pid,
+            expected_start,
+            actual,
+            process_executable_matches(pid as u32, &expected_executable),
+        ) {
+            return Err("The process identity or isolated process group no longer matches this registered emulator session".into());
+        }
+        stop_process_group(pid)?;
     }
-    terminate_process_group(pid)
-        .map_err(|error| format!("Could not stop emulator process: {error}"))?;
     Ok(format!("Stop signal sent to emulator session {session_id}"))
 }
 #[tauri::command]
@@ -3985,6 +6904,9 @@ fn read_build_log(app: tauri::AppHandle, id: i64) -> Result<String, String> {
 }
 #[tauri::command]
 fn get_setting(app: tauri::AppHandle, key: String) -> Result<Option<String>, String> {
+    if !["update_interval", "auto_update_mode", "theme"].contains(&key.as_str()) {
+        return Err("Unsupported setting".into());
+    }
     db(&app)?
         .query_row("SELECT value FROM settings WHERE key=?", [key], |r| {
             r.get(0)
@@ -3994,14 +6916,7 @@ fn get_setting(app: tauri::AppHandle, key: String) -> Result<Option<String>, Str
 }
 #[tauri::command]
 fn set_setting(app: tauri::AppHandle, key: String, value: String) -> Result<(), String> {
-    if ![
-        "update_interval",
-        "auto_update_mode",
-        "theme",
-        "github_token",
-    ]
-    .contains(&key.as_str())
-    {
+    if !["update_interval", "auto_update_mode", "theme"].contains(&key.as_str()) {
         return Err("Unsupported setting".into());
     }
     if key == "update_interval" && !valid_update_interval(&value) {
@@ -4077,6 +6992,8 @@ pub fn run() {
         .manage(Arc::new(Jobs {
             pid: AtomicI32::new(0),
             active: AtomicBool::new(false),
+            job_id: AtomicU64::new(0),
+            event_kind: Mutex::new(String::new()),
             cancel_requested: AtomicBool::new(false),
             cancellable: AtomicBool::new(false),
             control: Mutex::new(()),
@@ -4089,7 +7006,10 @@ pub fn run() {
             open_build_folder,
             validate_build,
             list_games,
+            remove_game_entry,
             game_compatibility,
+            record_compatibility_observation,
+            compatibility_observations,
             add_repository,
             discover_forks,
             github_repository_details,
@@ -4103,6 +7023,11 @@ pub fn run() {
             github_token_status,
             inspect_build_source,
             system_info,
+            storage_report,
+            clean_incomplete_builds,
+            clean_compiler_cache,
+            clean_community_worktrees,
+            clean_session_logs,
             inspect_graphics,
             start_clone,
             inspect_repository,
@@ -4111,7 +7036,9 @@ pub fn run() {
             start_update_build,
             cancel_job,
             activate_build,
+            remove_build,
             add_game,
+            refresh_game_metadata,
             open_game_folder,
             read_game_icon,
             read_game_background,
@@ -4121,6 +7048,9 @@ pub fn run() {
             get_profile,
             get_profile_capabilities,
             set_profile,
+            get_global_profile_options,
+            get_active_profile_capabilities,
+            set_global_profile_options,
             launch_game,
             process_metrics,
             stop_game_session,
@@ -4138,6 +7068,374 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lost_session_completion_and_playtime_are_atomic_and_idempotent() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE games(id INTEGER PRIMARY KEY,play_seconds INTEGER NOT NULL DEFAULT 0,last_played INTEGER);
+                 CREATE TABLE sessions(id INTEGER PRIMARY KEY,game_id INTEGER NOT NULL,ended_at INTEGER,outcome TEXT);
+                 INSERT INTO games(id,play_seconds) VALUES(1,15);
+                 INSERT INTO sessions(id,game_id) VALUES(7,1),(8,1);",
+            )
+            .unwrap();
+
+        assert!(record_lost_session(&mut connection, 7, 300, Some(100), "process_lost").unwrap());
+        assert!(!record_lost_session(&mut connection, 7, 400, Some(100), "process_lost").unwrap());
+        let game: (i64, Option<i64>) = connection
+            .query_row(
+                "SELECT play_seconds,last_played FROM games WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let session: (Option<i64>, Option<String>) = connection
+            .query_row(
+                "SELECT ended_at,outcome FROM sessions WHERE id=7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(game, (215, Some(100)));
+        assert_eq!(session, (Some(300), Some("process_lost".into())));
+
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_playtime BEFORE UPDATE OF play_seconds ON games BEGIN SELECT RAISE(ABORT,'test failure'); END;",
+            )
+            .unwrap();
+        assert!(record_lost_session(&mut connection, 8, 500, Some(200), "process_lost").is_err());
+        let uncommitted: Option<i64> = connection
+            .query_row("SELECT ended_at FROM sessions WHERE id=8", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(uncommitted, None);
+    }
+
+    #[test]
+    fn compiler_cache_cleanup_is_confined_to_managed_cache_and_reports_size() {
+        let cache = env::temp_dir().join(format!("kyty-cache-test-{}", now()));
+        let build_cache = cache.join("builds");
+        fs::create_dir_all(&build_cache).unwrap();
+        fs::write(build_cache.join("artifact.bin"), [0_u8; 17]).unwrap();
+        assert_eq!(directory_size(&build_cache), 17);
+        assert_eq!(
+            clear_managed_compiler_cache(&build_cache, &cache).unwrap(),
+            17
+        );
+        assert!(!build_cache.exists());
+
+        let outside = cache.with_file_name(format!("kyty-outside-{}", now()));
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), b"preserve").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, &build_cache).unwrap();
+            assert!(clear_managed_compiler_cache(&build_cache, &cache).is_err());
+            assert!(outside.join("keep").exists());
+            fs::remove_file(&build_cache).unwrap();
+        }
+        fs::remove_dir_all(cache).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+    #[test]
+    fn community_temporary_cleanup_reports_size_and_rejects_symlinks() {
+        let cache = env::temp_dir().join(format!("kyty-temp-cache-{}", now()));
+        let root = cache.join("community-worktrees");
+        let worktree = root.join("run-1");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join("source.bin"), [0_u8; 31]).unwrap();
+        assert_eq!(remove_managed_temp_directory(&worktree, &root).unwrap(), 31);
+        assert!(!worktree.exists());
+
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join("source.bin"), b"remove on scope exit").unwrap();
+        {
+            let _guard = ManagedTemporaryDirectory {
+                path: worktree.clone(),
+                root: root.clone(),
+            };
+        }
+        assert!(!worktree.exists());
+
+        let outside = cache.with_file_name(format!("kyty-temp-outside-{}", now()));
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), b"preserve").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("external")).unwrap();
+            assert!(remove_managed_temp_directory(&root.join("external"), &root).is_err());
+            assert!(outside.join("keep").exists());
+        }
+        fs::remove_dir_all(cache).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+    #[test]
+    fn incomplete_build_cleanup_only_removes_unregistered_partial_installations() {
+        let root = env::temp_dir().join(format!("kyty-build-install-cleanup-{}", now()));
+        let repo = root.join("7");
+        let partial = repo.join("0123456789ab-Release-123");
+        let existing_executable = repo.join("0123456789ab-Release-124");
+        let registered = repo.join("0123456789ab-Debug-125");
+        let unrelated = repo.join("notes");
+        let outside = root.with_file_name(format!("kyty-build-cleanup-external-{}", now()));
+        fs::create_dir_all(&partial).unwrap();
+        fs::create_dir_all(&existing_executable).unwrap();
+        fs::create_dir_all(&registered).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(partial.join("partial-file"), b"partial").unwrap();
+        fs::write(existing_executable.join("kyty_emulator"), b"preserve").unwrap();
+        fs::write(registered.join("partial-file"), b"tracked").unwrap();
+        fs::write(unrelated.join("file"), b"preserve").unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("preserve"), b"external").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, repo.join("0123456789ab-Release-126")).unwrap();
+        let registered_paths = HashSet::from([fs::canonicalize(&registered).unwrap()]);
+
+        assert_eq!(
+            incomplete_build_installations(&root, &registered_paths),
+            vec![fs::canonicalize(&partial).unwrap()]
+        );
+        assert_eq!(
+            clean_incomplete_build_installations(&root, &registered_paths).unwrap(),
+            b"partial".len() as u64
+        );
+        assert!(!partial.exists());
+        assert!(existing_executable.join("kyty_emulator").exists());
+        assert!(registered.join("partial-file").exists());
+        assert!(unrelated.join("file").exists());
+        assert!(outside.join("preserve").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+    #[test]
+    fn session_log_cleanup_preserves_history_and_unmanaged_paths() {
+        let data = env::temp_dir().join(format!("kyty-session-cleanup-{}", now()));
+        let logs = data.join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("old.log"), [0_u8; 23]).unwrap();
+        let outside = data.with_file_name(format!("kyty-external-log-{}", now()));
+        fs::write(&outside, b"keep this log").unwrap();
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions(id INTEGER PRIMARY KEY,log_path TEXT NOT NULL);
+                 INSERT INTO sessions VALUES(1,'PLACEHOLDER');
+                 INSERT INTO sessions VALUES(2,'EXTERNAL');",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sessions SET log_path=? WHERE id=1",
+                [logs.join("old.log").display().to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sessions SET log_path=? WHERE id=2",
+                [outside.display().to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            clear_managed_session_logs(&mut connection, &logs, &data).unwrap(),
+            23
+        );
+        assert!(logs.is_dir());
+        assert_eq!(directory_size(&logs), 0);
+        let managed_path: String = connection
+            .query_row("SELECT log_path FROM sessions WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let external_path: String = connection
+            .query_row("SELECT log_path FROM sessions WHERE id=2", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(managed_path.is_empty());
+        assert_eq!(external_path, outside.display().to_string());
+        assert_eq!(fs::read(&outside).unwrap(), b"keep this log");
+        fs::remove_dir_all(data).unwrap();
+        fs::remove_file(outside).unwrap();
+    }
+    #[test]
+    fn repository_pr_search_is_encoded_and_scoped_to_repo_and_state() {
+        let url = github_pull_request_search_url(
+            "owner",
+            "kyty",
+            "closed",
+            "night mode & logging",
+            3,
+            20,
+        );
+        let parsed = url::Url::parse(&url).unwrap();
+        let query: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(
+            query.get("q").unwrap(),
+            "repo:owner/kyty is:pr state:closed night mode & logging"
+        );
+        assert_eq!(query.get("page").unwrap(), "3");
+        assert_eq!(query.get("per_page").unwrap(), "20");
+    }
+    #[test]
+    fn github_search_pagination_stops_at_the_api_result_limit() {
+        assert!(github_search_has_more(49, 20, 1_500));
+        assert!(!github_search_has_more(50, 20, 1_500));
+        assert!(github_search_has_more(2, 20, 250));
+    }
+    #[test]
+    fn session_logs_have_a_hard_size_limit_and_mark_truncated_output() {
+        let path = env::temp_dir().join(format!("kyty-session-log-{}", now()));
+        let mut log = SessionLogWriter::new(fs::File::create(&path).unwrap(), 256);
+        log.append_line("stdout", &"x".repeat(500)).unwrap();
+        log.append_line("stderr", "this should not be appended")
+            .unwrap();
+        drop(log);
+        let contents = fs::read(&path).unwrap();
+        assert!(contents.len() <= 256);
+        assert!(String::from_utf8_lossy(&contents).contains("further output was omitted"));
+        assert!(!String::from_utf8_lossy(&contents).contains("this should not be appended"));
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn build_logs_have_a_hard_limit_across_build_phases() {
+        let path = env::temp_dir().join(format!("kyty-build-log-{}", now()));
+        {
+            let file = fs::File::create(&path).unwrap();
+            let mut log = BuildLogWriter::new(file, 256);
+            log.append_line("command", "cmake configure").unwrap();
+            log.append_line("stdout", &"x".repeat(500)).unwrap();
+            log.append_line("stderr", "this should not be appended")
+                .unwrap();
+        }
+        let first_contents = fs::read(&path).unwrap();
+        assert!(first_contents.len() <= 256);
+        assert!(
+            String::from_utf8_lossy(&first_contents).contains("Build log reached its 32 MiB limit")
+        );
+        {
+            let file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut next_phase = BuildLogWriter::new(file, 256);
+            next_phase
+                .append_line("stdout", "later CMake stage output")
+                .unwrap();
+        }
+        assert_eq!(fs::read(&path).unwrap(), first_contents);
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn process_output_reader_caps_single_lines_and_keeps_following_output() {
+        let input = format!("{}\nnext line\nlast", "x".repeat(1024));
+        let mut reader =
+            CappedOutputReader::with_limit(std::io::Cursor::new(input.into_bytes()), 32);
+        let first = reader.next_line().unwrap().unwrap();
+        assert_eq!(first.bytes.len(), 32);
+        assert!(first.truncated);
+        let second = reader.next_line().unwrap().unwrap();
+        assert_eq!(second.text(), "next line");
+        let third = reader.next_line().unwrap().unwrap();
+        assert_eq!(third.text(), "last");
+        assert!(reader.next_line().unwrap().is_none());
+    }
+    #[test]
+    fn git_output_capture_is_bounded_and_still_drains_the_pipe() {
+        let contents = b"0123456789";
+        let mut input = std::io::Cursor::new(contents);
+        let (captured, truncated) = read_capped_output(&mut input, 4).unwrap();
+        assert_eq!(captured, b"0123");
+        assert!(truncated);
+        assert_eq!(input.position(), contents.len() as u64);
+
+        let (complete, was_truncated) = read_capped_output(&contents[..], 10).unwrap();
+        assert_eq!(complete, contents);
+        assert!(!was_truncated);
+    }
+    fn write_zarchive_fixture(path: &Path) {
+        let footer = 65_618;
+        let total_size = footer + 144;
+        let mut bytes = vec![0_u8; total_size];
+        bytes[65_576..65_586].copy_from_slice(b"\x09eboot.bin");
+        bytes[65_586..65_590].copy_from_slice(&0x7fff_ffff_u32.to_be_bytes());
+        bytes[65_590..65_594].copy_from_slice(&1_u32.to_be_bytes());
+        bytes[65_594..65_598].copy_from_slice(&1_u32.to_be_bytes());
+        bytes[65_602..65_606].copy_from_slice(&0x8000_0000_u32.to_be_bytes());
+        let sections = [
+            (0_u64, 65_536_u64),
+            (65_536, 40),
+            (65_576, 10),
+            (65_586, 32),
+            (65_618, 0),
+            (65_618, 0),
+        ];
+        for (index, (offset, size)) in sections.into_iter().enumerate() {
+            let start = footer + index * 16;
+            bytes[start..start + 8].copy_from_slice(&offset.to_be_bytes());
+            bytes[start + 8..start + 16].copy_from_slice(&size.to_be_bytes());
+        }
+        bytes[footer + 128..footer + 136].copy_from_slice(&(total_size as u64).to_be_bytes());
+        bytes[footer + 136..footer + 140].copy_from_slice(&0x61bf_3a01_u32.to_be_bytes());
+        bytes[footer + 140..footer + 144].copy_from_slice(&0x169f_52d6_u32.to_be_bytes());
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn game_size_calculation_counts_regular_files_and_ignores_symlinks() {
+        let root = env::temp_dir().join(format!(
+            "kyty-game-size-test-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.bin"), b"abc").unwrap();
+        fs::write(root.join("b.bin"), b"de").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("a.bin"), root.join("linked.bin")).unwrap();
+        assert_eq!(calculate_game_size(&root), Some(5));
+        assert_eq!(calculate_game_size(&root.join("a.bin")), Some(3));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn recursive_game_scan_identifies_symlink_entries_for_rejection() {
+        let root = env::temp_dir().join(format!(
+            "kyty-game-scan-symlink-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let outside = root.with_file_name(format!("kyty-outside-game-{}", now()));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("eboot.bin"), b"\x7fELF\x02\x01").unwrap();
+        std::os::unix::fs::symlink(outside.join("eboot.bin"), root.join("game.elf")).unwrap();
+
+        let entry = walkdir::WalkDir::new(&root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|entry| entry.path() == root.join("game.elf"))
+            .unwrap();
+        assert!(scan_entry_is_symlink(&entry));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+    #[test]
+    fn game_file_status_reports_removed_paths_without_touching_game_data() {
+        let root = env::temp_dir().join(format!(
+            "kyty-game-status-test-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let game = root.join("game.zar");
+        fs::write(&game, b"existing").unwrap();
+        assert_eq!(game_file_status(&game), "Available");
+        fs::remove_file(&game).unwrap();
+        assert_eq!(game_file_status(&game), "Missing");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn test_git(path: &Path, args: &[&str]) -> Result<String, String> {
         git(Some(path), args)
     }
@@ -4313,6 +7611,7 @@ mod tests {
         assert_eq!(notification_text("abcdef", 3), "abc");
     }
 
+    #[cfg(unix)]
     #[test]
     fn process_group_termination_stops_the_requested_child_group() {
         let mut child = Command::new("sleep")
@@ -4322,8 +7621,96 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        terminate_process_group(child.id() as i32).unwrap();
+        let pid = child.id() as i32;
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+        let waiter = thread::spawn(move || child.wait().unwrap());
+        stop_process_group(pid).unwrap();
+        assert!(!waiter.join().unwrap().success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verified_session_stop_pins_the_leader_before_signaling_its_group() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let executable = fs::canonicalize(format!("/proc/{pid}/exe")).unwrap();
+        let start_ticks = proc_stat(pid as u32).unwrap().start_ticks as i64;
+        stop_verified_session_group(pid, Some(start_ticks), &executable).unwrap();
         assert!(!child.wait().unwrap().success());
+        assert!(!process_group_exists(pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_termination_escalates_to_bounded_forced_kill() {
+        let mut child = Command::new("python3")
+            .args([
+                "-c",
+                "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); time.sleep(30)",
+            ])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let waiter = thread::spawn(move || child.wait().unwrap());
+        let started = Instant::now();
+        stop_process_group(pid).unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!waiter.join().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_wait_cleans_the_process_group_on_timeout() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let started = Instant::now();
+        let result =
+            wait_for_child_with_timeout(&mut child, Duration::from_millis(100), "test command");
+        assert!(result.unwrap_err().contains("time limit"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!process_group_exists(pid));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_emulator_group_cleans_descendants_that_hold_output_pipes() {
+        use std::io::Read;
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30 & exit 0"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pgid = child.id() as i32;
+        let (status, cleanup) = wait_for_child_and_cleanup_group(&mut child, || {}).unwrap();
+        assert!(status.success());
+        assert!(cleanup.is_ok(), "{cleanup:?}");
+        assert!(!process_group_exists(pgid));
+        let mut stdout = child.stdout.take().unwrap();
+        let mut remaining = Vec::new();
+        stdout.read_to_end(&mut remaining).unwrap();
     }
 
     #[test]
@@ -4384,9 +7771,27 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         let columns: i64 = db.query_row("SELECT count(*) FROM pragma_table_info('games') WHERE name IN ('title_id','game_version','icon_path','install_size')", [], |r| r.get(0)).unwrap();
+        let hidden_default: i64 = db
+            .query_row("SELECT hidden FROM games WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        let compatibility_table: i64 = db.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='manual_compatibility_observations'", [], |r| r.get(0)).unwrap();
         let profile_columns: i64 = db.query_row("SELECT count(*) FROM pragma_table_info('profiles') WHERE name IN ('controller_color','controller_volume','controller_vibration','keyboard_player')", [], |r| r.get(0)).unwrap();
+        let profile_options_default: String = db
+            .query_row(
+                "SELECT options_json FROM profiles WHERE game_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         let process_columns: i64 = db.query_row("SELECT count(*) FROM pragma_table_info('sessions') WHERE name IN ('process_pid','process_start_ticks')", [], |r| r.get(0)).unwrap();
-        let build_columns: i64 = db.query_row("SELECT count(*) FROM pragma_table_info('builds') WHERE name IN ('install_size_bytes','validation_status')", [], |r| r.get(0)).unwrap();
+        let build_columns: i64 = db.query_row("SELECT count(*) FROM pragma_table_info('builds') WHERE name IN ('install_size_bytes','validation_status','configuration_json')", [], |r| r.get(0)).unwrap();
+        let build_configuration: String = db
+            .query_row(
+                "SELECT configuration_json FROM builds WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         let build_validation: String = db
             .query_row("SELECT validation_status FROM builds WHERE id=1", [], |r| {
                 r.get(0)
@@ -4401,11 +7806,15 @@ mod tests {
             ),
             ("KytyPS5", "/build", "Existing Game", "dark")
         );
-        assert_eq!(version, 9);
+        assert_eq!(version, 15);
+        assert_eq!(hidden_default, 0);
+        assert_eq!(compatibility_table, 1);
         assert_eq!(columns, 4);
         assert_eq!(profile_columns, 4);
+        assert_eq!(profile_options_default, "{}");
         assert_eq!(process_columns, 2);
-        assert_eq!(build_columns, 2);
+        assert_eq!(build_columns, 3);
+        assert_eq!(build_configuration, "{}");
         assert_eq!(build_validation, "not-checked");
         let community_tables: i64 = db.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('community_pr_cache','community_build_configs','community_build_prs','community_build_results')",
@@ -4446,7 +7855,32 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(row, (2560, 1440, "Mailbox".into(), 1, 0));
-        assert_eq!(version, 9);
+        assert_eq!(version, 15);
+    }
+    #[test]
+    fn migration_removes_only_the_legacy_sqlite_github_token() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO settings VALUES('github_token','legacy-secret'),('theme','dark');
+             PRAGMA user_version=9;",
+        )
+        .unwrap();
+        migrate(&mut db).unwrap();
+        let legacy_token: i64 = db
+            .query_row(
+                "SELECT count(*) FROM settings WHERE key='github_token'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let theme: String = db
+            .query_row("SELECT value FROM settings WHERE key='theme'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(legacy_token, 0);
+        assert_eq!(theme, "dark");
     }
     #[test]
     fn reads_game_metadata_from_the_upstream_param_layout() {
@@ -4485,6 +7919,41 @@ mod tests {
     }
 
     #[test]
+    fn game_artwork_is_downscaled_before_it_is_returned_to_the_renderer() {
+        let mut source_pixels = Vec::new();
+        for _ in 0..2 {
+            for x in 0..4 {
+                if x < 2 {
+                    source_pixels.extend_from_slice(&[255, 0, 0, 255]);
+                } else {
+                    source_pixels.extend_from_slice(&[0, 0, 255, 255]);
+                }
+            }
+        }
+        let mut source_png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut source_png, 4, 2);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&source_pixels).unwrap();
+        }
+
+        let thumbnail = resize_png(&source_png, 2, 2).unwrap();
+        let mut reader = png::Decoder::new(Cursor::new(&thumbnail))
+            .read_info()
+            .unwrap();
+        let mut output = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut output).unwrap();
+        assert_eq!((info.width, info.height), (2, 1));
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        assert!(thumbnail.len() < source_png.len() + 64);
+        assert_eq!(&output[..4], &[255, 0, 0, 255]);
+        assert_eq!(&output[4..8], &[0, 0, 255, 255]);
+        assert!(resize_png(&source_png, 0, 2).is_none());
+    }
+
+    #[test]
     fn profile_values_reject_unsupported_ranges_and_malformed_colors() {
         let mut profile = Profile {
             controller_color: Some("#a1B2c3".into()),
@@ -4494,6 +7963,13 @@ mod tests {
             ..Profile::default()
         };
         assert!(validate_profile_values(&profile).is_ok());
+        profile.screen_width = Some(1);
+        profile.screen_height = Some(u32::MAX);
+        assert!(validate_profile_values(&profile).is_ok());
+        profile.screen_width = Some(0);
+        assert!(validate_profile_values(&profile).is_err());
+        profile.screen_width = None;
+        profile.screen_height = None;
         profile.controller_color = Some("#１２３４５６".into());
         assert!(validate_profile_values(&profile).is_err());
         profile.controller_color = None;
@@ -4504,19 +7980,382 @@ mod tests {
         assert!(validate_profile_values(&profile).is_err());
     }
     #[test]
+    fn gpu_and_vblank_values_match_upstream_ranges() {
+        let capabilities = profile_capabilities(
+            "--gpu <index> Vulkan device\n--vblank-frequency <num> Virtual frequency",
+        );
+        for (flag, value) in [
+            ("--gpu", "-1"),
+            ("--gpu", "0"),
+            ("--vblank-frequency", "30"),
+            ("--vblank-frequency", "360"),
+        ] {
+            assert!(validate_extra_profile_options(
+                &BTreeMap::from([(flag.to_string(), value.to_string())]),
+                &capabilities,
+            )
+            .is_ok());
+        }
+        for (flag, value) in [
+            ("--gpu", "-2"),
+            ("--vblank-frequency", "29"),
+            ("--vblank-frequency", "361"),
+        ] {
+            assert!(validate_extra_profile_options(
+                &BTreeMap::from([(flag.to_string(), value.to_string())]),
+                &capabilities,
+            )
+            .is_err());
+        }
+    }
+    #[test]
     fn profile_capabilities_are_derived_from_emulator_help() {
         let capabilities = profile_capabilities(
-            "Options:\n  --screen-width <num> Window width\n  --present-mode <value> Fifo\n  --fullscreen Run fullscreen\n  --controller-color <#RRGGBB> Controller light\n  --controller-volume <0-100> Speaker volume\n  --controller-vibration <0-100> Vibration\n  --keyboard-player <0-4> Keyboard player\n",
+            "Options:\n  --screen-width <num> Window width\n  --screen-height <num> Window height\n  --present-mode <value> Fifo\n  --perf-overlay <true|false> Performance overlay\n  --fullscreen Run fullscreen\n  --controller-color <#RRGGBB> Controller light\n  --controller-volume <0-100> Speaker volume\n  --controller-vibration <0-100> Vibration\n  --keyboard-player <0-4> Keyboard player\n",
         );
         assert!(capabilities.screen_width);
-        assert!(!capabilities.screen_height);
+        assert!(capabilities.screen_height);
         assert!(capabilities.present_mode);
-        assert!(!capabilities.perf_overlay);
+        assert!(capabilities.perf_overlay);
         assert!(capabilities.fullscreen);
         assert!(capabilities.controller_color);
         assert!(capabilities.controller_volume);
         assert!(capabilities.controller_vibration);
         assert!(capabilities.keyboard_player);
+        for flag in [
+            "--screen-width",
+            "--screen-height",
+            "--present-mode",
+            "--perf-overlay",
+            "--fullscreen",
+            "--controller-color",
+            "--controller-volume",
+            "--controller-vibration",
+            "--keyboard-player",
+        ] {
+            assert!(capabilities.options.iter().any(|value| value == flag));
+        }
+    }
+    #[test]
+    fn configurable_cli_options_cover_the_upstream_linux_interface() {
+        let expected = [
+            "--addcont-dir",
+            "--amd-cpu",
+            "--command-buffer-dump",
+            "--command-buffer-dump-folder",
+            "--console-language",
+            "--controller-color",
+            "--controller-volume",
+            "--controller-vibration",
+            "--fullscreen",
+            "--game-patch",
+            "--gpu",
+            "--gpu-assisted-validation",
+            "--graphics-debug-dump",
+            "--hdr",
+            "--hide-cursor",
+            "--keyboard-player",
+            "--keymap",
+            "--mic",
+            "--network-connected",
+            "--no-splash",
+            "--perf-overlay",
+            "--playgo-hack",
+            "--present-mode",
+            "--printf-direction",
+            "--printf-output-file",
+            "--profile",
+            "--rd",
+            "--readback-linear-images",
+            "--screen-height",
+            "--screen-width",
+            "--shader-log-direction",
+            "--shader-log-folder",
+            "--shader-optimization-type",
+            "--shader-validation",
+            "--skip-notice-screen",
+            "--spirv-debug-printf",
+            "--sync-raw-image-buffers",
+            "--tessellation",
+            "--trophy-duration",
+            "--trophy-notifications",
+            "--user-id",
+            "--user-name",
+            "--vblank-frequency",
+            "--vr",
+            "--vulkan-validation",
+        ];
+        let mut actual = CONFIGURABLE_CLI_OPTIONS.to_vec();
+        actual.sort_unstable();
+        let mut expected = expected;
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+        assert!(!CONFIGURABLE_CLI_OPTIONS.contains(&"--redzone"));
+    }
+    #[test]
+    fn legacy_profile_settings_merge_into_inheritable_cli_options() {
+        let mut profile = Profile {
+            screen_width: Some(1600),
+            screen_height: Some(900),
+            perf_overlay: true,
+            fullscreen: true,
+            controller_volume: Some(65),
+            ..Profile::default()
+        };
+        merge_legacy_profile_options(&mut profile);
+        assert_eq!(profile.options["--screen-width"], "1600");
+        assert_eq!(profile.options["--perf-overlay"], "true");
+        assert_eq!(profile.options["--controller-volume"], "65");
+
+        profile
+            .options
+            .insert("--screen-width".into(), "1920".into());
+        profile
+            .options
+            .insert("--perf-overlay".into(), "false".into());
+        sync_legacy_profile_fields(&mut profile);
+        assert_eq!(profile.screen_width, Some(1920));
+        assert!(!profile.perf_overlay);
+    }
+    #[test]
+    fn manual_compatibility_outcomes_are_explicit_and_notes_are_bounded() {
+        assert!(compatibility_outcome("reached_gameplay"));
+        assert!(!compatibility_outcome("normal_exit"));
+        assert_eq!(
+            sanitize_compatibility_notes("first\nsecond\u{0}ok"),
+            "first\nsecondok"
+        );
+        assert_eq!(sanitize_compatibility_notes(&"x".repeat(2500)).len(), 2000);
+    }
+    #[test]
+    fn dynamic_profile_options_require_advertised_support_and_valid_values() {
+        let capabilities = profile_capabilities("  --hdr Enable HDR\n  --gpu-assisted-validation <bool> GPU validation\n  --vulkan-validation <bool> Vulkan validation\n  --console-language <0-29> language\n  --keymap <mapping> mapping\n");
+        let mut options = BTreeMap::from([
+            ("--hdr".into(), "true".into()),
+            ("--console-language".into(), "3".into()),
+            ("--keymap".into(), "Cross=K\nCircle=J".into()),
+        ]);
+        assert!(validate_extra_profile_options(&options, &capabilities).is_ok());
+        options.insert("--console-language".into(), "30".into());
+        assert!(validate_extra_profile_options(&options, &capabilities).is_err());
+        options.remove("--console-language");
+        options.insert("--totally-unknown".into(), "true".into());
+        assert!(validate_extra_profile_options(&options, &capabilities).is_err());
+        options.clear();
+        options.insert("--gpu-assisted-validation".into(), "true".into());
+        options.insert("--vulkan-validation".into(), "false".into());
+        assert!(validate_extra_profile_options(&options, &capabilities).is_err());
+    }
+    #[test]
+    fn future_fork_options_are_derived_from_help_and_reserved_modes_stay_hidden() {
+        let capabilities = profile_capabilities(
+            "--future-mode <value> Future value\n--future-switch Enable future behavior\n--game <path> Game input\n--guest-exec <path> Guest execution mode\n--help Print help\n",
+        );
+        assert_eq!(
+            capabilities.options,
+            vec!["--future-mode", "--future-switch"]
+        );
+        assert_eq!(capabilities.switch_options, vec!["--future-switch"]);
+        let options = BTreeMap::from([
+            ("--future-mode".into(), "safe".into()),
+            ("--future-switch".into(), "true".into()),
+        ]);
+        assert!(validate_extra_profile_options(&options, &capabilities).is_ok());
+        let args = extra_profile_arguments(&options, &capabilities.switch_options)
+            .into_iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(args, vec!["--future-mode", "safe", "--future-switch"]);
+        let forbidden = BTreeMap::from([("--guest-exec".into(), "/tmp/guest.elf".into())]);
+        assert!(validate_extra_profile_options(&forbidden, &capabilities).is_err());
+    }
+    #[test]
+    fn per_game_options_override_global_defaults_and_global_unsupported_values_are_skipped() {
+        let capabilities = profile_capabilities("--screen-width <num> Width\n--hdr Enable HDR\n");
+        let global = BTreeMap::from([
+            ("--screen-width".into(), "1600".into()),
+            ("--old-fork-option".into(), "legacy".into()),
+        ]);
+        let game = BTreeMap::from([("--screen-width".into(), "1920".into())]);
+        let effective = effective_profile_options(&global, &game, &capabilities).unwrap();
+        assert_eq!(
+            effective,
+            BTreeMap::from([("--screen-width".into(), "1920".into())])
+        );
+        let unsupported_game = BTreeMap::from([("--old-fork-option".into(), "legacy".into())]);
+        assert!(effective_profile_options(&global, &unsupported_game, &capabilities).is_err());
+    }
+    #[test]
+    fn inherited_graphics_and_input_options_are_validated_and_passed_as_arguments() {
+        let capabilities = profile_capabilities(
+            "--screen-width <num> Width\n--screen-height <num> Height\n--present-mode <value> Mode\n--perf-overlay <true|false> Overlay\n--fullscreen Fullscreen\n--controller-volume <0-100> Volume\n",
+        );
+        let options = BTreeMap::from([
+            ("--screen-width".into(), "1920".into()),
+            ("--screen-height".into(), "1080".into()),
+            ("--present-mode".into(), "Mailbox".into()),
+            ("--perf-overlay".into(), "false".into()),
+            ("--fullscreen".into(), "true".into()),
+            ("--controller-volume".into(), "80".into()),
+        ]);
+        assert!(validate_extra_profile_options(&options, &capabilities).is_ok());
+        let args = extra_profile_arguments(&options, &capabilities.switch_options)
+            .into_iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--screen-width", "1920"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--screen-height", "1080"]));
+        assert!(args.contains(&"--fullscreen".to_string()));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--perf-overlay", "false"]));
+        let mut invalid = options;
+        invalid.insert("--controller-volume".into(), "101".into());
+        assert!(validate_extra_profile_options(&invalid, &capabilities).is_err());
+    }
+    #[test]
+    fn guest_printf_output_can_be_a_new_file_but_user_ids_follow_upstream_limits() {
+        let dir = std::env::temp_dir().join(format!("kyty-printf-{}", now()));
+        fs::create_dir_all(&dir).unwrap();
+        let caps =
+            profile_capabilities("  --printf-output-file <path> Output\n  --user-id <num> User\n");
+        let options = BTreeMap::from([
+            (
+                "--printf-output-file".into(),
+                dir.join("guest.log").display().to_string(),
+            ),
+            ("--user-id".into(), "253".into()),
+        ]);
+        assert!(validate_extra_profile_options(&options, &caps).is_ok());
+        let max_user_id = i32::MAX - 3 * 0x100;
+        let maximum = BTreeMap::from([("--user-id".into(), max_user_id.to_string())]);
+        assert!(validate_extra_profile_options(&maximum, &caps).is_ok());
+        assert!(
+            canonicalize_option_path("--printf-output-file", &options["--printf-output-file"])
+                .unwrap()
+                .ends_with("guest.log")
+        );
+        let mut bad = options;
+        bad.insert("--user-id".into(), "254".into());
+        assert!(validate_extra_profile_options(&bad, &caps).is_err());
+        let too_large = BTreeMap::from([("--user-id".into(), (max_user_id + 1).to_string())]);
+        assert!(validate_extra_profile_options(&too_large, &caps).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn profile_arguments_keep_values_separate_and_repeat_keymaps() {
+        let options = BTreeMap::from([
+            ("--hdr".into(), "true".into()),
+            ("--hide-cursor".into(), "false".into()),
+            ("--gpu-assisted-validation".into(), "true".into()),
+            ("--keymap".into(), "Cross=K\nCircle=J".into()),
+        ]);
+        let args = extra_profile_arguments(&options, &[])
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "--vulkan-validation",
+                "true",
+                "--gpu-assisted-validation",
+                "true",
+                "--hdr",
+                "--keymap",
+                "Cross=K",
+                "--keymap",
+                "Circle=J"
+            ]
+        );
+    }
+    #[test]
+    fn removing_a_game_hides_it_without_dropping_profile_or_session_history() {
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE games(id INTEGER PRIMARY KEY,hidden INTEGER NOT NULL DEFAULT 0); CREATE TABLE profiles(game_id INTEGER PRIMARY KEY,options_json TEXT NOT NULL); CREATE TABLE sessions(id INTEGER PRIMARY KEY,game_id INTEGER NOT NULL,build_id INTEGER,started_at INTEGER,ended_at INTEGER,log_path TEXT); INSERT INTO games VALUES(1,0); INSERT INTO profiles VALUES(1,'{\"--hdr\":\"true\"}'); INSERT INTO sessions VALUES(1,1,1,100,123,'/managed/log.log');").unwrap();
+        soft_remove_game_entry(&mut db, 1).unwrap();
+        let hidden: i64 = db
+            .query_row("SELECT hidden FROM games WHERE id=1", [], |row| row.get(0))
+            .unwrap();
+        let profile: String = db
+            .query_row(
+                "SELECT options_json FROM profiles WHERE game_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let log: String = db
+            .query_row("SELECT log_path FROM sessions WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(hidden, 1);
+        assert_eq!(profile, "{\"--hdr\":\"true\"}");
+        assert_eq!(log, "/managed/log.log");
+        assert!(create_game_session(&mut db, 1, 1, 200, "/managed/new.log").is_err());
+
+        db.execute("UPDATE games SET hidden=0 WHERE id=1", [])
+            .unwrap();
+        db.execute("UPDATE sessions SET ended_at=NULL WHERE id=1", [])
+            .unwrap();
+        assert!(soft_remove_game_entry(&mut db, 1).is_err());
+        let hidden: i64 = db
+            .query_row("SELECT hidden FROM games WHERE id=1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(hidden, 0);
+    }
+    #[test]
+    fn managed_build_removal_protects_active_and_referenced_builds() {
+        let dir = std::env::temp_dir().join(format!("kyty-build-remove-{}", now()));
+        let root = dir.join("builds");
+        let install = root.join("commit-release");
+        fs::create_dir_all(&install).unwrap();
+        fs::write(install.join("kyty_emulator"), b"emulator").unwrap();
+        let mut db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE builds(id INTEGER PRIMARY KEY,path TEXT,active INTEGER); CREATE TABLE games(id INTEGER PRIMARY KEY,build_id INTEGER); CREATE TABLE sessions(id INTEGER PRIMARY KEY,build_id INTEGER); CREATE TABLE community_build_results(id INTEGER PRIMARY KEY,build_id INTEGER); CREATE TABLE manual_compatibility_observations(id INTEGER PRIMARY KEY,build_id INTEGER); INSERT INTO builds VALUES(1,'placeholder',1);").unwrap();
+        db.execute(
+            "UPDATE builds SET path=? WHERE id=1",
+            [install.display().to_string()],
+        )
+        .unwrap();
+        assert!(remove_managed_build(&mut db, 1, &root).is_err());
+        db.execute("UPDATE builds SET active=0 WHERE id=1", [])
+            .unwrap();
+        db.execute("INSERT INTO games VALUES(1,1)", []).unwrap();
+        assert!(remove_managed_build(&mut db, 1, &root).is_err());
+        db.execute("DELETE FROM games", []).unwrap();
+        db.execute("INSERT INTO sessions VALUES(1,1)", []).unwrap();
+        assert!(remove_managed_build(&mut db, 1, &root).is_err());
+        db.execute("DELETE FROM sessions", []).unwrap();
+        remove_managed_build(&mut db, 1, &root).unwrap();
+        assert!(!install.exists());
+        let remaining: i64 = db
+            .query_row("SELECT count(*) FROM builds", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
+        let outside = dir.join("unmanaged-install");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        let link = root.join("linked-build");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        db.execute(
+            "INSERT INTO builds VALUES(2,?,0)",
+            [link.display().to_string()],
+        )
+        .unwrap();
+        assert!(remove_managed_build(&mut db, 2, &root).is_err());
+        db.execute(
+            "UPDATE builds SET path=? WHERE id=2",
+            [outside.display().to_string()],
+        )
+        .unwrap();
+        assert!(remove_managed_build(&mut db, 2, &root).is_err());
+        assert!(outside.join("keep.txt").is_file());
+        fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn executable_validation_requires_a_successful_game_help_response() {
@@ -4530,6 +8369,18 @@ mod tests {
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(verify_emulator(&executable).is_ok());
+        fs::write(
+            &executable,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 12000 ]; do printf 'usage output line %s\n' \"$i\"; i=$((i + 1)); done\nprintf '%s\\n' '--game <dir>'\n",
+        )
+        .unwrap();
+        assert!(verify_emulator(&executable).is_ok());
+        fs::write(
+            &executable,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 50000 ]; do printf 'usage output line %s\n' \"$i\"; i=$((i + 1)); done\nprintf '%s\\n' '--game <dir>'\n",
+        )
+        .unwrap();
+        assert!(verify_emulator(&executable).is_err());
         fs::write(&executable, "#!/bin/sh\nprintf 'not an emulator'\n").unwrap();
         assert!(verify_emulator(&executable).is_err());
         fs::remove_dir_all(dir).unwrap();
@@ -4638,6 +8489,120 @@ mod tests {
         };
         assert!(validate_build_options(&invalid).is_err());
     }
+
+    #[test]
+    fn jobs_receive_distinct_ids_and_reject_overlapping_starts() {
+        let jobs = Jobs {
+            pid: AtomicI32::new(0),
+            active: AtomicBool::new(false),
+            job_id: AtomicU64::new(0),
+            event_kind: Mutex::new(String::new()),
+            cancel_requested: AtomicBool::new(false),
+            cancellable: AtomicBool::new(false),
+            control: Mutex::new(()),
+        };
+        let first = begin_job(&jobs, "Already running", true, "build").unwrap();
+        assert_eq!(jobs.job_id.load(Ordering::SeqCst), first);
+        assert_eq!(ACTIVE_JOB_ID.load(Ordering::SeqCst), first);
+        assert!(begin_job(&jobs, "Already running", true, "clone").is_err());
+
+        jobs.active.store(false, Ordering::SeqCst);
+        ACTIVE_JOB_ID.store(0, Ordering::SeqCst);
+        let second = begin_job(&jobs, "Already running", true, "clone").unwrap();
+        assert_ne!(first, second);
+        ACTIVE_JOB_ID.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn structured_job_channels_separate_repository_runtime_and_build_output() {
+        assert_eq!(job_event_channel("clone", "Cloning"), "repository-clone");
+        assert_eq!(job_event_channel("build", "Fetching"), "repository-update");
+        assert_eq!(job_event_channel("build", "Compile"), "emulator-build");
+        assert_eq!(
+            job_event_channel("community-build", "Compile"),
+            "community-pr-build"
+        );
+        assert_eq!(job_event_channel("game", "Running"), "runtime");
+    }
+    #[test]
+    fn standard_build_checkout_validation_rejects_dirty_and_uninitialized_sources() {
+        let root = env::temp_dir().join(format!(
+            "kyty-clean-source-test-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        test_git(&root, &["init", "--quiet"]).unwrap();
+        test_git(&root, &["config", "user.name", "Test"]).unwrap();
+        test_git(&root, &["config", "user.email", "test@localhost"]).unwrap();
+        fs::write(root.join("source.txt"), "clean\n").unwrap();
+        test_git(&root, &["add", "."]).unwrap();
+        test_git(
+            &root,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "base"],
+        )
+        .unwrap();
+        assert!(validate_clean_source_checkout(&root).is_ok());
+        fs::write(root.join("source.txt"), "modified\n").unwrap();
+        assert!(validate_clean_source_checkout(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn standard_build_checkout_validation_rejects_dirty_recursive_submodules() {
+        let root = env::temp_dir().join(format!(
+            "kyty-dirty-submodule-test-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let nested = root.join("nested");
+        let source = root.join("source");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        test_git(&nested, &["init", "--quiet", "-b", "main"]).unwrap();
+        test_git(&source, &["init", "--quiet", "-b", "main"]).unwrap();
+        for path in [&nested, &source] {
+            test_git(path, &["config", "user.name", "Test"]).unwrap();
+            test_git(path, &["config", "user.email", "test@localhost"]).unwrap();
+        }
+        fs::write(nested.join("nested.txt"), "clean\n").unwrap();
+        test_git(&nested, &["add", "."]).unwrap();
+        test_git(
+            &nested,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "nested"],
+        )
+        .unwrap();
+        fs::write(source.join("root.txt"), "clean\n").unwrap();
+        test_git(&source, &["add", "."]).unwrap();
+        test_git(
+            &source,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "base"],
+        )
+        .unwrap();
+        let nested_url = nested.canonicalize().unwrap().display().to_string();
+        test_git(
+            &source,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &nested_url,
+                "vendor/upstream",
+            ],
+        )
+        .unwrap();
+        test_git(&source, &["add", ".gitmodules", "vendor/upstream"]).unwrap();
+        test_git(
+            &source,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "submodule"],
+        )
+        .unwrap();
+        assert!(validate_clean_source_checkout(&source).is_ok());
+        fs::write(source.join("vendor/upstream/nested.txt"), "dirty\n").unwrap();
+        let error = validate_clean_source_checkout(&source).unwrap_err();
+        assert!(error.contains("submodules contain modified or untracked files"));
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn build_dependency_preflight_reports_only_missing_tools() {
         assert!(missing_build_dependencies(|_| true).is_empty());
@@ -4646,8 +8611,8 @@ mod tests {
             vec!["ninja", "python3"]
         );
         assert_eq!(
-            missing_pkg_config_dependencies(|name| name != "Qt6DBus"),
-            vec!["Qt6DBus"]
+            missing_pkg_config_dependencies(|name| name != "libudev"),
+            vec!["libudev"]
         );
     }
     #[test]
@@ -4659,6 +8624,7 @@ mod tests {
         assert!(linux_x86_64_cmake_cpu_flags("windows", "x86_64").is_empty());
         assert!(linux_x86_64_cmake_cpu_flags("linux", "aarch64").is_empty());
     }
+    #[cfg(target_os = "linux")]
     #[test]
     fn parses_proc_stat_fields_with_parenthesized_process_names() {
         let stat =
@@ -4672,6 +8638,7 @@ mod tests {
         let self_stat = fs::read_to_string(format!("/proc/{}/stat", std::process::id())).unwrap();
         assert!(parse_proc_stat(&self_stat, 4096).is_some());
     }
+    #[cfg(target_os = "linux")]
     #[test]
     fn matches_a_process_by_its_registered_executable_when_start_ticks_are_missing() {
         let executable = std::env::current_exe().unwrap();
@@ -4680,6 +8647,57 @@ mod tests {
             std::process::id(),
             Path::new("/bin/false")
         ));
+    }
+    #[test]
+    fn stopping_requires_a_recorded_process_incarnation_and_matching_group() {
+        let actual = ProcStat {
+            state: 'S',
+            process_group: 42,
+            cpu_ticks: 0,
+            start_ticks: 9876,
+            resident_bytes: 0,
+        };
+        assert!(verified_session_process(42, Some(9876), actual, true));
+        assert!(!verified_session_process(42, None, actual, true));
+        assert!(!verified_session_process(42, Some(9875), actual, true));
+        assert!(!verified_session_process(41, Some(9876), actual, true));
+        assert!(!verified_session_process(42, Some(9876), actual, false));
+    }
+    #[test]
+    fn build_registration_reports_ignored_installation_paths() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE builds(repo_id INTEGER,commit_sha TEXT,build_type TEXT,path TEXT UNIQUE,created_at INTEGER,install_size_bytes INTEGER,validation_status TEXT,configuration_json TEXT);",
+            )
+            .unwrap();
+        let path = Path::new("/managed/builds/first");
+        assert!(insert_registered_build(
+            &connection,
+            1,
+            "abc123",
+            "Release",
+            path,
+            1,
+            Some(1024),
+            "{}",
+        )
+        .unwrap());
+        assert!(!insert_registered_build(
+            &connection,
+            1,
+            "def456",
+            "Release",
+            path,
+            2,
+            Some(2048),
+            "{}",
+        )
+        .unwrap());
+        let count: i64 = connection
+            .query_row("SELECT count(*) FROM builds", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
     #[test]
     fn calculates_cpu_percent_from_tick_deltas_and_elapsed_time() {
@@ -4710,16 +8728,36 @@ mod tests {
     fn game_paths_require_a_supported_file_or_directory_layout() {
         let dir = std::env::temp_dir().join(format!("kyty-game-path-test-{}", now()));
         fs::create_dir_all(dir.join("folder/sce_sys")).unwrap();
-        fs::write(dir.join("folder/eboot.bin"), b"elf").unwrap();
-        fs::write(dir.join("game.ZAR"), b"archive").unwrap();
+        fs::write(dir.join("folder/eboot.bin"), b"\x7fELF\x02\x01").unwrap();
+        fs::create_dir_all(dir.join("fake_folder")).unwrap();
+        fs::write(dir.join("fake_folder/eboot.bin"), b"not an executable").unwrap();
+        write_zarchive_fixture(&dir.join("game.ZAR"));
+        fs::write(dir.join("broken.zar"), b"not an archive").unwrap();
         fs::write(dir.join("game.elf"), b"\x7fELF\x02\x01").unwrap();
         fs::write(dir.join("fake.elf"), b"not an executable").unwrap();
         fs::write(dir.join("notes.txt"), b"no").unwrap();
         assert!(supported_game_path(&dir.join("folder")));
+        assert!(!supported_game_path(&dir.join("fake_folder")));
+        assert!(!supported_game_path(&dir.join("fake_folder/eboot.bin")));
         assert!(supported_game_path(&dir.join("game.ZAR")));
+        assert!(!supported_game_path(&dir.join("broken.zar")));
         assert!(supported_game_path(&dir.join("game.elf")));
         assert!(!supported_game_path(&dir.join("fake.elf")));
         assert!(!supported_game_path(&dir.join("notes.txt")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn recursive_scan_does_not_import_content_nested_under_an_eboot_game() {
+        let dir = std::env::temp_dir().join(format!("kyty-game-scan-ancestor-{}", now()));
+        let game = dir.join("collection/title");
+        fs::create_dir_all(game.join("sce_sys")).unwrap();
+        fs::write(game.join("eboot.bin"), b"\x7fELF\x02\x01").unwrap();
+        fs::write(game.join("bonus.elf"), b"\x7fELF\x02\x01").unwrap();
+        fs::write(game.join("extra.zar"), b"\x7fZAR\0\0\0\0").unwrap();
+        let nested = game.join("sce_sys/param.sfo");
+        assert!(has_game_ancestor(&nested, &dir));
+        assert!(has_game_ancestor(&game.join("bonus.elf"), &dir));
+        assert!(!has_game_ancestor(&dir.join("standalone.elf"), &dir));
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

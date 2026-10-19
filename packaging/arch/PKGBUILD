@@ -3,23 +3,34 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc='Linux desktop manager for KytyPS5 sources, builds, and games'
 arch=('x86_64')
-url='https://github.com/KytyPS5/KytyPS5'
+url='https://github.com/Febsho/KytyPs5-Studio'
 license=('MIT')
 options=('!lto')
-depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'librsvg' 'xdg-utils' 'libnotify' 'libsecret')
-makedepends=('nodejs' 'npm' 'rust' 'cargo')
+depends=('webkit2gtk-4.1' 'gtk3' 'libayatana-appindicator' 'librsvg' 'xdg-utils' 'libnotify' 'libsecret' 'xdotool')
+makedepends=('nodejs' 'npm' 'rust' 'cargo' 'appmenu-gtk-module' 'xdotool')
 source=("$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP')
+
+sanitize_rust_flags() {
+  printf '%s' "$1" | sed -E \
+    's/(^|[[:space:]])-C[[:space:]]+target-cpu=[^[:space:]]+/\1-C target-cpu=x86-64/g'
+}
+
+sanitize_cpu_flags() {
+  printf '%s' "$1" | sed -E \
+    -e 's/(^|[[:space:]])-(march|mcpu)=[^[:space:]]+/\1-march=x86-64/g' \
+    -e 's/(^|[[:space:]])-mtune=[^[:space:]]+/\1-mtune=generic/g'
+}
 
 build() {
   cd "$srcdir/$pkgname-$pkgver"
   npm ci
-  # CachyOS may inject target-cpu=native through /etc/makepkg.conf's Rust config.
-  # Keep Rust artifacts usable across x86_64 Arch machines without changing host config.
-  export RUSTFLAGS="${RUSTFLAGS//-C target-cpu=native/-C target-cpu=x86-64}"
-  # The host makepkg C/C++ flags can also target the build CPU (for example znver4).
-  export CFLAGS="${CFLAGS/-march=native/-march=x86-64}"
-  export CXXFLAGS="${CXXFLAGS/-march=native/-march=x86-64}"
+  # CachyOS and custom makepkg.conf files may target a specific CPU (for
+  # example native, znver4, or skylake). Keep release packages runnable across
+  # x86_64 systems without changing the user's global build configuration.
+  export RUSTFLAGS="$(sanitize_rust_flags "${RUSTFLAGS:-}")"
+  export CFLAGS="$(sanitize_cpu_flags "${CFLAGS:-}")"
+  export CXXFLAGS="$(sanitize_cpu_flags "${CXXFLAGS:-}")"
   npm run tauri build -- --no-bundle
 }
 

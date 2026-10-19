@@ -34,7 +34,9 @@ jobs:
             build-essential curl file libayatana-appindicator3-dev \
             libssl-dev libwebkit2gtk-4.1-dev librsvg2-dev libxdo-dev pkg-config
       - run: npm ci
+      - run: npm test
       - run: npm run build
+      - run: npm run check
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
       - run: cargo check --locked --manifest-path src-tauri/Cargo.toml
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
@@ -112,12 +114,12 @@ jobs:
             archlinux:base-devel \
             bash -euxo pipefail -c '
               pacman -Syu --noconfirm --needed \
-                git nodejs npm rust cargo webkit2gtk-4.1 gtk3 \
+                git nodejs npm rust cargo webkit2gtk-4.1 gtk3 appmenu-gtk-module xdotool \
                 libayatana-appindicator librsvg xdg-utils libnotify libsecret \
                 pkgconf cmake ninja clang
               useradd --create-home builder
-              chown -R builder:builder /workspace/packaging/arch
-              su builder -s /bin/bash -c "cd /workspace && ./packaging/arch/build-package.sh"
+              chown -R builder:builder /workspace
+              su - builder -s /bin/bash -c "cd /workspace && ./packaging/arch/test-flags.sh && ./packaging/arch/build-package.sh"
               mkdir -p /workspace/artifacts
               package=$(find /workspace/packaging/arch -maxdepth 1 -name "kytyps5-studio-*.pkg.tar.zst" -print -quit)
               test -n "$package"

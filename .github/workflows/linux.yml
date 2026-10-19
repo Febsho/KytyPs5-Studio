@@ -115,7 +115,7 @@ jobs:
             bash -euxo pipefail -c '
               pacman -Syu --noconfirm --needed \
                 git nodejs npm rust cargo webkit2gtk-4.1 gtk3 appmenu-gtk-module xdotool \
-                libayatana-appindicator librsvg xdg-utils libnotify libsecret \
+                libayatana-appindicator librsvg xdg-utils xdg-desktop-portal zenity libnotify libsecret \
                 pkgconf cmake ninja clang
               useradd --create-home builder
               chown -R builder:builder /workspace

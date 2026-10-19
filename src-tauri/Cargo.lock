@@ -1732,9 +1732,11 @@ name = "kytyps5-studio"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "png 0.18.1",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

@@ -473,6 +473,28 @@ fn migrate(db: &mut Connection) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
     }
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version < 18 {
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        // Install size is derived data; invalidate older values so the new
+        // package-root calculation refreshes existing library entries.
+        let has_install_size: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('games') WHERE name='install_size')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if has_install_size {
+            tx.execute("UPDATE games SET install_size=NULL", [])
+                .map_err(|e| e.to_string())?;
+        }
+        tx.pragma_update(None, "user_version", 18)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 #[derive(Serialize)]
@@ -544,6 +566,39 @@ struct GameCompatibility {
     latest_log_path: Option<String>,
     gameplay_status: String,
     playable_status: String,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct OfficialCompatibilityGame {
+    title_id: String,
+    title: String,
+    overall: String,
+    status: String,
+    preferred_os: String,
+    os: HashMap<String, String>,
+    report_counts: HashMap<String, u32>,
+    latest_tested: Option<String>,
+}
+#[derive(Serialize, Deserialize)]
+struct OfficialCompatibilityIndex {
+    available: bool,
+    updated_at: Option<i64>,
+    error: Option<String>,
+    games: Vec<OfficialCompatibilityGame>,
+}
+#[derive(Deserialize)]
+struct OfficialSiteIndexPayload {
+    games: Vec<OfficialSiteIndexGame>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OfficialSiteIndexGame {
+    key: Option<String>,
+    title_id: Option<String>,
+    title: String,
+    overall: String,
+    os: HashMap<String, String>,
+    report_counts: HashMap<String, u32>,
+    latest_tested: Option<String>,
 }
 #[derive(Serialize)]
 struct ManualCompatibilityObservation {
@@ -1225,6 +1280,7 @@ struct GameScanResult {
     rejected: usize,
 }
 static NEXT_GAME_SCAN_ID: AtomicU64 = AtomicU64::new(1);
+static GAME_SIZE_REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_JOB_ID: AtomicU64 = AtomicU64::new(0);
 static SESSION_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
@@ -2989,10 +3045,44 @@ fn list_games(app: tauri::AppHandle) -> Result<Vec<Game>, String> {
         .prepare("SELECT id FROM games WHERE hidden=0 ORDER BY favorite DESC, title COLLATE NOCASE")
         .map_err(|e| e.to_string())?;
     let rows = s.query_map([], |r| r.get(0)).map_err(|e| e.to_string())?;
-    let result = rows
+    let result: Vec<Game> = rows
         .map(|id| game(&c, id.map_err(|e| e.to_string())?))
-        .collect();
-    result
+        .collect::<Result<_, _>>()?;
+    let pending = result
+        .iter()
+        .filter(|entry| entry.install_size.is_none() && entry.file_status == "Available")
+        .map(|entry| (entry.id, entry.path.clone()))
+        .collect::<Vec<_>>();
+    if !pending.is_empty() && !GAME_SIZE_REFRESH_RUNNING.swap(true, Ordering::AcqRel) {
+        let app = app.clone();
+        thread::spawn(move || {
+            let scan_id = NEXT_GAME_SCAN_ID.fetch_add(1, Ordering::Relaxed);
+            let total = pending.len() as u64;
+            for (index, (game_id, path)) in pending.into_iter().enumerate() {
+                if let Some(size) = calculate_game_size(Path::new(&path)) {
+                    if let Ok(connection) = db(&app) {
+                        let _ = connection.execute(
+                            "UPDATE games SET install_size=? WHERE id=? AND install_size IS NULL",
+                            params![size, game_id],
+                        );
+                    }
+                }
+                emit_game_scan(
+                    &app,
+                    GameScanEvent {
+                        scan_id,
+                        phase: "Calculating install sizes".into(),
+                        completed: index as u64 + 1,
+                        total,
+                        current: path,
+                        done: index as u64 + 1 == total,
+                    },
+                );
+            }
+            GAME_SIZE_REFRESH_RUNNING.store(false, Ordering::Release);
+        });
+    }
+    Ok(result)
 }
 #[tauri::command]
 fn game_compatibility(app: tauri::AppHandle, game_id: i64) -> Result<GameCompatibility, String> {
@@ -3035,6 +3125,175 @@ fn game_compatibility(app: tauri::AppHandle, game_id: i64) -> Result<GameCompati
         gameplay_status: "Not measured by Studio".into(),
         playable_status: "Unconfirmed".into(),
     })
+}
+const OFFICIAL_COMPATIBILITY_INDEX_URL: &str = "https://kytyps5.github.io/data/compat-index.json";
+const OFFICIAL_COMPATIBILITY_DETAILS_URL: &str = "https://kytyps5.github.io/data/compat/";
+const OFFICIAL_COMPATIBILITY_CACHE_MAX_AGE: i64 = 6 * 60 * 60;
+fn compatibility_cache_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let path = state_paths(app)?.cache.join("compatibility");
+    fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+    Ok(path)
+}
+fn compatibility_http_json(url: &str, max_bytes: usize) -> Result<serde_json::Value, String> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .new_agent();
+    let mut response = agent
+        .get(url)
+        .header("User-Agent", "KytyPS5-Studio")
+        .header("Accept", "application/json")
+        .call()
+        .map_err(|error| format!("Official compatibility database request failed: {error}"))?;
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Could not read official compatibility data: {error}"))?;
+    if bytes.len() > max_bytes {
+        return Err("Official compatibility response exceeded the size limit".into());
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Official compatibility data is invalid JSON: {error}"))
+}
+fn cached_json(path: &Path) -> Option<(i64, serde_json::Value)> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    Some((
+        value.get("cached_at")?.as_i64()?,
+        value.get("data")?.clone(),
+    ))
+}
+fn write_cached_json(path: &Path, data: &serde_json::Value) -> Result<i64, String> {
+    let cached_at = now();
+    let temp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(&serde_json::json!({"cached_at":cached_at,"data":data}))
+        .map_err(|error| error.to_string())?;
+    fs::write(&temp, bytes).map_err(|error| error.to_string())?;
+    fs::rename(temp, path).map_err(|error| error.to_string())?;
+    Ok(cached_at)
+}
+fn normalized_title_id(value: &str) -> Option<String> {
+    let value = value.trim().to_ascii_uppercase().replace('-', "");
+    (value.len() == 9
+        && value.starts_with("PPSA")
+        && value[4..].bytes().all(|byte| byte.is_ascii_digit()))
+    .then_some(value)
+}
+#[tauri::command]
+fn official_compatibility_index(app: tauri::AppHandle) -> OfficialCompatibilityIndex {
+    let Ok(cache_dir) = compatibility_cache_dir(&app) else {
+        return OfficialCompatibilityIndex {
+            available: false,
+            updated_at: None,
+            error: Some("Could not initialize the compatibility cache".into()),
+            games: Vec::new(),
+        };
+    };
+    let cache_path = cache_dir.join("index.json");
+    let remote = compatibility_http_json(OFFICIAL_COMPATIBILITY_INDEX_URL, 8 * 1024 * 1024)
+        .and_then(|value| {
+            let payload: OfficialSiteIndexPayload =
+                serde_json::from_value(value.clone()).map_err(|error| {
+                    format!("Official compatibility index has an unexpected format: {error}")
+                })?;
+            if payload.games.is_empty() {
+                return Err("Official compatibility index contained no game records".into());
+            }
+            let games = payload
+                .games
+                .into_iter()
+                .filter_map(|game| {
+                    let title_id =
+                        normalized_title_id(game.title_id.as_deref().or(game.key.as_deref())?)?;
+                    let preferred_os = if game.os.contains_key("linux") {
+                        "linux"
+                    } else {
+                        "all"
+                    };
+                    let status = if preferred_os == "linux" {
+                        game.os
+                            .get("linux")
+                            .cloned()
+                            .unwrap_or_else(|| game.overall.clone())
+                    } else {
+                        game.overall.clone()
+                    };
+                    Some(OfficialCompatibilityGame {
+                        title_id,
+                        title: game.title,
+                        overall: game.overall,
+                        status,
+                        preferred_os: preferred_os.into(),
+                        os: game.os,
+                        report_counts: game.report_counts,
+                        latest_tested: game.latest_tested,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let data = serde_json::to_value(games).map_err(|error| error.to_string())?;
+            let updated_at = write_cached_json(&cache_path, &data)?;
+            Ok(OfficialCompatibilityIndex {
+                available: true,
+                updated_at: Some(updated_at),
+                error: None,
+                games: serde_json::from_value(data).unwrap_or_default(),
+            })
+        });
+    let error = match remote {
+        Ok(index) => return index,
+        Err(error) => error,
+    };
+    if let Some((updated_at, data)) = cached_json(&cache_path) {
+        return OfficialCompatibilityIndex {
+            available: true,
+            updated_at: Some(updated_at),
+            error: Some(error),
+            games: serde_json::from_value(data).unwrap_or_default(),
+        };
+    }
+    OfficialCompatibilityIndex {
+        available: false,
+        updated_at: None,
+        error: Some(error),
+        games: Vec::new(),
+    }
+}
+#[tauri::command]
+fn official_compatibility_details(
+    app: tauri::AppHandle,
+    title_id: String,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(title_id) = normalized_title_id(&title_id) else {
+        return Ok(None);
+    };
+    let cache_path = compatibility_cache_dir(&app)?.join(format!("{title_id}.json"));
+    let cached = cached_json(&cache_path);
+    if cached
+        .as_ref()
+        .is_some_and(|(updated_at, _)| now() - updated_at < OFFICIAL_COMPATIBILITY_CACHE_MAX_AGE)
+    {
+        return Ok(cached.map(|(_, data)| data));
+    }
+    let url = format!("{OFFICIAL_COMPATIBILITY_DETAILS_URL}{title_id}.json");
+    match compatibility_http_json(&url, 2 * 1024 * 1024) {
+        Ok(data) => {
+            let returned_id = data
+                .get("titleId")
+                .or_else(|| data.get("title_id"))
+                .and_then(|value| value.as_str())
+                .and_then(normalized_title_id);
+            if returned_id.as_deref() != Some(&title_id) {
+                return cached.map(|(_, data)| Some(data)).ok_or_else(|| {
+                    "Official compatibility report did not match the game's title ID".into()
+                });
+            }
+            write_cached_json(&cache_path, &data)?;
+            Ok(Some(data))
+        }
+        Err(error) => cached.map(|(_, data)| Some(data)).ok_or(error),
+    }
 }
 fn compatibility_outcome(value: &str) -> bool {
     matches!(
@@ -4232,51 +4491,13 @@ fn start_community_build(
                             pr.number, pr.base_branch, branch
                         ));
                     }
-                    if prs
-                        .first()
-                        .is_some_and(|first: &CommunityPullRequest| first.base_sha != pr.base_sha)
-                    {
-                        return Err(format!("PR #{} is based on a different target commit; select PRs with the same pinned base", pr.number));
-                    }
                 } else {
                     base_branch = Some(pr.base_branch.clone());
                 }
                 prs.push(pr);
             }
             ensure_job_not_cancelled(&jobs)?;
-            let base_sha = prs
-                .first()
-                .map(|pr| pr.base_sha.clone())
-                .ok_or("No base commit")?;
-            if base_sha.len() != 40 || !base_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err("GitHub returned an invalid base SHA".into());
-            }
             let branch = base_branch.clone().unwrap_or_else(|| "unknown".into());
-            let signature = community_build_signature(
-                repository_id,
-                &branch,
-                &base_sha,
-                &prs.iter()
-                    .map(|pr| (pr.number, pr.head_sha.clone()))
-                    .collect::<Vec<_>>(),
-                &options.build_type,
-                options.jobs,
-                &compiler,
-                options.clean,
-            );
-            let history_db = db(&app)?;
-            history_db.execute("INSERT OR IGNORE INTO community_build_configs(signature,repo_id,name,base_branch,base_sha,build_type,jobs,created_at,compiler,clean) VALUES(?,?,?,?,?,?,?,?,?,?)", params![signature, repository_id, format!("Community Combined Build — PR {}", pull_requests.iter().map(|selection| format!("#{}", selection.number)).collect::<Vec<_>>().join(" + ")), branch, base_sha, options.build_type, options.jobs, now(), compiler, options.clean]).map_err(|e| e.to_string())?;
-            let config_id: i64 = history_db
-                .query_row(
-                    "SELECT id FROM community_build_configs WHERE signature=?",
-                    [&signature],
-                    |row| row.get(0),
-                )
-                .map_err(|e| e.to_string())?;
-            for (position, pr) in prs.iter().enumerate() {
-                history_db.execute("INSERT OR IGNORE INTO community_build_prs(config_id,position,number,head_repo,head_sha) VALUES(?,?,?,?,?)", params![config_id, position as i64, pr.number as i64, pr.head_repo, pr.head_sha]).map_err(|e| e.to_string())?;
-            }
-            history_result_id = Some(history_db.query_row("INSERT INTO community_build_results(config_id,status,started_at) VALUES(?,'preparing',?) RETURNING id", params![config_id, now()], |row| row.get(0)).map_err(|e| e.to_string())?);
             let paths = state_paths(&app)?;
             let work_root = paths.cache.join("community-worktrees");
             if fs::symlink_metadata(&work_root)
@@ -4360,21 +4581,43 @@ fn start_community_build(
                 Some(&worktree),
                 &["fetch", "--no-tags", "origin", &base_ref],
             )?;
-            git_cancellable(
+            let base_sha = git_cancellable(
                 &app,
                 &jobs,
                 Some(&worktree),
-                &["cat-file", "-e", &format!("{base_sha}^{{commit}}")],
-            )
-            .map_err(|_| {
-                "Pinned PR base commit is no longer reachable from the target branch".to_string()
-            })?;
+                &["rev-parse", "refs/studio/base"],
+            )?;
             git_cancellable(
                 &app,
                 &jobs,
                 Some(&worktree),
                 &["checkout", "--detach", &base_sha],
             )?;
+            let signature = community_build_signature(
+                repository_id,
+                &branch,
+                &base_sha,
+                &prs.iter()
+                    .map(|pr| (pr.number, pr.head_sha.clone()))
+                    .collect::<Vec<_>>(),
+                &options.build_type,
+                options.jobs,
+                &compiler,
+                options.clean,
+            );
+            let history_db = db(&app)?;
+            history_db.execute("INSERT OR IGNORE INTO community_build_configs(signature,repo_id,name,base_branch,base_sha,build_type,jobs,created_at,compiler,clean) VALUES(?,?,?,?,?,?,?,?,?,?)", params![signature, repository_id, format!("Community PR Build — {}", pull_requests.iter().map(|selection| format!("#{}", selection.number)).collect::<Vec<_>>().join(" + ")), branch, base_sha, options.build_type, options.jobs, now(), compiler, options.clean]).map_err(|e| e.to_string())?;
+            let config_id: i64 = history_db
+                .query_row(
+                    "SELECT id FROM community_build_configs WHERE signature=?",
+                    [&signature],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            for (position, pr) in prs.iter().enumerate() {
+                history_db.execute("INSERT OR IGNORE INTO community_build_prs(config_id,position,number,head_repo,head_sha) VALUES(?,?,?,?,?)", params![config_id, position as i64, pr.number as i64, pr.head_repo, pr.head_sha]).map_err(|e| e.to_string())?;
+            }
+            history_result_id = Some(history_db.query_row("INSERT INTO community_build_results(config_id,status,started_at) VALUES(?,'preparing',?) RETURNING id", params![config_id, now()], |row| row.get(0)).map_err(|e| e.to_string())?);
             for pr in &prs {
                 ensure_job_not_cancelled(&jobs)?;
                 let reference = format!("refs/studio/pr/{}", pr.number);
@@ -6123,22 +6366,10 @@ fn add_game_with_size(
             .to_string_lossy()
             .to_string();
     }
-    let install_size = if !calculate_install_size {
-        None
-    } else if p.is_dir() {
-        walkdir::WalkDir::new(&p)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter_map(|entry| entry.metadata().ok())
-            .filter(|metadata| metadata.is_file())
-            .map(|metadata| metadata.len().min(i64::MAX as u64) as i64)
-            .fold(0_i64, i64::saturating_add)
-            .into()
+    let install_size = if calculate_install_size {
+        calculate_game_size(&p)
     } else {
-        fs::metadata(&p)
-            .map(|metadata| metadata.len().min(i64::MAX as u64) as i64)
-            .ok()
+        None
     };
     let c = db(&app)?;
     let inserted = c.execute(
@@ -6160,9 +6391,45 @@ fn add_game_with_size(
     Ok((game(&c, id)?, inserted != 0))
 }
 fn calculate_game_size(path: &Path) -> Option<i64> {
-    if path.is_dir() {
+    // The emulator needs app0 as its launch path, but the installed title may
+    // contain sibling data/sce_sys folders beside app0. Count the package root
+    // for the displayed install size while leaving the registered launch path
+    // untouched.
+    let package_root = if path.is_dir()
+        && path
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("app0"))
+        && path
+            .parent()
+            .is_some_and(|parent| parent.join("sce_sys").is_dir())
+    {
+        path.parent().unwrap_or(path)
+    } else if path.file_name().is_some_and(|name| name == "eboot.bin")
+        && path.parent().is_some_and(|parent| {
+            parent
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("app0"))
+        })
+        && path
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|parent| parent.join("sce_sys").is_dir())
+    {
+        path.parent().and_then(Path::parent).unwrap_or(path)
+    } else if path.is_dir() {
+        path
+    } else if path.file_name().is_some_and(|name| name == "eboot.bin")
+        || path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("elf"))
+    {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
+    if package_root.is_dir() {
         Some(
-            walkdir::WalkDir::new(path)
+            walkdir::WalkDir::new(package_root)
                 .follow_links(false)
                 .into_iter()
                 .filter_map(Result::ok)
@@ -6193,8 +6460,8 @@ fn spawn_game_size_task(
             let size = calculate_game_size(Path::new(&path));
             if let (Some(size), Ok(c)) = (size, db(&app)) {
                 let _ = c.execute(
-                    "UPDATE games SET install_size=? WHERE id=? AND install_size IS NULL",
-                    params![size, game_id],
+                    "UPDATE games SET install_size=? WHERE id=? AND (? OR install_size IS NULL)",
+                    params![size, game_id, !report_progress],
                 );
             }
             completed += 1;
@@ -7459,6 +7726,333 @@ fn set_profile(app: tauri::AppHandle, game_id: i64, mut profile: Profile) -> Res
     c.execute("INSERT INTO profiles(game_id,screen_width,screen_height,present_mode,perf_overlay,fullscreen,controller_color,controller_volume,controller_vibration,keyboard_player,options_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(game_id) DO UPDATE SET screen_width=excluded.screen_width,screen_height=excluded.screen_height,present_mode=excluded.present_mode,perf_overlay=excluded.perf_overlay,fullscreen=excluded.fullscreen,controller_color=excluded.controller_color,controller_volume=excluded.controller_volume,controller_vibration=excluded.controller_vibration,keyboard_player=excluded.keyboard_player,options_json=excluded.options_json",params![game_id,profile.screen_width,profile.screen_height,profile.present_mode,profile.perf_overlay,profile.fullscreen,profile.controller_color,profile.controller_volume,profile.controller_vibration,profile.keyboard_player,options_json]).map_err(|e|e.to_string())?;
     Ok(())
 }
+fn steam_shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn steam_vdf_string(out: &mut Vec<u8>, key: &str, value: &str) {
+    out.push(1);
+    out.extend_from_slice(key.as_bytes());
+    out.push(0);
+    out.extend_from_slice(value.as_bytes());
+    out.push(0);
+}
+
+fn steam_vdf_int(out: &mut Vec<u8>, key: &str, value: u32) {
+    out.push(2);
+    out.extend_from_slice(key.as_bytes());
+    out.push(0);
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn steam_vdf_key(bytes: &[u8], mut pos: usize) -> Result<(String, usize), String> {
+    let start = pos;
+    while pos < bytes.len() && bytes[pos] != 0 {
+        pos += 1;
+    }
+    if pos >= bytes.len() {
+        return Err("Steam shortcuts file is malformed".into());
+    }
+    Ok((
+        String::from_utf8_lossy(&bytes[start..pos]).into_owned(),
+        pos + 1,
+    ))
+}
+
+fn steam_vdf_skip(bytes: &[u8], kind: u8, mut pos: usize) -> Result<usize, String> {
+    match kind {
+        0 => loop {
+            let next = *bytes.get(pos).ok_or("Steam shortcuts file is malformed")?;
+            pos += 1;
+            if next == 8 {
+                return Ok(pos);
+            }
+            let (_, value_pos) = steam_vdf_key(bytes, pos)?;
+            pos = steam_vdf_skip(bytes, next, value_pos)?;
+        },
+        1 | 5 => {
+            if kind == 1 {
+                while pos < bytes.len() && bytes[pos] != 0 {
+                    pos += 1;
+                }
+                if pos >= bytes.len() {
+                    return Err("Steam shortcuts file is malformed".into());
+                }
+                Ok(pos + 1)
+            } else {
+                while pos + 1 < bytes.len() && (bytes[pos] != 0 || bytes[pos + 1] != 0) {
+                    pos += 2;
+                }
+                if pos + 1 >= bytes.len() {
+                    return Err("Steam shortcuts file is malformed".into());
+                }
+                Ok(pos + 2)
+            }
+        }
+        2 | 3 | 4 | 6 => pos
+            .checked_add(4)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| "Steam shortcuts file is malformed".into()),
+        7 => pos
+            .checked_add(8)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| "Steam shortcuts file is malformed".into()),
+        _ => Err("Steam shortcuts file contains an unsupported value".into()),
+    }
+}
+
+fn steam_root_end(bytes: &[u8]) -> Result<(usize, u32), String> {
+    if bytes.get(..11) != Some(b"\0shortcuts\0") || bytes.get(11) != Some(&0) {
+        return Err("Steam shortcuts.vdf has an unexpected format".into());
+    }
+    let mut pos = 12;
+    let mut max_index = None;
+    loop {
+        let kind = *bytes.get(pos).ok_or("Steam shortcuts.vdf is incomplete")?;
+        if kind == 8 {
+            return Ok((pos, max_index.unwrap_or(0)));
+        }
+        pos += 1;
+        let (key, value_pos) = steam_vdf_key(bytes, pos)?;
+        if kind == 0 {
+            if let Ok(index) = key.parse::<u32>() {
+                max_index = Some(max_index.map_or(index, |previous: u32| previous.max(index)));
+            }
+        }
+        pos = steam_vdf_skip(bytes, kind, value_pos)?;
+    }
+}
+
+fn steam_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (0_u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
+}
+
+fn steam_config_dir() -> Result<PathBuf, String> {
+    let h = home()?;
+    let roots = [
+        h.join(".steam/steam"),
+        h.join(".steam/root"),
+        h.join(".local/share/Steam"),
+        h.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"),
+    ];
+    let mut candidates = Vec::new();
+    for root in roots {
+        let userdata = root.join("userdata");
+        let Ok(users) = fs::read_dir(userdata) else {
+            continue;
+        };
+        for user in users.flatten() {
+            if !user
+                .file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                || user.file_name() == "0"
+            {
+                continue;
+            }
+            let config = user.path().join("config");
+            let shortcuts = config.join("shortcuts.vdf");
+            let localconfig = config.join("localconfig.vdf");
+            if !config.is_dir() {
+                continue;
+            }
+            let timestamp = shortcuts
+                .metadata()
+                .or_else(|_| localconfig.metadata())
+                .and_then(|m| m.modified())
+                .ok();
+            candidates.push((timestamp, shortcuts.exists(), config));
+        }
+    }
+    candidates.sort_by_key(|(time, has_shortcuts, _)| (time.is_some(), *time, *has_shortcuts));
+    candidates.pop().map(|(_, _, path)| path).ok_or_else(|| {
+        "Steam user configuration was not found. Install and open Steam once, then retry.".into()
+    })
+}
+
+#[tauri::command]
+fn add_game_to_steam(
+    app: tauri::AppHandle,
+    game_id: i64,
+    image_path: String,
+) -> Result<String, String> {
+    if fs::read_dir("/proc")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            fs::read_to_string(entry.path().join("comm"))
+                .ok()
+                .is_some_and(|name| matches!(name.trim(), "steam" | "steam-runtime"))
+        })
+    {
+        return Err("Close Steam completely, then add the game again so Steam cannot overwrite its shortcut list.".into());
+    }
+    let image = fs::canonicalize(&image_path)
+        .map_err(|error| format!("Could not read selected cover image: {error}"))?;
+    let extension = image
+        .extension()
+        .and_then(|v| v.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|v| matches!(v.as_str(), "png" | "jpg" | "jpeg"))
+        .ok_or("Choose a PNG, JPG, or JPEG cover image")?;
+    let c = db(&app)?;
+    let g = game(&c, game_id)?;
+    let game_profile = profile(&c, game_id)?;
+    let build_id = if let Some(id) = g.build_id {
+        id
+    } else {
+        c.query_row("SELECT id FROM builds WHERE active=1 LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .map_err(|_| "Select an active emulator build".to_string())?
+    };
+    let b = build(&c, build_id)?;
+    let capabilities = capabilities_for_build(&b)?;
+    let mut options = effective_profile_options(
+        &global_profile_options(&c)?,
+        &game_profile.options,
+        &capabilities,
+    )?;
+    if game_profile.screen_width.is_some() && !capabilities.screen_width
+        || game_profile.screen_height.is_some() && !capabilities.screen_height
+        || game_profile.present_mode.is_some() && !capabilities.present_mode
+        || game_profile.perf_overlay && !capabilities.perf_overlay
+        || game_profile.fullscreen && !capabilities.fullscreen
+        || game_profile.controller_color.is_some() && !capabilities.controller_color
+        || game_profile.controller_volume.is_some() && !capabilities.controller_volume
+        || game_profile.controller_vibration.is_some() && !capabilities.controller_vibration
+        || game_profile.keyboard_player.is_some() && !capabilities.keyboard_player
+    {
+        return Err("The selected emulator build no longer supports this game's saved profile. Clear unsupported profile options before adding it to Steam.".into());
+    }
+    for (flag, value) in &mut options {
+        if [
+            "--game-patch",
+            "--printf-output-file",
+            "--addcont-dir",
+            "--shader-log-folder",
+            "--command-buffer-dump-folder",
+        ]
+        .contains(&flag.as_str())
+        {
+            *value = canonicalize_option_path(flag, value)?;
+        }
+    }
+    let exe = Path::new(&b.path).join("kyty_emulator");
+    if !exe.is_file()
+        || fs::metadata(&exe)
+            .map(|m| m.permissions().mode() & 0o111 == 0)
+            .unwrap_or(true)
+    {
+        return Err("The selected emulator build is missing or not executable".into());
+    }
+    let game_path = fs::canonicalize(&g.path)
+        .map_err(|_| "The registered game path is missing or inaccessible".to_string())?;
+    if !supported_game_path(&game_path) {
+        return Err(
+            "The registered game path no longer contains a supported eboot.bin, ELF, or ZArchive"
+                .into(),
+        );
+    }
+    let args = extra_profile_arguments(&options, &capabilities.switch_options);
+    let config = steam_config_dir()?;
+    let launcher_dir = state_paths(&app)?.data.join("steam-launchers");
+    fs::create_dir_all(&launcher_dir).map_err(|e| e.to_string())?;
+    let launcher = launcher_dir.join(format!("game-{game_id}.sh"));
+    let mut script = format!(
+        "#!/bin/sh\nexec {} --game {}",
+        steam_shell_quote(&exe.display().to_string()),
+        steam_shell_quote(&game_path.display().to_string())
+    );
+    for arg in args {
+        script.push(' ');
+        script.push_str(&steam_shell_quote(&arg.to_string_lossy()));
+    }
+    script.push('\n');
+    fs::write(&launcher, script)
+        .map_err(|e| format!("Could not create Steam game launcher: {e}"))?;
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+
+    let app_name = format!("{} · KytyPS5 Studio", g.title);
+    let exe_field = format!("\"{}\"", launcher.display());
+    let app_id = steam_crc32(format!("{exe_field}{app_name}").as_bytes()) | 0x8000_0000;
+    let launch_id = (u64::from(app_id) << 32) | 0x0200_0000;
+    let grid = config.join("grid");
+    fs::create_dir_all(&grid).map_err(|e| format!("Could not create Steam artwork folder: {e}"))?;
+    let artwork = grid.join(format!("{launch_id}p.{extension}"));
+    fs::copy(&image, &artwork).map_err(|e| format!("Could not copy cover image to Steam: {e}"))?;
+    let shortcuts_path = config.join("shortcuts.vdf");
+    let mut shortcuts = if shortcuts_path.exists() {
+        fs::read(&shortcuts_path).map_err(|e| e.to_string())?
+    } else {
+        b"\0shortcuts\0\0\x08\x08\x08".to_vec()
+    };
+    if !shortcuts
+        .windows(launcher.to_string_lossy().len())
+        .any(|part| part == launcher.to_string_lossy().as_bytes())
+    {
+        let (root_end, max_index) = steam_root_end(&shortcuts)?;
+        let mut entry = Vec::new();
+        entry.push(0);
+        let entry_index = if max_index == 0 && root_end == 12 {
+            0
+        } else {
+            max_index.saturating_add(1)
+        };
+        entry.extend_from_slice(entry_index.to_string().as_bytes());
+        entry.push(0);
+        steam_vdf_int(&mut entry, "appid", app_id);
+        steam_vdf_string(&mut entry, "AppName", &app_name);
+        steam_vdf_string(&mut entry, "Exe", &exe_field);
+        steam_vdf_string(&mut entry, "StartDir", &format!("\"{}\"", b.path));
+        steam_vdf_string(&mut entry, "icon", &artwork.display().to_string());
+        steam_vdf_string(&mut entry, "ShortcutPath", "");
+        steam_vdf_string(&mut entry, "LaunchOptions", "");
+        steam_vdf_int(&mut entry, "IsHidden", 0);
+        steam_vdf_int(&mut entry, "AllowDesktopConfig", 1);
+        steam_vdf_int(&mut entry, "AllowOverlay", 1);
+        steam_vdf_int(&mut entry, "OpenVR", 0);
+        steam_vdf_int(&mut entry, "Devkit", 0);
+        steam_vdf_string(&mut entry, "DevkitGameID", "");
+        steam_vdf_int(&mut entry, "DevkitOverrideAppID", 0);
+        steam_vdf_int(&mut entry, "LastPlayTime", 0);
+        steam_vdf_string(&mut entry, "FlatpakAppID", "");
+        steam_vdf_string(&mut entry, "sortas", &app_name);
+        entry.push(0);
+        entry.extend_from_slice(b"tags\0");
+        entry.push(8);
+        entry.push(8);
+        shortcuts.splice(root_end..root_end, entry);
+        let temporary =
+            shortcuts_path.with_file_name(format!("shortcuts.vdf.tmp-{}", std::process::id()));
+        let write_result = (|| {
+            use std::io::Write as _;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&shortcuts)?;
+            file.sync_all()?;
+            fs::rename(&temporary, &shortcuts_path)
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("Could not update Steam shortcuts: {error}"));
+        }
+    }
+    Ok(format!("Added {} to Steam with the selected emulator build. Restart Steam to see it in your library.", g.title))
+}
+
 #[tauri::command]
 fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
     let _session_lifecycle = SESSION_LIFECYCLE_LOCK
@@ -8042,7 +8636,9 @@ fn read_build_log(app: tauri::AppHandle, id: i64) -> Result<String, String> {
 
 #[derive(Debug)]
 struct DiscordSession {
+    game_id: i64,
     title: String,
+    title_id: Option<String>,
     started_at: i64,
 }
 
@@ -8059,9 +8655,9 @@ fn discord_current_state(app: &tauri::AppHandle) -> Result<(bool, Option<Discord
         .map_err(|e| e.to_string())?;
     let active = conn
         .query_row(
-            "SELECT g.title,s.started_at FROM sessions s JOIN games g ON g.id=s.game_id WHERE s.ended_at IS NULL ORDER BY s.started_at DESC,s.id DESC LIMIT 1",
+            "SELECT g.id,g.title,g.title_id,s.started_at FROM sessions s JOIN games g ON g.id=s.game_id WHERE s.ended_at IS NULL ORDER BY s.started_at DESC,s.id DESC LIMIT 1",
             [],
-            |r| Ok(DiscordSession { title: r.get(0)?, started_at: r.get(1)? }),
+            |r| Ok(DiscordSession { game_id: r.get(0)?, title: r.get(1)?, title_id: r.get(2)?, started_at: r.get(3)? }),
         )
         .optional()
         .map_err(|e| e.to_string())?;
@@ -8104,7 +8700,69 @@ fn connect_discord(client_id: &str) -> Option<UnixStream> {
     (message.get("evt").and_then(|v| v.as_str()) == Some("READY")).then_some(stream)
 }
 
-fn discord_activity(session: Option<&DiscordSession>) -> serde_json::Value {
+fn discord_game_artwork_url(title_id: &str) -> Option<String> {
+    let title_id = title_id
+        .trim()
+        .strip_suffix("_00")
+        .unwrap_or(title_id.trim());
+    if title_id.is_empty()
+        || title_id.len() > 32
+        || !title_id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .new_agent();
+    for (country, language) in [("de", "de"), ("us", "en")] {
+        let url = format!(
+            "https://store.playstation.com/store/api/chihiro/00_09_000/titlecontainer/{country}/{language}/999/{title_id}_00"
+        );
+        let response = agent
+            .get(&url)
+            .header("User-Agent", "KytyPS5-Studio")
+            .call();
+        let Ok(mut response) = response else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if response
+            .body_mut()
+            .as_reader()
+            .take(2 * 1024 * 1024)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            continue;
+        }
+        let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        let Some(images) = metadata.get("images").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        let Some(image) = images
+            .iter()
+            .find(|image| image.get("type").and_then(|value| value.as_i64()) == Some(10))
+            .or_else(|| images.first())
+        else {
+            continue;
+        };
+        let Some(image_url) = image.get("url").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if image_url.starts_with("https://") {
+            return Some(image_url.to_owned());
+        }
+    }
+    None
+}
+
+fn discord_activity(
+    session: Option<&DiscordSession>,
+    artwork_url: Option<&str>,
+) -> serde_json::Value {
     let mut activity = serde_json::json!({"name": "KytyPS5 Studio", "type": 0});
     if let Some(session) = session {
         let title: String = session.title.chars().take(120).collect();
@@ -8113,6 +8771,12 @@ fn discord_activity(session: Option<&DiscordSession>) -> serde_json::Value {
         activity["state"] = serde_json::json!("KytyPS5 Studio");
         activity["timestamps"] =
             serde_json::json!({"start": session.started_at.saturating_mul(1000)});
+        if let Some(image_url) = artwork_url {
+            activity["assets"] = serde_json::json!({
+                "large_image": image_url,
+                "large_text": title,
+            });
+        }
     } else {
         activity["details"] = serde_json::json!("Browsing KytyPS5 Studio");
         activity["state"] = serde_json::json!("No game running");
@@ -8124,6 +8788,7 @@ fn start_discord_presence(app: tauri::AppHandle) {
     thread::spawn(move || {
         let mut stream: Option<UnixStream> = None;
         let mut nonce = 0u64;
+        let mut artwork_cache: HashMap<i64, Option<String>> = HashMap::new();
         loop {
             let (enabled, session) = discord_current_state(&app).unwrap_or_default();
             if !enabled {
@@ -8135,10 +8800,21 @@ fn start_discord_presence(app: tauri::AppHandle) {
                 stream = connect_discord("1561813805229674627");
             }
             if let Some(connection) = stream.as_mut() {
+                let artwork_url = session.as_ref().and_then(|session| {
+                    artwork_cache
+                        .entry(session.game_id)
+                        .or_insert_with(|| {
+                            session
+                                .title_id
+                                .as_deref()
+                                .and_then(discord_game_artwork_url)
+                        })
+                        .as_deref()
+                });
                 nonce = nonce.wrapping_add(1);
                 let payload = serde_json::json!({
                     "cmd": "SET_ACTIVITY",
-                    "args": {"pid": std::process::id(), "activity": discord_activity(session.as_ref())},
+                    "args": {"pid": std::process::id(), "activity": discord_activity(session.as_ref(), artwork_url)},
                     "nonce": nonce.to_string()
                 });
                 if discord_write_frame(connection, 1, payload.to_string().as_bytes()).is_err() {
@@ -8279,6 +8955,8 @@ pub fn run() {
             list_games,
             remove_game_entry,
             game_compatibility,
+            official_compatibility_index,
+            official_compatibility_details,
             record_compatibility_observation,
             compatibility_observations,
             add_repository,
@@ -8328,6 +9006,7 @@ pub fn run() {
             get_global_profile_options,
             get_active_profile_capabilities,
             set_global_profile_options,
+            add_game_to_steam,
             launch_game,
             process_metrics,
             stop_game_session,
@@ -9083,7 +9762,7 @@ mod tests {
             ),
             ("KytyPS5", "/build", "Existing Game", "dark")
         );
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
         assert_eq!(hidden_default, 0);
         assert_eq!(compatibility_table, 1);
         assert_eq!(columns, 4);
@@ -9132,7 +9811,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(row, (2560, 1440, "Mailbox".into(), 1, 0));
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
     }
     #[test]
     fn migration_removes_only_the_legacy_sqlite_github_token() {

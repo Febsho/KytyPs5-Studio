@@ -1335,6 +1335,45 @@ main {
   height: 100%;
   color: #a6aab1;
 }
+.import-menu-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+.import-menu {
+  position: absolute;
+  z-index: 1000;
+  top: calc(100% - 3px);
+  right: 0;
+  display: grid;
+  width: min(310px, calc(100vw - 24px));
+  gap: 4px;
+  padding: 6px;
+  border: 1px solid #30343b;
+  border-radius: 8px;
+  background: #101216;
+  box-shadow: 0 12px 32px #000a;
+}
+.import-menu button {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #e5e7eb;
+  text-align: left;
+  cursor: pointer;
+}
+.import-menu button:hover {
+  background: #ffffff0c;
+}
+.import-menu small {
+  color: #969ba5;
+  font-size: 11px;
+  line-height: 1.4;
+}
 .title-action,
 .title-icon,
 .title-controller {
@@ -4273,4 +4312,218 @@ main {
     width: 120px;
     min-width: 120px;
   }
+}
+
+/* Keep mouse focus visually quiet across the app; keyboard focus remains clear
+   without the bright blue browser-style frame. */
+:where(button, input, select, textarea, a, [tabindex]):focus:not(:focus-visible) {
+  outline: none !important;
+  box-shadow: none !important;
+}
+:where(button, input, select, textarea, a, [tabindex]):focus-visible {
+  outline: 1px solid #aeb4bd !important;
+  outline-offset: 2px;
+  box-shadow: none !important;
+}
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: #626873;
+}
+
+.game-details-page > .details-overview > .panel {
+  max-width: 980px;
+  padding: 24px;
+  border-radius: 10px;
+  background: linear-gradient(145deg, #101216, #0b0d10);
+}
+.game-details-page .game-meta span {
+  border-color: #343840;
+  border-radius: 5px;
+  padding: 6px 10px;
+  color: #d4d6da;
+  background: #17191e;
+  font-weight: 600;
+  letter-spacing: 0.015em;
+}
+.game-details-page .compatibility-panel {
+  max-width: 980px;
+  margin: 0;
+  padding: 22px 24px;
+  border-color: #30343b;
+  border-radius: 10px;
+  background: linear-gradient(145deg, #101216, #0b0d10);
+}
+.game-details-page .compatibility-panel > h2 {
+  margin: 0 0 14px;
+}
+.game-details-page .compatibility-panel > .kv {
+  align-items: center;
+  gap: 24px;
+  padding: 14px 2px;
+  border-bottom-color: #272a30;
+}
+.game-details-page .compatibility-panel > .kv > span {
+  color: #aeb2ba;
+}
+.game-details-page .compatibility-panel > .kv > strong {
+  max-width: 55%;
+  border: 1px solid #353941;
+  border-radius: 5px;
+  padding: 5px 9px;
+  color: #e3e5e9;
+  background: #181a1f;
+  font-weight: 600;
+}
+.game-details-page .compatibility-panel > .hint {
+  margin: 16px 0 22px;
+  color: #9da2ab;
+}
+.game-details-page .compat-observation {
+  border-top-color: #30343b;
+}
+.official-compatibility-badge {
+  position: absolute;
+  z-index: 3;
+  left: 7px;
+  bottom: 7px;
+  max-width: calc(100% - 14px);
+  padding: 4px 7px;
+  border: 1px solid #ffffff30;
+  border-radius: 999px;
+  background: #080a0de8;
+  color: #e4e7eb;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.game-art,
+.home-game-art {
+  position: relative;
+}
+.official-compatibility-section {
+  margin: 0 0 20px;
+  padding: 0 0 18px;
+  border-bottom: 1px solid #252a32;
+}
+.official-compatibility-heading,
+.official-report-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.official-compatibility-heading h2 {
+  margin: 3px 0 0;
+}
+.official-compatibility-heading > small,
+.official-report-heading > span,
+.official-report-meta,
+.official-report > a,
+.official-database-link {
+  color: #9da5b0;
+  font-size: var(--studio-font-sm);
+}
+.official-compatibility-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 9px;
+  margin: 14px 0;
+  color: #abb2bc;
+  font-size: var(--studio-font-sm);
+}
+.official-status {
+  padding: 5px 9px;
+  border: 1px solid #ffffff24;
+  border-radius: 999px;
+  background: #ffffff0a;
+  color: #e6e9ed;
+  font-size: 12px;
+}
+.official-status.status-doesnt-boot { color: #c2c7ce; }
+.official-status.status-logo { color: #ff8b8b; }
+.official-status.status-main-menu { color: #ffbd73; }
+.official-status.status-in-game,
+.official-status.status-playable { color: #7ce0a5; }
+.official-platform-results {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 12px 0;
+}
+.official-platform-result {
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  border: 1px solid #282d35;
+  border-radius: 8px;
+  background: #090b0e;
+}
+.official-platform-result.preferred { border-color: #66716f; }
+.official-platform-result > span,
+.official-platform-result > small { color: #8f98a4; font-size: var(--studio-font-sm); }
+.official-platform-result > strong { font-size: 13px; }
+.official-report-list { display: grid; gap: 10px; margin: 14px 0; }
+.official-report {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid #282d35;
+  border-radius: 8px;
+  background: #090b0e;
+}
+.official-report-meta { display: grid; gap: 4px; line-height: 1.45; }
+.official-report-notes > strong { font-size: 12px; }
+.official-report-notes > p {
+  margin: 6px 0 0;
+  color: #b9c0ca;
+  font-size: var(--studio-font-sm);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.official-report > a,
+.official-database-link { color: #d4d9e0; text-decoration: underline; text-underline-offset: 2px; }
+.official-database-link { display: inline-block; margin-top: 4px; }
+.smart-advisor {
+  display: grid;
+  gap: 10px;
+  margin: 16px 0;
+  padding: 14px;
+  border: 1px solid #303640;
+  border-radius: 9px;
+  background: linear-gradient(135deg, #11151a, #0a0c0f 70%);
+}
+.smart-advisor-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.smart-advisor-heading h3 { margin: 3px 0 0; }
+.smart-advisor-empty { color: #e2e5e9; }
+.smart-advisor-build,
+.smart-advisor-evidence { display: grid; gap: 5px; color: #aeb6c0; font-size: var(--studio-font-sm); line-height: 1.5; overflow-wrap: anywhere; }
+.smart-advisor-build > strong { color: #e4e8ed; }
+.smart-advisor-actions { align-items: center; }
+.smart-advisor-actions > a { color: #c6ccd4; font-size: var(--studio-font-sm); text-decoration: underline; text-underline-offset: 2px; }
+.smart-advisor-prs { display: grid; gap: 6px; color: #aeb6c0; font-size: var(--studio-font-sm); }
+.smart-advisor-prs > strong { color: #e1e5e9; }
+.smart-advisor-prs > div { display: flex; flex-wrap: wrap; gap: 7px; }
+.smart-advisor-prs a { color: #c6ccd4; }
+.library-official-compatibility {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0;
+  font-size: var(--studio-font-sm);
+}
+.library-official-compatibility > span,
+.library-official-compatibility > small { color: #929aa5; }
+.library-official-compatibility > strong { color: #e0e4e9; }
+.home-official-compatibility { color: #d5dbdf; }
+@media (max-width: 600px) {
+  .official-platform-results { grid-template-columns: 1fr; }
+  .official-compatibility-heading { align-items: flex-start; }
 }

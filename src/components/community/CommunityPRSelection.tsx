@@ -52,8 +52,9 @@ export function CommunityPRSelection({
   onCleanChange: (clean: boolean) => void;
 }) {
   if (!selectedPullRequests.length) return null;
-  const baseShas = new Set(review.map((detail) => detail.pull_request.base_sha));
-  const incompatibleBases = review.length === selectedPullRequests.length && baseShas.size > 1;
+  const hasDifferentReviewBases =
+    review.length === selectedPullRequests.length &&
+    new Set(review.map((detail) => detail.pull_request.base_sha)).size > 1;
 
   return (
     <>
@@ -64,7 +65,7 @@ export function CommunityPRSelection({
             {selectedPullRequests.length === 1 ? "" : "s"} selected
           </strong>
           <small>
-            Build target: {targetRepository || "Selected repository"} · {targetBranch || "default branch"}. Order:{" "}
+            Add to {targetRepository || "Selected repository"} · branch {targetBranch || "default branch"}. Apply order:{" "}
             {selectedPullRequests.map((pr) => `#${pr.number}`).join(" → ")}. Git
             worktrees isolate source files, not untrusted build code.
           </small>
@@ -98,12 +99,12 @@ export function CommunityPRSelection({
           disabled={busy || reviewLoading}
           onClick={onReview}
         >
-          {reviewLoading ? "Reviewing PR files…" : "Review combination"}
+          {reviewLoading ? "Reviewing PR files…" : "Review selection"}
         </button>
       </div>
       {review.length === selectedPullRequests.length && (
         <div className="panel pr-review">
-          <h3>Review before compiling</h3>
+          <h3>Review before building</h3>
           <p>
             Confirm the exact selected head SHAs and inspect build scripts and
             submodule changes. Compilation executes community source; the
@@ -168,9 +169,9 @@ export function CommunityPRSelection({
                 ))}
             </div>
           ))}
-          {incompatibleBases && (
+          {hasDifferentReviewBases && (
             <p className="diagnosis-note">
-              These PRs target different base commits. Select PRs with the same pinned base before building.
+              These PRs were reviewed against different commits. Studio will apply them in the selected order to the latest commit on their shared target branch; Git conflicts will stop the build.
             </p>
           )}
           <div className="formgrid pr-build-options">
@@ -210,10 +211,11 @@ export function CommunityPRSelection({
           </label>
           <button
             className="primary"
-            disabled={busy || reviewLoading || reviewHasMissingFiles(review) || incompatibleBases}
+            disabled={busy || reviewLoading || reviewHasMissingFiles(review)}
             onClick={() => onBuild(review)}
           >
-            <Play size={16} /> Compile reviewed PRs
+            <Play size={16} /> Build{" "}
+            {selectedPullRequests.length === 1 ? "selected PR" : "selected PRs"}
           </button>
         </div>
       )}

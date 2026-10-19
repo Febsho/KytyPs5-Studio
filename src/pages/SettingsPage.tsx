@@ -1,4 +1,5 @@
-import { useRef, useState, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { Settings } from "lucide-react";
 import type { AppUpdateInfo, ProfileCapabilities, StorageReport } from "../types/studio";
 import {
@@ -71,7 +72,21 @@ export function SettingsPage({
   onCheckAppUpdate,
 }: SettingsPageProps) {
   const [storageTask, setStorageTask] = useState<string | null>(null);
+  const [installedVersion, setInstalledVersion] = useState("Loading…");
   const storageTaskActive = useRef(false);
+  useEffect(() => {
+    let mounted = true;
+    void getVersion()
+      .then((version) => {
+        if (mounted) setInstalledVersion(version);
+      })
+      .catch(() => {
+        if (mounted) setInstalledVersion("Unavailable");
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
   const runStorageTask = (name: string, task: () => void | Promise<void>) => {
     if (storageTaskActive.current) return;
     storageTaskActive.current = true;
@@ -371,7 +386,7 @@ export function SettingsPage({
       </div>
       <div className="panel">
         <h3>About</h3>
-        <p>KytyPS5 Studio 0.1.0 · Linux foundation</p>
+        <p>KytyPS5 Studio {installedVersion} · Linux foundation</p>
         <p>
           Emulator source and games are supplied separately by the user. KytyPS5
           is GPL-2.0 licensed. Studio does not include firmware or games.

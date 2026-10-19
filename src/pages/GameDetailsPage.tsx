@@ -10,9 +10,12 @@ import type {
   ManualCompatibilityObservation,
   Repo,
   Session,
+  OfficialCompatibilityDetails,
+  OfficialCompatibilityIndex,
 } from "../types/studio";
 import { date, formatBytes, short } from "../utils/format";
 import { trophyGrade, trophyGrades } from "../utils/trophies";
+import { compatibilityOsLabel, compatibilityStatusLabel, normalizeTitleId, officialCompatibilityForGame, recommendVerifiedBuild } from "../utils/compatibility";
 
 type Tab = "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Cheats";
 export type GameDetailsPageProps = {
@@ -24,6 +27,9 @@ export type GameDetailsPageProps = {
   repos: Repo[];
   gameProfileEditor: ReactNode;
   gameCompatibility: GameCompatibility | null;
+  officialCompatibilityIndex?: OfficialCompatibilityIndex | null;
+  officialCompatibilityDetails?: OfficialCompatibilityDetails | null;
+  officialCompatibilityError?: string | null;
   manualOutcome: string;
   setManualOutcome: Dispatch<SetStateAction<string>>;
   manualNotes: string;
@@ -32,10 +38,13 @@ export type GameDetailsPageProps = {
   sessions: Session[];
   onBack: () => void;
   onLaunch: (gameId: number) => void;
+  onAddToSteam?: (game: Game) => void;
   onOpenGameFolder: () => void;
   onRefreshMetadata: () => void;
   onRemoveEntry: () => void;
   onSetPreferredBuild: (buildId: number | null) => void;
+  onActivateBuild?: (buildId: number) => void;
+  onBuildRecommendedSource?: (repoId: number) => void;
   onRecordObservation: () => void;
   onOpenSessionLog: (session: Session) => void;
   onInspectContent?: (gameId:number) => Promise<GameContent>;
@@ -55,6 +64,9 @@ export function GameDetailsPage({
   repos,
   gameProfileEditor,
   gameCompatibility,
+  officialCompatibilityIndex,
+  officialCompatibilityDetails,
+  officialCompatibilityError,
   manualOutcome,
   setManualOutcome,
   manualNotes,
@@ -63,10 +75,13 @@ export function GameDetailsPage({
   sessions,
   onBack,
   onLaunch,
+  onAddToSteam,
   onOpenGameFolder,
   onRefreshMetadata,
   onRemoveEntry,
   onSetPreferredBuild,
+  onActivateBuild,
+  onBuildRecommendedSource,
   onRecordObservation,
   onOpenSessionLog,
   onInspectContent,
@@ -143,6 +158,15 @@ export function GameDetailsPage({
       setCustomPatchBusy(false);
     }
   };
+  const recommendation = recommendVerifiedBuild(
+    currentGame,
+    officialCompatibilityDetails ?? null,
+    builds,
+    repos,
+  );
+  const exactLinuxReports = officialCompatibilityDetails?.reports.filter(
+    (report) => normalizeTitleId(report.titleId) === normalizeTitleId(currentGame.title_id) && report.os.trim().toLowerCase() === "linux",
+  ) ?? [];
   return (
     <section className="page game-details-page">
       <div className="game-details-header">
@@ -161,6 +185,11 @@ export function GameDetailsPage({
           >
             Settings
           </button>
+          {onAddToSteam && (
+            <button className="outline" onClick={() => onAddToSteam(currentGame)}>
+              Add to Steam
+            </button>
+          )}
           <button
             className="primary"
             disabled={currentGame.file_status === "Missing"}
@@ -357,6 +386,89 @@ export function GameDetailsPage({
       </div>}
       {gameDetailsTab === "Compatibility" && (
         <div className="panel compatibility-panel">
+          <section className="official-compatibility-section">
+            <div className="official-compatibility-heading">
+              <div>
+                <span className="eyebrow">OFFICIAL KYTYPS5 DATABASE</span>
+                <h2>Community compatibility</h2>
+              </div>
+              {officialCompatibilityIndex?.updated_at && <small>Cached {date(officialCompatibilityIndex.updated_at)}</small>}
+            </div>
+            {!currentGame.title_id && <p className="hint">A PS5 title ID (PPSA) is required to look up this game.</p>}
+            {currentGame.title_id && !officialCompatibilityIndex?.available && <p className="hint">{officialCompatibilityIndex?.error || "Compatibility data is unavailable."} No status has been inferred.</p>}
+            <section className="smart-advisor" aria-label="Smart fork and build recommendation">
+              <div className="smart-advisor-heading">
+                <div><span className="eyebrow">SMART FORK &amp; BUILD ADVISOR</span><h3>Linux-tested build</h3></div>
+                {recommendation && <strong className="official-status">{compatibilityStatusLabel(recommendation.status)}</strong>}
+              </div>
+              {!currentGame.title_id || !officialCompatibilityDetails ? <p className="hint">Waiting for an exact-title compatibility report.</p> : !recommendation ? <>
+                <strong className="smart-advisor-empty">Not enough data</strong>
+                <p className="hint">A recommendation requires an exact PPSA Linux report that names one tested source commit, plus a matching verified local build or checkout. GitHub activity, stars, PRs, and local process exits do not count as proof.</p>
+                {exactLinuxReports.length > 0 && <p className="hint">{exactLinuxReports.length} exact-title Linux {exactLinuxReports.length === 1 ? "report is" : "reports are"} available; none can be tied unambiguously to a verified local source commit.</p>}
+              </> : <>
+                <div className="smart-advisor-build">
+                  <strong>{recommendation.repo.owner}/{recommendation.repo.name}</strong>
+                  <span>{recommendation.kind === "installed" ? `${recommendation.build!.build_type} · ${recommendation.build!.commit_sha}` : `Source checkout · ${recommendation.testedSha}`}</span>
+                  <span>{recommendation.explanation}</span>
+                </div>
+                <div className="smart-advisor-evidence">
+                  <span>Tested {recommendation.report.testedDate || "date not reported"} · {compatibilityOsLabel(recommendation.report.os)}</span>
+                  <span>Tested version: {recommendation.report.testedVersion}</span>
+                  {recommendation.report.hardware && <span>Hardware: {recommendation.report.hardware}</span>}
+                  <span>Performance: See report notes; Studio does not normalize metrics across tests.</span>
+                  <span>Stability: No normalized stability measurement is published.</span>
+                </div>
+                {recommendation.report.notes?.trim() && <div className="official-report-notes"><strong>Test notes and known issues</strong><p>{recommendation.report.notes.trim()}</p></div>}
+                <div className="buttonrow smart-advisor-actions">
+                  {recommendation.kind === "installed" && recommendation.build && <>
+                    <button className="outline" onClick={() => onSetPreferredBuild(recommendation.build!.id)} disabled={currentGame.build_id === recommendation.build.id}>Use for this game</button>
+                    <button className="primary" onClick={() => onActivateBuild?.(recommendation.build!.id)} disabled={!onActivateBuild || recommendation.build.active}>{recommendation.build.active ? "Already active" : "Activate build"}</button>
+                  </>}
+                  {recommendation.kind === "build" && <button className="primary" onClick={() => onBuildRecommendedSource?.(recommendation.repo.id)} disabled={!onBuildRecommendedSource || !recommendation.repo.source_path}>Open Build Studio for this checkout</button>}
+                  <a href={`${recommendation.repo.url.replace(/\/$/, "")}/commit/${recommendation.testedSha}`} target="_blank" rel="noreferrer">View tested commit</a>
+                  {recommendation.report.source?.url && <a href={recommendation.report.source.url} target="_blank" rel="noreferrer">Open test report</a>}
+                </div>
+                {recommendation.build?.community_prs?.length ? <div className="smart-advisor-prs"><strong>Included community PRs</strong><span>Build provenance only; PR inclusion does not prove a game-specific fix.</span><div>{recommendation.build.community_prs.map((pr) => <a href={pr.url} target="_blank" rel="noreferrer" key={`${pr.number}-${pr.head_sha}`}>#{pr.number}</a>)}</div></div> : null}
+              </>}
+            </section>
+            {currentGame.title_id && officialCompatibilityIndex?.available && (() => {
+              const summary = officialCompatibilityForGame(currentGame, officialCompatibilityIndex);
+              const platformStatuses = summary?.os ?? {};
+              return <>
+                <div className="official-compatibility-summary">
+                  <strong className={`official-status status-${(summary?.status || "untested").toLowerCase().replaceAll(/[^a-z]+/g, "-")}`}>
+                    {compatibilityStatusLabel(summary?.status)}
+                  </strong>
+                  <span>{summary?.preferred_os === "linux" ? "Linux test prioritized" : Object.keys(platformStatuses).length ? "Best reported result · no Linux test" : "No official test report"}</span>
+                  {summary?.latest_tested && <span>Latest test {summary.latest_tested}</span>}
+                </div>
+                <div className="official-platform-results">
+                  {(["linux", "windows", "macos"] as const).map((os) => <div className={`official-platform-result ${os === "linux" ? "preferred" : ""}`} key={os}>
+                    <span>{compatibilityOsLabel(os)}</span>
+                    <strong>{compatibilityStatusLabel(platformStatuses[os])}</strong>
+                    {summary?.report_counts[os] !== undefined && <small>{summary.report_counts[os]} {summary.report_counts[os] === 1 ? "report" : "reports"}</small>}
+                  </div>)}
+                </div>
+                {officialCompatibilityError && <p className="hint">Detailed report unavailable: {officialCompatibilityError}</p>}
+                {!officialCompatibilityDetails && !officialCompatibilityError && <p className="hint">Loading official test details…</p>}
+                {officialCompatibilityDetails?.reports?.some((report) => normalizeTitleId(report.titleId) === normalizeTitleId(currentGame.title_id)) ? <div className="official-report-list">
+                  {[...officialCompatibilityDetails.reports].filter((report) => normalizeTitleId(report.titleId) === normalizeTitleId(currentGame.title_id)).sort((a, b) => Number(b.os === "linux") - Number(a.os === "linux")).map((report, index) => <article className="official-report" key={`${report.slug}-${index}`}>
+                    <div className="official-report-heading">
+                      <strong>{compatibilityOsLabel(report.os)} · {compatibilityStatusLabel(report.status)}</strong>
+                      <span>{report.testedDate}</span>
+                    </div>
+                    <div className="official-report-meta">
+                      <span>Emulator: {report.testedVersion || "Not specified"}</span>
+                      {report.hardware && <span>Hardware: {report.hardware}</span>}
+                    </div>
+                    {report.notes?.trim() && <div className="official-report-notes"><strong>Test details and known issues</strong><p>{report.notes.trim()}</p></div>}
+                    {report.source?.url && <a href={report.source.url} target="_blank" rel="noreferrer">{report.source.label || "Open source report"}</a>}
+                  </article>)}
+                </div> : officialCompatibilityDetails && <p className="hint">The official index has a status, but no detailed report is published for this exact title ID.</p>}
+                <a className="official-database-link" href="https://kytyps5.github.io/compatibility/" target="_blank" rel="noreferrer">Open official compatibility database</a>
+              </>;
+            })()}
+          </section>
           <h2>Compatibility evidence</h2>
           <div className="kv">
             <span>Supported path recognized</span>

@@ -102,10 +102,10 @@ describe("CommunityPRSelection", () => {
 
     expect(screen.getAllByText("src/vulkan.cpp")).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "Move PR 7 later" }));
-    fireEvent.click(screen.getByRole("button", { name: "Review combination" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review selection" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear" }));
     fireEvent.click(
-      screen.getByRole("button", { name: "Compile reviewed PRs" }),
+      screen.getByRole("button", { name: "Build selected PRs" }),
     );
     expect(onMove).toHaveBeenCalledWith(0, 1);
     expect(onReview).toHaveBeenCalledOnce();
@@ -123,7 +123,7 @@ describe("CommunityPRSelection", () => {
     expect(
       (
         screen.getByRole("button", {
-          name: "Compile reviewed PRs",
+          name: "Build selected PR",
         }) as HTMLButtonElement
       ).disabled,
     ).toBe(true);

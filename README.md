@@ -18,20 +18,30 @@ The screenshots show the games home page, installed emulator builds, and the sou
 - Clones and manages the official KytyPS5 repository and compatible forks.
 - Builds and keeps separate emulator versions, with controls to activate, compare, update, and remove them.
 - Finds Community Pull Requests, reviews their changes, and can build compatible PR combinations while recording their exact commits.
+- Matches games to the official KytyPS5 compatibility database by PPSA title ID and shows published test reports.
+- Recommends a fork build only when a Linux test report can be matched to an exact verified source commit.
 - Stores per-game launch options, session history, playtime, and emulator logs.
+- Adds games to Steam and shares the current game through Discord Rich Presence when enabled.
 - Shows host and Vulkan diagnostics to help troubleshoot build and launch problems.
 
-See the [0.2.0 release notes](CHANGELOG.md) for recent changes.
+See the [0.3.0 release notes](CHANGELOG.md) for this release's changes.
 
 Successful compilation or CLI verification does **not** guarantee that a game will run. Compatibility depends on the emulator, game, drivers, and system configuration.
+
+## Dedication and inspiration
+
+KytyPS5 Studio is dedicated to everyone building tools that make experimental
+PlayStation 5 projects easier to explore. Its interface and overall direction
+were inspired in part by [AnyPS5 Studio](https://github.com/Ramzyayman/AnyPS5-Studio).
+This is an independent project and is not affiliated with AnyPS5 Studio.
 
 ## Run the AppImage
 
 Download the Linux AppImage provided with the release, make it executable, and run it:
 
 ```sh
-chmod +x "KytyPS5 Studio_0.2.0_amd64.AppImage"
-./"KytyPS5 Studio_0.2.0_amd64.AppImage"
+chmod +x "KytyPS5 Studio_0.3.0_amd64.AppImage"
+./"KytyPS5 Studio_0.3.0_amd64.AppImage"
 ```
 
 The AppImage filename may change between releases. KytyPS5 emulator builds require a working Vulkan driver. Building the emulator from Studio also requires the development tools and libraries listed in the Build Studio dependency check.

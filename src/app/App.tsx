@@ -30,6 +30,8 @@ import type {
   BuildSourceInfo,
   Game,
   GameCompatibility,
+  OfficialCompatibilityDetails,
+  OfficialCompatibilityIndex,
   ManualCompatibilityObservation,
   AppUpdateInfo,
   Fork,
@@ -123,6 +125,11 @@ export function App() {
   const [gameScan, setGameScan] = useState<GameScanEvent | null>(null);
   const [gameCompatibility, setGameCompatibility] =
     useState<GameCompatibility | null>(null);
+  const [officialCompatibilityIndex, setOfficialCompatibilityIndex] =
+    useState<OfficialCompatibilityIndex | null>(null);
+  const [officialCompatibilityDetails, setOfficialCompatibilityDetails] =
+    useState<OfficialCompatibilityDetails | null>(null);
+  const [officialCompatibilityError, setOfficialCompatibilityError] = useState<string | null>(null);
   const [compatibilityObservations, setCompatibilityObservations] = useState<
     ManualCompatibilityObservation[]
   >([]);
@@ -135,6 +142,8 @@ export function App() {
   const [appUpdateInfo, setAppUpdateInfo] = useState<AppUpdateInfo | null>(null);
   const [appUpdateStatus, setAppUpdateStatus] = useState("Checking for updates when Studio starts…");
   const [appUpdateBusy, setAppUpdateBusy] = useState(false);
+  const [importMenuOpen, setImportMenuOpen] = useState(false);
+  const importMenuRef = useRef<HTMLDivElement>(null);
   const appUpdateInFlight = useRef(false);
   const [graphics, setGraphics] = useState<GraphicsDiagnostics | null>(null);
   const [repoUrl, setRepoUrl] = useState("");
@@ -297,6 +306,17 @@ export function App() {
     refresh,
     refreshBuilds,
   } = useStudioData(call);
+  useEffect(() => {
+    let disposed = false;
+    const refreshCompatibilityIndex = () => {
+      void invoke<OfficialCompatibilityIndex>("official_compatibility_index")
+        .then((result) => { if (!disposed) setOfficialCompatibilityIndex(result); })
+        .catch(() => { if (!disposed) setOfficialCompatibilityIndex({ available: false, updated_at: null, error: "The official compatibility database could not be reached and no offline cache is available.", games: [] }); });
+    };
+    refreshCompatibilityIndex();
+    const timer = window.setInterval(refreshCompatibilityIndex, 6 * 60 * 60 * 1000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, []);
   const trackedRepos = useMemo(() => repos.filter((repo) => !repo.removed), [repos]);
   const currentRepo = trackedRepos.find((r) => r.id === selectedRepo) || trackedRepos[0];
   useEffect(() => {
@@ -998,6 +1018,20 @@ export function App() {
       setMessage(`Could not refresh launcher session: ${String(error)}`);
     }
   };
+  const addGameToSteam = async (game: Game) => {
+    const image = await open({
+      multiple: false,
+      filters: [{ name: "Cover image", extensions: ["png", "jpg", "jpeg"] }],
+    });
+    if (typeof image !== "string") return;
+    await action(async () => {
+      const result = await call<string>("add_game_to_steam", {
+        gameId: game.id,
+        imagePath: image,
+      });
+      setMessage(result);
+    });
+  };
   const importDroppedPaths = async (paths: string[]) => {
     let imported = 0;
     let alreadyRegistered = 0;
@@ -1157,6 +1191,20 @@ export function App() {
         .catch(() => {});
   }, [currentGame?.id]);
   useEffect(() => {
+    setOfficialCompatibilityDetails(null);
+    setOfficialCompatibilityError(null);
+    if (!currentGame?.title_id) return;
+    let disposed = false;
+    const refreshDetails = () => {
+      void invoke<OfficialCompatibilityDetails | null>("official_compatibility_details", { titleId: currentGame.title_id })
+        .then((result) => { if (!disposed) { setOfficialCompatibilityDetails(result); setOfficialCompatibilityError(null); } })
+        .catch((error) => { if (!disposed) setOfficialCompatibilityError(String(error)); });
+    };
+    refreshDetails();
+    const timer = window.setInterval(refreshDetails, 6 * 60 * 60 * 1000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [currentGame?.id, currentGame?.title_id]);
+  useEffect(() => {
     setCompatibilityObservations([]);
     if (currentGame)
       call<ManualCompatibilityObservation[]>("compatibility_observations", {
@@ -1254,6 +1302,37 @@ export function App() {
         }
       });
   };
+  const chooseSingleGameFolder = async () => {
+    const chosen = await open({ directory: true, multiple: false });
+    setImportMenuOpen(false);
+    if (typeof chosen !== "string") return;
+    action(async () => {
+      await call("add_game", { path: chosen });
+      setMessage(
+        "Game registered; install size is being calculated in the background",
+      );
+    });
+  };
+  useEffect(() => {
+    if (!importMenuOpen) return;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (
+        event.target instanceof Node &&
+        !importMenuRef.current?.contains(event.target)
+      ) {
+        setImportMenuOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setImportMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [importMenuOpen]);
   const maximizeWindow = () => {
     void getCurrentWindow()
       .toggleMaximize()
@@ -1489,12 +1568,34 @@ export function App() {
           onNavigate={(id) => setPage(id as (typeof nav)[number]["id"])}
         />
         <div className="title-tools">
-          <button
-            className="title-action"
-            onClick={() => void choose("directory")}
-          >
-            <span>＋</span> Import
-          </button>
+          <div className="import-menu-wrap" ref={importMenuRef}>
+            <button
+              className="title-action"
+              aria-haspopup="menu"
+              aria-expanded={importMenuOpen}
+              onClick={() => setImportMenuOpen((open) => !open)}
+            >
+              <span>＋</span> Import
+            </button>
+            {importMenuOpen && (
+              <div className="import-menu" role="menu" aria-label="Import games">
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setImportMenuOpen(false);
+                    void choose("directory");
+                  }}
+                >
+                  <strong>Scan folder location</strong>
+                  <small>Find and import all supported games inside</small>
+                </button>
+                <button role="menuitem" onClick={() => void chooseSingleGameFolder()}>
+                  <strong>Add one game folder</strong>
+                  <small>Select a specific game folder to add</small>
+                </button>
+              </div>
+            )}
+          </div>
           <span
             className="title-controller"
             title={
@@ -1567,6 +1668,7 @@ export function App() {
           {page === "home" && (
             <HomePage
               games={publicGames}
+              officialCompatibilityIndex={officialCompatibilityIndex}
               featuredGame={featuredGame}
               featuredBackground={featuredBackground}
               active={active}
@@ -1579,6 +1681,7 @@ export function App() {
               setPage={setPage}
               choose={choose}
               launchGame={launchGame}
+              onAddToSteam={addGameToSteam}
               selectGameWithGuard={selectGameWithGuard}
               setGameDetailsTab={setGameDetailsTab}
               setHomeSelection={setHomeSelection}
@@ -1687,8 +1790,8 @@ export function App() {
                 <div>
                   <h3>Community PR Builds</h3>
                   <p>
-                    Review real GitHub pull requests and combine selected
-                    changes into an isolated experimental build.
+                    Select one or more GitHub pull requests and build them
+                    into an isolated version of the selected repository.
                   </p>
                 </div>
                 <button
@@ -1759,7 +1862,7 @@ export function App() {
                   </strong>
                 </span>
                 <span>
-                  <strong>{selectedPrs.length}</strong> selected in merge order
+                  <strong>{selectedPrs.length}</strong> selected for build
                 </span>
                 <span>
                   <strong>
@@ -1912,11 +2015,10 @@ export function App() {
                         `#${detail.pull_request.number} @ ${detail.pull_request.head_sha.slice(0, 12)}`,
                     )
                     .join(" + ");
-                  const base =
-                    review[0]?.pull_request.base_sha.slice(0, 12) ??
-                    "unknown base";
+                  const targetBranch =
+                    review[0]?.pull_request.base_branch ?? "target branch";
                   const approved = window.confirm(
-                    `Compile exactly ${reviewed} from base ${base}? This runs community code. Confirm only after reviewing all listed files.`,
+                    `Build exactly ${reviewed} in ${communityPrs?.repository ?? "the selected repository"} on ${targetBranch}. Studio applies the PRs in the selected order to the latest branch commit. This runs community code. Confirm only after reviewing all listed files.`,
                   );
                   if (approved && selectedRepo)
                     void runJob("start_community_build", {
@@ -2067,6 +2169,7 @@ export function App() {
               gameIcon={gameIcon}
               gameScan={gameScan}
               gameCompatibility={gameCompatibility}
+              officialCompatibilityIndex={officialCompatibilityIndex}
               inspectGameContent={inspectGameContent}
               query={query}
               setQuery={setQuery}
@@ -2107,6 +2210,7 @@ export function App() {
                 })
               }
               onLaunch={(id) => void launchGame(id)}
+              onAddToSteam={addGameToSteam}
               onToggleFavorite={(id) =>
                 action(() => call("toggle_favorite", { gameId: id }))
               }
@@ -2149,6 +2253,9 @@ export function App() {
               repos={repos}
               gameProfileEditor={gameProfileEditor}
               gameCompatibility={gameCompatibility}
+              officialCompatibilityIndex={officialCompatibilityIndex}
+              officialCompatibilityDetails={officialCompatibilityDetails}
+              officialCompatibilityError={officialCompatibilityError}
               manualOutcome={manualOutcome}
               setManualOutcome={setManualOutcome}
               manualNotes={manualNotes}
@@ -2157,6 +2264,7 @@ export function App() {
               sessions={sessions}
               onBack={() => setPage("library")}
               onLaunch={(gameId) => void launchGame(gameId)}
+              onAddToSteam={addGameToSteam}
               onOpenGameFolder={() =>
                 action(() =>
                   call("open_game_folder", { gameId: currentGame.id }),
@@ -2186,6 +2294,17 @@ export function App() {
                   call("set_game_build", { gameId: currentGame.id, buildId }),
                 )
               }
+              onActivateBuild={(buildId) =>
+                action(async () => {
+                  await call("activate_build", { id: buildId });
+                  await refreshBuilds();
+                  setMessage("Recommended emulator build activated");
+                })
+              }
+              onBuildRecommendedSource={(repoId) => {
+                setSelectedRepo(repoId);
+                setPage("build");
+              }}
               onRecordObservation={() =>
                 action(async () => {
                   await call("record_compatibility_observation", {

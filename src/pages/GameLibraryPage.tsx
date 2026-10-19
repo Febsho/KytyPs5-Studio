@@ -15,11 +15,13 @@ import type {
   GameCompatibility,
   GameContent,
   GameScanEvent,
+  OfficialCompatibilityIndex,
   Repo,
 } from "../types/studio";
 import { GameContextMenu, VirtualGameGrid } from "../components/games/GameLibrary";
 import { short } from "../utils/format";
 import { trophySummary } from "../utils/trophies";
+import { compatibilityStatusLabel, officialCompatibilityForGame } from "../utils/compatibility";
 
 export type GameLibraryPageProps = {
   games: Game[];
@@ -29,6 +31,7 @@ export type GameLibraryPageProps = {
   gameIcon: string | null;
   gameScan: GameScanEvent | null;
   gameCompatibility: GameCompatibility | null;
+  officialCompatibilityIndex?: OfficialCompatibilityIndex | null;
   inspectGameContent?: (gameId: number) => Promise<GameContent>;
   query: string;
   setQuery: Dispatch<SetStateAction<string>>;
@@ -52,6 +55,7 @@ export type GameLibraryPageProps = {
   onToggleFavorite: (id: number) => void;
   onSetPreferredBuild: (id: number | null) => void;
   onRemoveGame?: (id: number) => void;
+  onAddToSteam?: (game: Game) => void;
 };
 
 export function GameLibraryPage({
@@ -62,6 +66,7 @@ export function GameLibraryPage({
   gameIcon,
   gameScan,
   gameCompatibility,
+  officialCompatibilityIndex,
   inspectGameContent,
   query,
   setQuery,
@@ -83,6 +88,7 @@ export function GameLibraryPage({
   onToggleFavorite,
   onSetPreferredBuild,
   onRemoveGame,
+  onAddToSteam,
 }: GameLibraryPageProps) {
   const [contextMenu, setContextMenu] = useState<{ game: Game; x: number; y: number } | null>(null);
   const [trophyProgress, setTrophyProgress] = useState<ReturnType<typeof trophySummary> | null>(null);
@@ -192,6 +198,7 @@ export function GameLibraryPage({
             setContextMenu({ game, x: event.clientX, y: event.clientY });
           }}
           mode={libraryView}
+          compatibilityIndex={officialCompatibilityIndex}
         />
         {currentGame && filteredGames.some((game) => game.id === currentGame.id) && (
           <div className="panel detail">
@@ -214,6 +221,7 @@ export function GameLibraryPage({
               )}
             </div>
             <h2>{currentGame.title}</h2>
+            {officialCompatibilityIndex && officialCompatibilityForGame(currentGame, officialCompatibilityIndex) && <div className="library-official-compatibility"><span>Official compatibility</span><strong>{compatibilityStatusLabel(officialCompatibilityForGame(currentGame, officialCompatibilityIndex)?.status)}</strong><small>{officialCompatibilityForGame(currentGame, officialCompatibilityIndex)?.preferred_os === "linux" ? "Linux result" : Object.keys(officialCompatibilityForGame(currentGame, officialCompatibilityIndex)?.os ?? {}).length ? "Best available result" : "No report"}</small></div>}
             <p className="path">{currentGame.path}</p>
             <div className="library-detail-actions">
               <button
@@ -371,6 +379,10 @@ export function GameLibraryPage({
           onDetails={(game) => {
             setContextMenu(null);
             if (onSelectGame(game.id) !== false) onOpenDetails();
+          }}
+          onAddToSteam={(game) => {
+            setContextMenu(null);
+            onAddToSteam?.(game);
           }}
           onRemove={onRemoveGame ? (game) => {
             setContextMenu(null);

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0
+
+### Compatibility and recommendations
+
+- Integrated the official KytyPS5 compatibility database with PPSA matching, Linux-first results, report details, and offline caching.
+- Added the Smart Fork & Build Advisor. Recommendations require an exact Linux test report and a matching verified local build or checkout; unsupported guesses are shown as “Not enough data.”
+- Added report, tested-commit, and included community PR links, with explicit controls to use or activate a verified build.
+
+### Games and integrations
+
+- Added game-folder scanning and single-game import choices, plus whole-folder install-size calculation.
+- Added Steam shortcut integration and Discord Rich Presence with game artwork where metadata provides it.
+- Refined game library cards, compatibility details, and application focus styling.
+
+### Community builds
+
+- Improved Community PR build handling for selected changes based on different commits on the same target branch; selected PR order is retained and conflicts stop the build.
+
+### Notes
+
+- Compatibility recommendations reflect published reports and exact source commits. They do not promise gameplay, and the Studio does not infer performance or stability from stars, commit activity, or PR inclusion.
+- KytyPS5 Studio manages emulator sources and builds; it does not include the emulator source, games, or firmware.
+
 ## 0.2.0
 
 ### Games and library

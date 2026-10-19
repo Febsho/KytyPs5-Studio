@@ -8,10 +8,12 @@ import type {
   GraphicsDiagnostics,
   Repo,
   System,
+  OfficialCompatibilityIndex,
 } from "../types/studio";
 import { GameContextMenu, HomeGameTile } from "../components/games/GameLibrary";
 import { date, formatBytes, short } from "../utils/format";
 import { trophySummary } from "../utils/trophies";
+import { compatibilityBadgeLabel, officialCompatibilityForGame } from "../utils/compatibility";
 
 type Page =
   | "home"
@@ -25,6 +27,7 @@ type Page =
   | "game-details";
 export type HomePageProps = {
   games: Game[];
+  officialCompatibilityIndex?: OfficialCompatibilityIndex | null;
   featuredGame: Game | null;
   featuredBackground: string | null;
   active?: Build;
@@ -44,12 +47,14 @@ export type HomePageProps = {
   setHomeSelection: Dispatch<SetStateAction<number | null>>;
   inspectGameContent?: (gameId:number) => Promise<GameContent>;
   onRemoveGame?: (gameId: number) => void;
+  onAddToSteam?: (game: Game) => void;
   runningGameId?: number;
   onShowRunningSession?: () => void;
 };
 
 export function HomePage({
   games,
+  officialCompatibilityIndex,
   featuredGame,
   featuredBackground,
   active,
@@ -67,6 +72,7 @@ export function HomePage({
   setHomeSelection,
   inspectGameContent,
   onRemoveGame,
+  onAddToSteam,
   runningGameId,
   onShowRunningSession,
 }: HomePageProps) {
@@ -103,6 +109,7 @@ export function HomePage({
               <HomeGameTile
                 key={game.id}
                 game={game}
+                compatibilityIndex={officialCompatibilityIndex}
                 selected={featuredGame?.id === game.id}
                 onSelect={() => setHomeSelection(game.id)}
                 onContextMenu={(selected, event) => {
@@ -126,6 +133,7 @@ export function HomePage({
       {featuredGame && <div className="home-feature">
         <div className="home-game-meta">
           {featuredGame?.title_id && <span>{featuredGame.title_id}</span>}
+          {featuredGame && officialCompatibilityIndex && officialCompatibilityForGame(featuredGame, officialCompatibilityIndex) && <span className="home-official-compatibility">{compatibilityBadgeLabel(officialCompatibilityForGame(featuredGame, officialCompatibilityIndex))}</span>}
           {featuredGame?.game_version && (
             <span>VERSION {featuredGame.game_version}</span>
           )}
@@ -220,6 +228,10 @@ export function HomePage({
             if (selectGameWithGuard(game.id) === false) return;
             setGameDetailsTab("Overview");
             setPage("game-details");
+          }}
+          onAddToSteam={(game) => {
+            setContextMenu(null);
+            onAddToSteam?.(game);
           }}
           onRemove={onRemoveGame ? (game) => {
             setContextMenu(null);

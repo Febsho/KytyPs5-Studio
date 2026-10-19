@@ -1,9 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
-import { Gamepad2, Trash2 } from "lucide-react";
-import type { Game } from "../../types/studio";
+import { Gamepad2, Trash2, ExternalLink } from "lucide-react";
+import type { Game, OfficialCompatibilityIndex } from "../../types/studio";
 import { getGridColumnCount, getVirtualWindow } from "./virtualWindow";
 import { date, formatBytes } from "../../utils/format";
+import { compatibilityBadgeLabel, officialCompatibilityForGame } from "../../utils/compatibility";
 import { loadGameIcon, retainGameIcon } from "../../services/gameArtwork";
 
 export function GameContextMenu({
@@ -12,6 +13,7 @@ export function GameContextMenu({
   y,
   onClose,
   onDetails,
+  onAddToSteam,
   onRemove,
 }: {
   game: Game;
@@ -19,6 +21,7 @@ export function GameContextMenu({
   y: number;
   onClose: () => void;
   onDetails: (game: Game) => void;
+  onAddToSteam?: (game: Game) => void;
   onRemove?: (game: Game) => void;
 }) {
   const menu = useRef<HTMLDivElement>(null);
@@ -42,11 +45,16 @@ export function GameContextMenu({
       className="game-context-menu"
       role="menu"
       aria-label={`${game.title} actions`}
-      style={{ left: Math.min(x, window.innerWidth - 216), top: Math.min(y, window.innerHeight - 112) }}
+      style={{ left: Math.min(x, window.innerWidth - 216), top: Math.min(y, window.innerHeight - 160) }}
     >
       <button role="menuitem" onClick={() => onDetails(game)}>
         Game details
       </button>
+      {onAddToSteam && (
+        <button role="menuitem" onClick={() => onAddToSteam(game)}>
+          <ExternalLink size={14} /> Add to Steam
+        </button>
+      )}
       {onRemove && (
         <button className="danger-action" role="menuitem" onClick={() => onRemove(game)}>
           <Trash2 size={14} /> Remove from library
@@ -62,12 +70,14 @@ export function GameCard({
   onSelect,
   onContextMenu,
   mode,
+  compatibilityIndex,
 }: {
   game: Game;
   selected: boolean;
   onSelect: () => void;
   onContextMenu?: (game: Game, event: ReactMouseEvent<HTMLButtonElement>) => void;
   mode: "grid" | "list";
+  compatibilityIndex?: OfficialCompatibilityIndex | null;
 }) {
   const element = useRef<HTMLButtonElement>(null);
   const [icon, setIcon] = useState<string | null>(null);
@@ -121,6 +131,11 @@ export function GameCard({
         ) : (
           <Gamepad2 />
         )}
+        {compatibilityIndex && officialCompatibilityForGame(game, compatibilityIndex) && (
+          <span className="official-compatibility-badge">
+            {compatibilityBadgeLabel(officialCompatibilityForGame(game, compatibilityIndex))}
+          </span>
+        )}
       </div>
       <strong>{game.title}</strong>
       <small>
@@ -140,11 +155,13 @@ export function HomeGameTile({
   selected,
   onSelect,
   onContextMenu,
+  compatibilityIndex,
 }: {
   game: Game;
   selected: boolean;
   onSelect: () => void;
   onContextMenu?: (game: Game, event: ReactMouseEvent<HTMLButtonElement>) => void;
+  compatibilityIndex?: OfficialCompatibilityIndex | null;
 }) {
   const [icon, setIcon] = useState<string | null>(null);
   useEffect(() => {
@@ -172,6 +189,11 @@ export function HomeGameTile({
         ) : (
           <Gamepad2 size={25} />
         )}
+        {compatibilityIndex && officialCompatibilityForGame(game, compatibilityIndex) && (
+          <span className="official-compatibility-badge">
+            {compatibilityBadgeLabel(officialCompatibilityForGame(game, compatibilityIndex))}
+          </span>
+        )}
         <span className="home-game-title">{game.title}</span>
       </span>
     </button>
@@ -183,12 +205,14 @@ export function VirtualGameGrid({
   onSelect,
   onContextMenu,
   mode,
+  compatibilityIndex,
 }: {
   games: Game[];
   selectedId: number | undefined;
   onSelect: (id: number) => void;
   onContextMenu?: (game: Game, event: ReactMouseEvent<HTMLButtonElement>) => void;
   mode: "grid" | "list";
+  compatibilityIndex?: OfficialCompatibilityIndex | null;
 }) {
   const grid = useRef<HTMLDivElement>(null);
   const [viewport, setViewport] = useState({
@@ -349,6 +373,7 @@ export function VirtualGameGrid({
           onSelect={() => onSelect(game.id)}
           onContextMenu={onContextMenu}
           mode={mode}
+          compatibilityIndex={compatibilityIndex}
         />
       ))}
       {endRow < totalRows && (

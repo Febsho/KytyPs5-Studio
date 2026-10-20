@@ -21,7 +21,7 @@ import type {
 import { GameContextMenu, VirtualGameGrid } from "../components/games/GameLibrary";
 import { short } from "../utils/format";
 import { trophySummary } from "../utils/trophies";
-import { compatibilityStatusLabel, officialCompatibilityForGame } from "../utils/compatibility";
+import { compatibilityOsLabel, compatibilityStatusLabel, currentCompatibilityOS, officialCompatibilityForGame } from "../utils/compatibility";
 
 export type GameLibraryPageProps = {
   games: Game[];
@@ -221,7 +221,7 @@ export function GameLibraryPage({
               )}
             </div>
             <h2>{currentGame.title}</h2>
-            {officialCompatibilityIndex && officialCompatibilityForGame(currentGame, officialCompatibilityIndex) && <div className="library-official-compatibility"><span>Official compatibility</span><strong>{compatibilityStatusLabel(officialCompatibilityForGame(currentGame, officialCompatibilityIndex)?.status)}</strong><small>{officialCompatibilityForGame(currentGame, officialCompatibilityIndex)?.preferred_os === "linux" ? "Linux result" : Object.keys(officialCompatibilityForGame(currentGame, officialCompatibilityIndex)?.os ?? {}).length ? "Best available result" : "No report"}</small></div>}
+            {officialCompatibilityIndex && officialCompatibilityForGame(currentGame, officialCompatibilityIndex) && <div className="library-official-compatibility"><span>Official compatibility</span><strong>{compatibilityStatusLabel(officialCompatibilityForGame(currentGame, officialCompatibilityIndex)?.status)}</strong><small>{officialCompatibilityForGame(currentGame, officialCompatibilityIndex)?.preferred_os === currentCompatibilityOS() ? `${compatibilityOsLabel(currentCompatibilityOS())} result` : Object.keys(officialCompatibilityForGame(currentGame, officialCompatibilityIndex)?.os ?? {}).length ? "Best available result" : "No report"}</small></div>}
             <p className="path">{currentGame.path}</p>
             <div className="library-detail-actions">
               <button

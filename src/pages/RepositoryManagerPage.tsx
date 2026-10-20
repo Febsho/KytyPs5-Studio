@@ -89,7 +89,7 @@ export function RepositoryManagerPage({
             <span>OFFICIAL</span>
           </div>
           <h3>KytyPS5 / KytyPS5</h3>
-          <p>The upstream PlayStation 5 translation layer for Linux.</p>
+          <p>The upstream open-source PlayStation 5 translation layer.</p>
           <button className="outline" onClick={onAddOfficialRepository}>
             Select Official Source
           </button>

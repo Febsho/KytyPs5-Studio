@@ -10,6 +10,15 @@ export type SmartBuildRecommendation = {
   explanation: string;
 };
 
+export type CompatibilityOS = "linux" | "windows" | "macos";
+
+export function currentCompatibilityOS(): CompatibilityOS {
+  const userAgent = typeof navigator === "undefined" ? "" : navigator.userAgent.toLowerCase();
+  if (userAgent.includes("windows")) return "windows";
+  if (userAgent.includes("macintosh") || userAgent.includes("mac os")) return "macos";
+  return "linux";
+}
+
 const compatibilityStage = (status: string): number => {
   switch (status.trim().toLowerCase().replaceAll("_", "-").replaceAll(" ", "-")) {
     case "playable": return 5;
@@ -33,7 +42,7 @@ function sameCommit(commit: string | null | undefined, testedSha: string): boole
 }
 
 /**
- * Only recommend builds with a Linux report whose testedVersion names exactly
+ * Only recommend builds with a host-OS report whose testedVersion names exactly
  * one source commit. Session exits, stars, PRs, and recent activity are never
  * used as compatibility or performance evidence.
  */
@@ -42,6 +51,7 @@ export function recommendVerifiedBuild(
   details: OfficialCompatibilityDetails | null,
   builds: Build[],
   repos: Repo[],
+  hostOS: CompatibilityOS = currentCompatibilityOS(),
 ): SmartBuildRecommendation | null {
   const titleId = normalizeTitleId(game.title_id);
   if (!titleId || !details) return null;
@@ -51,7 +61,7 @@ export function recommendVerifiedBuild(
   for (const report of details.reports) {
     if (
       normalizeTitleId(report.titleId) !== titleId ||
-      report.os.trim().toLowerCase() !== "linux"
+      report.os.trim().toLowerCase() !== hostOS
     ) continue;
     const sha = oneExplicitCommit(report.testedVersion);
     if (!sha || compatibilityStage(report.status) <= 1) continue;
@@ -67,7 +77,7 @@ export function recommendVerifiedBuild(
       if (!repo) continue;
       candidates.push({
         kind: "installed", build, repo, report, testedSha, status: report.status,
-        explanation: "This installed build’s exact source commit is named by a Linux compatibility report.",
+        explanation: `This installed build’s exact source commit is named by a ${hostOS} compatibility report.`,
       });
     }
     for (const repo of trackedRepos) {
@@ -75,7 +85,7 @@ export function recommendVerifiedBuild(
       if (candidates.some((candidate) => candidate.testedSha === testedSha && candidate.kind === "installed" && candidate.repo.id === repo.id)) continue;
       candidates.push({
         kind: "build", build: null, repo, report, testedSha, status: report.status,
-        explanation: "This checked-out source commit is named by a Linux compatibility report; building it creates a candidate installation, not a guarantee of identical runtime behavior.",
+        explanation: `This checked-out source commit is named by a ${hostOS} compatibility report; building it creates a candidate installation, not a guarantee of identical runtime behavior.`,
       });
     }
   }
@@ -138,6 +148,8 @@ export function compatibilityBadgeLabel(entry: OfficialCompatibilityGame | null)
   if (!entry) return "";
   const status = compatibilityStatusLabel(entry.status);
   if (entry.preferred_os === "linux") return `Linux · ${status}`;
+  if (entry.preferred_os === "windows") return `Windows · ${status}`;
+  if (entry.preferred_os === "macos") return `macOS · ${status}`;
   return Object.keys(entry.os).length ? `Overall · ${status}` : status;
 }
 

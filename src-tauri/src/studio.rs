@@ -1,17 +1,18 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::{fd::AsRawFd, unix::net::UnixStream, unix::process::CommandExt};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
     ffi::OsString,
     fs,
     io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write},
-    os::fd::AsRawFd,
-    os::unix::fs::MetadataExt,
-    os::unix::fs::PermissionsExt,
-    os::unix::net::UnixStream,
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -22,6 +23,32 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager};
+#[cfg(windows)]
+trait ProcessGroupCommandExt {
+    fn process_group(&mut self, group_id: i32) -> &mut Command;
+}
+#[cfg(windows)]
+impl ProcessGroupCommandExt for Command {
+    fn process_group(&mut self, _group_id: i32) -> &mut Command {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
+        self.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED)
+    }
+}
+#[cfg(any(windows, test))]
+#[cfg_attr(test, allow(dead_code))]
+#[path = "platform/windows_build.rs"]
+mod windows_build;
+#[cfg(windows)]
+#[path = "platform/windows_credentials.rs"]
+mod windows_credentials;
+#[cfg(windows)]
+#[path = "platform/windows_diagnostics.rs"]
+mod windows_diagnostics;
+#[cfg(windows)]
+#[path = "platform/windows_process.rs"]
+mod windows_process;
 
 #[cfg(test)]
 const OFFICIAL: &str = "https://github.com/KytyPS5/KytyPS5";
@@ -31,10 +58,130 @@ fn now() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // Keep replacement atomic and ask Windows to flush the move before returning.
+    const MOVEFILE_REPLACE_EXISTING_AND_WRITE_THROUGH: u32 = 0x1 | 0x8;
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING_AND_WRITE_THROUGH,
+        )
+    } != 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Globalization::CompareStringOrdinal;
+
+        fn separator(unit: u16) -> bool {
+            unit == b'\\' as u16 || unit == b'/' as u16
+        }
+
+        let path = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        let root = root.as_os_str().encode_wide().collect::<Vec<_>>();
+        let mut root_len = root.len();
+        while root_len > 1 && separator(root[root_len - 1]) {
+            root_len -= 1;
+        }
+        if root_len == 0 || path.len() < root_len {
+            return false;
+        }
+        let Ok(root_len_i32) = i32::try_from(root_len) else {
+            return false;
+        };
+        if unsafe {
+            CompareStringOrdinal(path.as_ptr(), root_len_i32, root.as_ptr(), root_len_i32, 1)
+        } != 2
+        {
+            return false;
+        }
+        path.len() == root_len || separator(path[root_len])
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(root)
+    }
+}
+fn paths_equal(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        path_starts_with(left, right) && path_starts_with(right, left)
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+fn emulator_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "kyty_emulator.exe"
+    } else {
+        "kyty_emulator"
+    }
+}
+fn emulator_executable(directory: &Path) -> PathBuf {
+    directory.join(emulator_binary_name())
+}
+fn is_emulator_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(windows)]
+    {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    }
+}
+#[cfg(unix)]
 fn home() -> Result<PathBuf, String> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or("HOME is unavailable".into())
+}
+#[cfg(windows)]
+fn home() -> Result<PathBuf, String> {
+    env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let drive = env::var_os("HOMEDRIVE")?;
+            let path = env::var_os("HOMEPATH")?;
+            Some(PathBuf::from(drive).join(path))
+        })
+        .ok_or_else(|| "USERPROFILE is unavailable".to_string())
 }
 #[derive(Clone)]
 struct Paths {
@@ -45,6 +192,7 @@ struct Paths {
 impl Paths {
     fn new() -> Result<Self, String> {
         let h = home()?;
+        #[cfg(unix)]
         let path = |key: &str, fallback: &str| {
             env::var_os(key)
                 .filter(|v| !v.is_empty())
@@ -52,15 +200,35 @@ impl Paths {
                 .unwrap_or_else(|| h.join(fallback))
                 .join("kytyps5-studio")
         };
+        #[cfg(unix)]
         let p = Self {
             data: path("XDG_DATA_HOME", ".local/share"),
             cache: path("XDG_CACHE_HOME", ".cache"),
             config: path("XDG_CONFIG_HOME", ".config"),
         };
+        #[cfg(windows)]
+        let p = Self::from_windows_roots(
+            env::var_os("LOCALAPPDATA")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| h.join("AppData").join("Local")),
+            env::var_os("APPDATA")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| h.join("AppData").join("Roaming")),
+        );
         for d in [&p.data, &p.cache, &p.config] {
             fs::create_dir_all(d).map_err(|e| e.to_string())?;
         }
         Ok(p)
+    }
+    #[cfg(windows)]
+    fn from_windows_roots(local: PathBuf, roaming: PathBuf) -> Self {
+        Self {
+            data: local.join("kytyps5-studio"),
+            cache: local.join("kytyps5-studio").join("Cache"),
+            config: roaming.join("kytyps5-studio"),
+        }
     }
     fn db(&self) -> Result<Connection, String> {
         let mut db =
@@ -852,26 +1020,28 @@ fn build_for_game(c: &Connection, game_id: i64) -> Result<Build, String> {
 }
 
 fn capabilities_for_build(b: &Build) -> Result<ProfileCapabilities, String> {
-    let exe = Path::new(&b.path).join("kyty_emulator");
+    let exe = emulator_executable(Path::new(&b.path));
     let canonical = fs::canonicalize(&exe).map_err(|e| e.to_string())?;
     let metadata = fs::metadata(&canonical).map_err(|e| e.to_string())?;
+    #[cfg(windows)]
     let modified = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    let key = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}",
-        canonical.display(),
+    #[cfg(unix)]
+    let identity = format!(
+        "{}:{}:{}:{}:{}",
         metadata.dev(),
         metadata.ino(),
-        metadata.len(),
-        modified,
         metadata.permissions().mode(),
         metadata.ctime(),
         metadata.ctime_nsec()
     );
+    #[cfg(windows)]
+    let identity = modified.to_string();
+    let key = format!("{}:{}:{}", canonical.display(), metadata.len(), identity);
     static CACHE: std::sync::OnceLock<Mutex<HashMap<String, ProfileCapabilities>>> =
         std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1287,6 +1457,7 @@ static SESSION_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
 struct Jobs {
     pid: AtomicI32,
     active: AtomicBool,
+    updating: AtomicBool,
     job_id: AtomicU64,
     event_kind: Mutex<String>,
     cancel_requested: AtomicBool,
@@ -1300,6 +1471,9 @@ fn begin_job(
     event_kind: &str,
 ) -> Result<u64, String> {
     let _control = jobs.control.lock().map_err(|error| error.to_string())?;
+    if jobs.updating.load(Ordering::SeqCst) {
+        return Err("KytyPS5 Studio is preparing an application update".into());
+    }
     if jobs.active.swap(true, Ordering::SeqCst) {
         return Err(message.to_string());
     }
@@ -1312,6 +1486,7 @@ fn begin_job(
     ACTIVE_JOB_ID.store(job_id, Ordering::SeqCst);
     Ok(job_id)
 }
+#[cfg(unix)]
 fn terminate_process_group(pid: i32) -> std::io::Result<()> {
     let result = unsafe { libc::kill(-pid, libc::SIGTERM) };
     if result == 0 {
@@ -1320,6 +1495,7 @@ fn terminate_process_group(pid: i32) -> std::io::Result<()> {
         Err(std::io::Error::last_os_error())
     }
 }
+#[cfg(unix)]
 fn process_group_exists(pgid: i32) -> bool {
     if Path::new("/proc").is_dir() {
         return fs::read_dir("/proc").ok().is_some_and(|entries| {
@@ -1328,7 +1504,7 @@ fn process_group_exists(pgid: i32) -> bool {
                     return false;
                 };
                 proc_stat(pid).is_some_and(|stat| {
-                    stat.process_group == pgid && !matches!(stat.state, 'Z' | 'X')
+                    stat.process_group == i64::from(pgid) && !matches!(stat.state, 'Z' | 'X')
                 })
             })
         });
@@ -1336,6 +1512,7 @@ fn process_group_exists(pgid: i32) -> bool {
     let result = unsafe { libc::kill(-pgid, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
+#[cfg(target_os = "linux")]
 fn child_exit_observed(pid: u32) -> Result<bool, String> {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     loop {
@@ -1358,6 +1535,7 @@ fn child_exit_observed(pid: u32) -> Result<bool, String> {
         return Err(format!("Could not inspect child process status: {error}"));
     }
 }
+#[cfg(unix)]
 fn stop_process_group(pid: i32) -> Result<(), String> {
     // The caller has verified that pid is the session leader for this exact
     // process incarnation. Launches use process_group(0), so this group is
@@ -1390,6 +1568,69 @@ fn stop_process_group(pid: i32) -> Result<(), String> {
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+fn attach_owned_child(child: &mut std::process::Child) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if let Err(error) = windows_process::attach_child(child.id()) {
+            let kill = child.kill().err();
+            let wait = child.wait().err();
+            return Err(format!(
+                "Could not establish Windows process-tree ownership: {error}{}{}",
+                kill.map(|error| format!("; child kill failed: {error}"))
+                    .unwrap_or_default(),
+                wait.map(|error| format!("; child wait failed: {error}"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = child;
+    Ok(())
+}
+/// Windows children must not run before they are assigned to their
+/// kill-on-close Job Object. `attach_owned_child` resumes the primary thread
+/// only after assignment succeeds, so every managed spawn must set
+/// CREATE_SUSPENDED before calling `Command::spawn`.
+fn prepare_owned_child(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        // `creation_flags` replaces the previously requested custom flags.
+        // Preserve the Windows process-group isolation set by
+        // `ProcessGroupCommandExt::process_group` while ensuring the process
+        // cannot run before Job Object assignment.
+        command.creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+#[cfg(windows)]
+fn stop_process_group(pid: i32) -> Result<(), String> {
+    let pid = windows_pid_from_job_slot(pid).ok_or("Invalid Windows process ID")?;
+    windows_process::terminate_child(pid)
+}
+#[cfg(windows)]
+fn release_owned_child(pid: i32) {
+    if let Some(pid) = windows_pid_from_job_slot(pid) {
+        windows_process::release_child(pid);
+    }
+}
+#[cfg(any(windows, test))]
+fn windows_pid_from_job_slot(pid: i32) -> Option<u32> {
+    (pid != 0).then_some(pid as u32)
+}
+fn stop_and_reap_owned_child(
+    child: &mut std::process::Child,
+) -> (Result<(), String>, Result<std::process::ExitStatus, String>) {
+    let pid = child.id() as i32;
+    let cleanup = stop_process_group(pid);
+    let wait = child.wait().map_err(|error| error.to_string());
+    #[cfg(windows)]
+    release_owned_child(pid);
+    (cleanup, wait)
 }
 #[cfg(target_os = "linux")]
 fn wait_for_child_and_cleanup_group(
@@ -1432,10 +1673,12 @@ fn wait_for_child_and_cleanup_group(
     group_cleaned: impl FnOnce(),
 ) -> Result<(std::process::ExitStatus, Result<(), String>), String> {
     let pid = child.id() as i32;
-    let status = child.wait().map_err(|error| error.to_string())?;
+    let status = child.wait().map_err(|error| error.to_string());
     let cleanup = stop_process_group(pid);
     group_cleaned();
-    Ok((status, cleanup))
+    #[cfg(windows)]
+    release_owned_child(pid);
+    status.map(|status| (status, cleanup))
 }
 #[derive(Default)]
 struct ProcessSamples(Mutex<HashMap<i64, ProcessSample>>);
@@ -1555,6 +1798,7 @@ impl SessionLogWriter {
         Ok(())
     }
 }
+#[cfg(unix)]
 fn set_nonblocking_fd(fd: i32) -> std::io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
@@ -1563,6 +1807,24 @@ fn set_nonblocking_fd(fd: i32) -> std::io::Result<()> {
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    Ok(())
+}
+#[cfg(unix)]
+fn configure_session_output(child: &std::process::Child) -> std::io::Result<()> {
+    child
+        .stdout
+        .as_ref()
+        .map(|stream| set_nonblocking_fd(stream.as_raw_fd()))
+        .transpose()?;
+    child
+        .stderr
+        .as_ref()
+        .map(|stream| set_nonblocking_fd(stream.as_raw_fd()))
+        .transpose()?;
+    Ok(())
+}
+#[cfg(windows)]
+fn configure_session_output(_child: &std::process::Child) -> std::io::Result<()> {
     Ok(())
 }
 const PROCESS_OUTPUT_LINE_MAX_BYTES: usize = 64 * 1024;
@@ -1653,7 +1915,7 @@ fn spawn_session_output_reader<R>(
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()>
 where
-    R: Read + std::os::fd::AsRawFd + Send + 'static,
+    R: Read + Send + 'static,
 {
     thread::spawn(move || {
         let mut reader = CappedOutputReader::new(stream);
@@ -1708,11 +1970,12 @@ fn write_session_output(
 #[derive(Clone, Copy, Debug)]
 struct ProcStat {
     state: char,
-    process_group: i32,
+    process_group: i64,
     cpu_ticks: u64,
     start_ticks: u64,
     resident_bytes: u64,
 }
+#[cfg(unix)]
 fn parse_proc_stat(contents: &str, page_size: u64) -> Option<ProcStat> {
     let close = contents.rfind(')')?;
     let fields: Vec<_> = contents.get(close + 1..)?.split_whitespace().collect();
@@ -1724,12 +1987,13 @@ fn parse_proc_stat(contents: &str, page_size: u64) -> Option<ProcStat> {
     let resident_pages = fields.get(21)?.parse::<i64>().ok()?.max(0) as u64;
     Some(ProcStat {
         state,
-        process_group,
+        process_group: i64::from(process_group),
         cpu_ticks: user_ticks.saturating_add(system_ticks),
         start_ticks,
         resident_bytes: resident_pages.saturating_mul(page_size),
     })
 }
+#[cfg(unix)]
 fn proc_stat(pid: u32) -> Option<ProcStat> {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page_size <= 0 {
@@ -1738,14 +2002,30 @@ fn proc_stat(pid: u32) -> Option<ProcStat> {
     let contents = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_proc_stat(&contents, page_size as u64)
 }
+#[cfg(unix)]
 fn process_executable_matches(pid: u32, expected_executable: &Path) -> bool {
     fs::canonicalize(format!("/proc/{pid}/exe"))
         .ok()
         .zip(fs::canonicalize(expected_executable).ok())
         .is_some_and(|(actual, expected)| actual == expected)
 }
+#[cfg(windows)]
+fn proc_stat(pid: u32) -> Option<ProcStat> {
+    let snapshot = windows_process::snapshot(pid)?;
+    Some(ProcStat {
+        state: if snapshot.running { 'R' } else { 'Z' },
+        process_group: i64::from(pid),
+        cpu_ticks: snapshot.cpu_time_100ns,
+        start_ticks: snapshot.creation_time,
+        resident_bytes: snapshot.resident_bytes,
+    })
+}
+#[cfg(windows)]
+fn process_executable_matches(pid: u32, expected_executable: &Path) -> bool {
+    windows_process::matches_executable(pid, expected_executable)
+}
 fn verified_session_process(
-    pid: i32,
+    pid: i64,
     expected_start: Option<i64>,
     actual: ProcStat,
     executable_matches: bool,
@@ -1804,7 +2084,7 @@ fn stop_verified_session_group(
     let pidfd = PidFd(descriptor as std::os::fd::RawFd);
     let actual = proc_stat(pid as u32).ok_or("The emulator process has already exited")?;
     if !verified_session_process(
-        pid,
+        i64::from(pid),
         expected_start,
         actual,
         process_executable_matches(pid as u32, expected_executable),
@@ -1965,10 +2245,12 @@ fn incomplete_build_installations(
                 return None;
             }
             let canonical = fs::canonicalize(path).ok()?;
-            if canonical == canonical_root
-                || !canonical.starts_with(&canonical_root)
-                || registered_paths.contains(&canonical)
-                || canonical.join("kyty_emulator").exists()
+            if paths_equal(&canonical, &canonical_root)
+                || !path_starts_with(&canonical, &canonical_root)
+                || registered_paths
+                    .iter()
+                    .any(|registered| paths_equal(registered, &canonical))
+                || canonical.join(emulator_binary_name()).exists()
             {
                 return None;
             }
@@ -1992,7 +2274,7 @@ fn registered_build_paths(
         if let Ok(path) = fs::canonicalize(row.map_err(|error| error.to_string())?) {
             if canonical_root
                 .as_ref()
-                .is_some_and(|root| path.starts_with(root) && path != *root)
+                .is_some_and(|root| path_starts_with(&path, root) && !paths_equal(&path, root))
             {
                 paths.insert(path);
             }
@@ -2075,7 +2357,9 @@ fn remove_managed_temp_directory(path: &Path, root: &Path) -> Result<u64, String
     }
     let canonical_root = fs::canonicalize(root).map_err(|error| error.to_string())?;
     let canonical_path = fs::canonicalize(path).map_err(|error| error.to_string())?;
-    if canonical_path == canonical_root || !canonical_path.starts_with(&canonical_root) {
+    if paths_equal(&canonical_path, &canonical_root)
+        || !path_starts_with(&canonical_path, &canonical_root)
+    {
         return Err("Temporary build path is outside Studio's managed cache".into());
     }
     let bytes = directory_size(&canonical_path);
@@ -2096,7 +2380,9 @@ fn clear_managed_session_logs(
     }
     let canonical_data = fs::canonicalize(data_root).map_err(|error| error.to_string())?;
     let canonical_logs = fs::canonicalize(logs_root).map_err(|error| error.to_string())?;
-    if canonical_logs == canonical_data || !canonical_logs.starts_with(&canonical_data) {
+    if paths_equal(&canonical_logs, &canonical_data)
+        || !path_starts_with(&canonical_logs, &canonical_data)
+    {
         return Err("Session log path is outside Studio's managed data directory".into());
     }
     let bytes = directory_size(&canonical_logs);
@@ -2112,8 +2398,8 @@ fn clear_managed_session_logs(
     for row in rows {
         let (id, path) = row.map_err(|error| error.to_string())?;
         let path = PathBuf::from(path);
-        let in_root =
-            fs::canonicalize(&path).is_ok_and(|canonical| canonical.starts_with(&canonical_logs));
+        let in_root = fs::canonicalize(&path)
+            .is_ok_and(|canonical| path_starts_with(&canonical, &canonical_logs));
         if in_root {
             session_ids.push(id);
         }
@@ -2174,8 +2460,8 @@ fn clean_compiler_cache(
     let data_root = fs::canonicalize(&paths.data).map_err(|error| error.to_string())?;
     let compiler_builds = cache_root.join("builds");
     let installed_builds = data_root.join("builds");
-    if compiler_builds.starts_with(&installed_builds)
-        || installed_builds.starts_with(&compiler_builds)
+    if path_starts_with(&compiler_builds, &installed_builds)
+        || path_starts_with(&installed_builds, &compiler_builds)
     {
         return Err(
             "Compiler cache overlaps installed emulator builds; cleanup was refused".into(),
@@ -2222,7 +2508,7 @@ fn clean_session_logs(app: tauri::AppHandle, jobs: tauri::State<'_, Jobs>) -> Re
     clear_managed_session_logs(&mut connection, &paths.data.join("logs"), &paths.data)
 }
 fn clear_managed_compiler_cache(root: &Path, cache_root: &Path) -> Result<u64, String> {
-    let Ok(metadata) = fs::symlink_metadata(&root) else {
+    let Ok(metadata) = fs::symlink_metadata(root) else {
         return Ok(0);
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -2230,7 +2516,9 @@ fn clear_managed_compiler_cache(root: &Path, cache_root: &Path) -> Result<u64, S
     }
     let canonical = fs::canonicalize(root).map_err(|error| error.to_string())?;
     let canonical_cache_root = fs::canonicalize(cache_root).map_err(|error| error.to_string())?;
-    if canonical == canonical_cache_root || !canonical.starts_with(&canonical_cache_root) {
+    if paths_equal(&canonical, &canonical_cache_root)
+        || !path_starts_with(&canonical, &canonical_cache_root)
+    {
         return Err("Compiler cache path is outside Studio's managed cache".into());
     }
     let bytes = directory_size(&canonical);
@@ -2243,12 +2531,21 @@ fn db(app: &tauri::AppHandle) -> Result<Connection, String> {
 }
 fn command_exists(name: &str) -> bool {
     env::var_os("PATH")
-        .map(|paths| env::split_paths(&paths).any(|p| p.join(name).is_file()))
+        .map(|paths| {
+            env::split_paths(&paths).any(|directory| {
+                if cfg!(windows) && Path::new(name).extension().is_none() {
+                    directory.join(format!("{name}.exe")).is_file()
+                } else {
+                    directory.join(name).is_file()
+                }
+            })
+        })
         .unwrap_or(false)
 }
 fn graphics_diagnostics() -> GraphicsDiagnostics {
     let mut drivers = Vec::new();
     let mut monitors = Vec::new();
+    #[cfg(not(windows))]
     if let Ok(entries) = fs::read_dir("/sys/class/drm") {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -2281,6 +2578,15 @@ fn graphics_diagnostics() -> GraphicsDiagnostics {
             }
         }
     }
+    #[cfg(windows)]
+    let graphics_error = match windows_diagnostics::graphics() {
+        Ok((windows_drivers, windows_monitors)) => {
+            drivers = windows_drivers;
+            monitors = windows_monitors;
+            None
+        }
+        Err(error) => Some(error),
+    };
     drivers.sort();
     drivers.dedup();
     monitors.sort();
@@ -2291,16 +2597,24 @@ fn graphics_diagnostics() -> GraphicsDiagnostics {
             "Install vulkan-tools and a Vulkan ICD/driver package, then retry diagnostics.".into(),
         )
     } else {
-        match host_tool_command("vulkaninfo")
+        let mut command = host_tool_command("vulkaninfo");
+        command
             .arg("--summary")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .process_group(0)
+            .process_group(0);
+        prepare_owned_child(&mut command);
+        let child = command
             .spawn()
-        {
+            .map_err(|error| error.to_string())
+            .and_then(|mut child| {
+                attach_owned_child(&mut child)?;
+                Ok(child)
+            });
+        match child {
             Err(error) => (
                 "Failed".into(),
-                format!("Could not start vulkaninfo: {error}"),
+                format!("Could not safely start vulkaninfo: {error}"),
             ),
             Ok(mut child) => {
                 let stdout = child.stdout.take().expect("stdout was piped");
@@ -2369,6 +2683,10 @@ fn graphics_diagnostics() -> GraphicsDiagnostics {
             }
         }
     };
+    #[cfg(windows)]
+    let vulkan_details = graphics_error.map_or(vulkan_details.clone(), |error| {
+        format!("{vulkan_details}\n\nWindows display diagnostics: {error}")
+    });
     GraphicsDiagnostics {
         vulkan_status,
         vulkan_details,
@@ -2376,6 +2694,7 @@ fn graphics_diagnostics() -> GraphicsDiagnostics {
         monitors,
     }
 }
+#[cfg(any(not(windows), test))]
 fn memory_value_bytes(meminfo: &str, key: &str) -> Option<u64> {
     meminfo.lines().find_map(|line| {
         let (name, rest) = line.split_once(':')?;
@@ -2389,6 +2708,7 @@ fn memory_value_bytes(meminfo: &str, key: &str) -> Option<u64> {
             .checked_mul(1024)
     })
 }
+#[cfg(any(not(windows), test))]
 fn detected_controllers(input_devices: &str) -> Vec<String> {
     let mut found = Vec::new();
     for block in input_devices.split("\n\n") {
@@ -2458,7 +2778,7 @@ fn host_tool_command(program: &str) -> Command {
         Command::new(program)
     };
     #[cfg(not(target_os = "linux"))]
-    let mut command = Command::new(program);
+    let command = Command::new(program);
     #[cfg(target_os = "linux")]
     {
         let mut search_path = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
@@ -2482,7 +2802,10 @@ fn host_tool_command(program: &str) -> Command {
 }
 
 fn git_command() -> Command {
+    #[cfg(target_os = "linux")]
     let mut command = host_tool_command("git");
+    #[cfg(not(target_os = "linux"))]
+    let command = host_tool_command("git");
     #[cfg(target_os = "linux")]
     {
         command.env_remove("GIT_EXEC_PATH");
@@ -2495,6 +2818,7 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
     if let Some(d) = dir {
         c.arg("-C").arg(d);
     }
+    prepare_owned_child(&mut c);
     let mut child = c
         .args(args)
         .stdout(Stdio::piped())
@@ -2502,6 +2826,7 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
         .process_group(0)
         .spawn()
         .map_err(|error| error.to_string())?;
+    attach_owned_child(&mut child)?;
     let stdout = child.stdout.take().ok_or("Git stdout unavailable")?;
     let stderr = child.stderr.take().ok_or("Git stderr unavailable")?;
     let stdout_reader =
@@ -2510,6 +2835,7 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
         thread::spawn(move || read_capped_output(BufReader::new(stderr), GIT_CAPTURE_MAX_BYTES));
     let wait_result =
         wait_for_child_with_timeout(&mut child, Duration::from_secs(120), "Git command");
+    let status = wait_result.map_err(|error| format!("Could not wait for Git: {error}"))?;
     let (stdout, stdout_truncated) = stdout_reader
         .join()
         .map_err(|_| "Git output reader failed")?
@@ -2518,7 +2844,6 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
         .join()
         .map_err(|_| "Git error reader failed")?
         .map_err(|error| format!("Could not read Git error output: {error}"))?;
-    let status = wait_result.map_err(|error| format!("Could not wait for Git: {error}"))?;
     if stdout_truncated || stderr_truncated {
         return Err(format!(
             "Git command output exceeded the {} MiB safety limit",
@@ -2588,33 +2913,73 @@ fn wait_for_child_with_timeout(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                stop_process_group(pid)?;
+                let cleanup = stop_process_group(pid);
+                #[cfg(windows)]
+                release_owned_child(pid);
+                cleanup?;
                 return Ok(status);
             }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
             Ok(None) => {
                 let cleanup = stop_process_group(pid);
-                let _ = child.wait();
+                #[cfg(windows)]
+                release_owned_child(pid);
+                #[cfg(windows)]
+                let wait = wait_for_child_exit_bounded(child, Duration::from_secs(3), description);
+                #[cfg(not(windows))]
+                let wait = child.wait().map_err(|error| error.to_string());
                 return Err(format!(
-                    "{description} exceeded its {} second time limit{}",
+                    "{description} exceeded its {} second time limit{}{}",
                     timeout.as_secs(),
                     cleanup
                         .err()
                         .map(|error| format!("; process cleanup failed: {error}"))
+                        .unwrap_or_default(),
+                    wait.err()
+                        .map(|error| format!("; bounded reap failed: {error}"))
                         .unwrap_or_default()
                 ));
             }
             Err(error) => {
                 let cleanup = stop_process_group(pid);
-                let _ = child.wait();
+                #[cfg(windows)]
+                release_owned_child(pid);
+                #[cfg(windows)]
+                let wait = wait_for_child_exit_bounded(child, Duration::from_secs(3), description);
+                #[cfg(not(windows))]
+                let wait = child.wait().map_err(|error| error.to_string());
                 return Err(format!(
-                    "Could not wait for {description}: {error}{}",
+                    "Could not wait for {description}: {error}{}{}",
                     cleanup
                         .err()
                         .map(|error| format!("; process cleanup failed: {error}"))
+                        .unwrap_or_default(),
+                    wait.err()
+                        .map(|error| format!("; bounded reap failed: {error}"))
                         .unwrap_or_default()
                 ));
             }
+        }
+    }
+}
+#[cfg(windows)]
+fn wait_for_child_exit_bounded(
+    child: &mut std::process::Child,
+    timeout: Duration,
+    description: &str,
+) -> Result<std::process::ExitStatus, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) => {
+                return Err(format!(
+                    "{description} remained alive after the {} second cleanup window",
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => return Err(format!("Could not reap {description}: {error}")),
         }
     }
 }
@@ -2665,7 +3030,9 @@ fn git_cancellable_env(
     for (key, value) in environment {
         command.env(key, value);
     }
+    prepare_owned_child(&mut command);
     let mut child = command.spawn().map_err(|error| error.to_string())?;
+    attach_owned_child(&mut child)?;
     let pid = child.id() as i32;
     jobs.pid.store(pid, Ordering::SeqCst);
     let stdout = child.stdout.take().ok_or("Git stdout unavailable")?;
@@ -2680,9 +3047,9 @@ fn git_cancellable_env(
             cancellation_sent = true;
             let _ = stop_process_group(pid);
         }
-        match child_exit_observed(pid as u32) {
-            Ok(true) => break Ok(()),
-            Ok(false) => thread::sleep(Duration::from_millis(100)),
+        match child.try_wait() {
+            Ok(Some(_)) => break Ok(()),
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
             Err(error) => break Err(format!("Could not wait for Git: {error}")),
         }
     };
@@ -2690,9 +3057,30 @@ fn git_cancellable_env(
     // Keep the unreaped child as the owner of its PID until its process group
     // has been cleaned, then clear the cancellation target before reaping it.
     jobs.pid.store(0, Ordering::SeqCst);
+    #[cfg(windows)]
+    release_owned_child(pid);
+    #[cfg(windows)]
+    let wait_result = wait_for_child_exit_bounded(&mut child, Duration::from_secs(3), "Git");
+    #[cfg(not(windows))]
     let wait_result = child
         .wait()
         .map_err(|error| format!("Could not reap Git: {error}"));
+    let status = match wait_result {
+        Ok(status) => status,
+        Err(error) => {
+            return Err(format!(
+                "Could not reap Git: {error}{}{}",
+                cleanup_result
+                    .err()
+                    .map(|error| format!("; process cleanup failed: {error}"))
+                    .unwrap_or_default(),
+                observed
+                    .err()
+                    .map(|error| format!("; process wait failed: {error}"))
+                    .unwrap_or_default()
+            ));
+        }
+    };
     let (stdout, stdout_truncated) = stdout_reader
         .join()
         .map_err(|_| "Git output reader failed")?
@@ -2703,7 +3091,6 @@ fn git_cancellable_env(
         .map_err(|error| format!("Could not read Git error output: {error}"))?;
     cleanup_result?;
     observed?;
-    let status = wait_result?;
     if stdout_truncated || stderr_truncated {
         return Err(format!(
             "Git command output exceeded the {} MiB safety limit",
@@ -2774,6 +3161,7 @@ fn git_deterministic_merge_test(dir: &Path, reference: &str) -> Result<String, S
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
 }
+#[allow(clippy::too_many_arguments)] // Keep each signature input explicit in the cache key.
 fn community_build_signature(
     repository_id: i64,
     base_branch: &str,
@@ -2834,17 +3222,23 @@ fn parse_repo(input: &str) -> Result<(String, String, String), String> {
     ))
 }
 fn valid_branch_name(branch: &str) -> bool {
-    !branch.is_empty()
-        && Command::new("git")
-            .args(["check-ref-format", "--branch", branch])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+    if branch.is_empty() {
+        return false;
+    }
+    git_command()
+        .args(["check-ref-format", "--branch", branch])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 fn repo(conn: &Connection, id: i64) -> Result<Repo, String> {
     conn.query_row("SELECT id,owner,name,url,branch,source_path,adapter,installed_commit,removed_at IS NOT NULL FROM repositories WHERE id=?",[id],|r|Ok(Repo{id:r.get(0)?,owner:r.get(1)?,name:r.get(2)?,url:r.get(3)?,branch:r.get(4)?,source_path:r.get(5)?,adapter:r.get(6)?,installed_commit:r.get(7)?,removed:r.get::<_,i64>(8)?!=0})).map_err(|e|e.to_string())
+}
+#[cfg(windows)]
+fn windows_explorer_path(system_root: &std::ffi::OsStr) -> PathBuf {
+    PathBuf::from(system_root).join("explorer.exe")
 }
 fn open_directory(path: &Path) -> Result<(), String> {
     let directory =
@@ -2852,12 +3246,27 @@ fn open_directory(path: &Path) -> Result<(), String> {
     if !directory.is_dir() {
         return Err("Selected location is not a directory".into());
     }
+    #[cfg(unix)]
     let mut child = host_tool_command("xdg-open")
         .arg(directory)
         .spawn()
         .map_err(|error| {
             format!("Could not open the folder with the desktop file manager: {error}")
         })?;
+    #[cfg(windows)]
+    let mut child = Command::new({
+        let system_root = env::var_os("SystemRoot")
+            .filter(|root| !root.is_empty())
+            .ok_or("Windows SystemRoot is unavailable")?;
+        let explorer = windows_explorer_path(&system_root);
+        if !explorer.is_file() {
+            return Err("Windows Explorer is unavailable under SystemRoot".into());
+        }
+        explorer
+    })
+    .arg(directory)
+    .spawn()
+    .map_err(|error| format!("Could not open the folder with the desktop file manager: {error}"))?;
     thread::spawn(move || {
         let _ = child.wait();
     });
@@ -2910,9 +3319,9 @@ fn build(conn: &Connection, id: i64) -> Result<Build, String> {
                 created_at: r.get(5)?,
                 active: r.get::<_, i64>(6)? != 0,
                 executable_status: {
-                    let executable = Path::new(&r.get::<_, String>(4)?).join("kyty_emulator");
+                    let executable = emulator_executable(Path::new(&r.get::<_, String>(4)?));
                     match fs::metadata(&executable) {
-                        Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => "Executable present".to_string(),
+                        Ok(metadata) if metadata.is_file() && is_emulator_executable(&executable) => "Executable present".to_string(),
                         Ok(metadata) if metadata.is_file() => "Not executable".to_string(),
                         _ => "Missing".to_string(),
                     }
@@ -3158,6 +3567,47 @@ fn compatibility_http_json(url: &str, max_bytes: usize) -> Result<serde_json::Va
     serde_json::from_slice(&bytes)
         .map_err(|error| format!("Official compatibility data is invalid JSON: {error}"))
 }
+
+fn prioritize_compatibility_game(
+    mut game: OfficialCompatibilityGame,
+    host_os: &str,
+) -> OfficialCompatibilityGame {
+    let status = game.os.get(host_os).or_else(|| {
+        game.os
+            .iter()
+            .filter(|(os, _)| os.trim().eq_ignore_ascii_case(host_os))
+            .min_by(|(left, _), (right, _)| left.cmp(right))
+            .map(|(_, status)| status)
+    });
+    if let Some(status) = status {
+        game.preferred_os = host_os.to_string();
+        game.status = status.clone();
+    } else {
+        game.preferred_os = "all".into();
+        game.status = game.overall.clone();
+    }
+    game
+}
+
+fn cached_compatibility_games(
+    data: serde_json::Value,
+    host_os: &str,
+) -> Vec<OfficialCompatibilityGame> {
+    serde_json::from_value::<Vec<OfficialCompatibilityGame>>(data)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|game| prioritize_compatibility_game(game, host_os))
+        .collect()
+}
+
+fn current_host_compatibility_os() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else {
+        "linux"
+    }
+}
+
 fn cached_json(path: &Path) -> Option<(i64, serde_json::Value)> {
     let value: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
     Some((
@@ -3171,7 +3621,7 @@ fn write_cached_json(path: &Path, data: &serde_json::Value) -> Result<i64, Strin
     let bytes = serde_json::to_vec(&serde_json::json!({"cached_at":cached_at,"data":data}))
         .map_err(|error| error.to_string())?;
     fs::write(&temp, bytes).map_err(|error| error.to_string())?;
-    fs::rename(temp, path).map_err(|error| error.to_string())?;
+    replace_file(&temp, path).map_err(|error| error.to_string())?;
     Ok(cached_at)
 }
 fn normalized_title_id(value: &str) -> Option<String> {
@@ -3207,29 +3657,19 @@ fn official_compatibility_index(app: tauri::AppHandle) -> OfficialCompatibilityI
                 .filter_map(|game| {
                     let title_id =
                         normalized_title_id(game.title_id.as_deref().or(game.key.as_deref())?)?;
-                    let preferred_os = if game.os.contains_key("linux") {
-                        "linux"
-                    } else {
-                        "all"
-                    };
-                    let status = if preferred_os == "linux" {
-                        game.os
-                            .get("linux")
-                            .cloned()
-                            .unwrap_or_else(|| game.overall.clone())
-                    } else {
-                        game.overall.clone()
-                    };
-                    Some(OfficialCompatibilityGame {
-                        title_id,
-                        title: game.title,
-                        overall: game.overall,
-                        status,
-                        preferred_os: preferred_os.into(),
-                        os: game.os,
-                        report_counts: game.report_counts,
-                        latest_tested: game.latest_tested,
-                    })
+                    Some(prioritize_compatibility_game(
+                        OfficialCompatibilityGame {
+                            title_id,
+                            title: game.title,
+                            overall: game.overall.clone(),
+                            status: game.overall,
+                            preferred_os: "all".into(),
+                            os: game.os,
+                            report_counts: game.report_counts,
+                            latest_tested: game.latest_tested,
+                        },
+                        current_host_compatibility_os(),
+                    ))
                 })
                 .collect::<Vec<_>>();
             let data = serde_json::to_value(games).map_err(|error| error.to_string())?;
@@ -3238,7 +3678,7 @@ fn official_compatibility_index(app: tauri::AppHandle) -> OfficialCompatibilityI
                 available: true,
                 updated_at: Some(updated_at),
                 error: None,
-                games: serde_json::from_value(data).unwrap_or_default(),
+                games: cached_compatibility_games(data, current_host_compatibility_os()),
             })
         });
     let error = match remote {
@@ -3250,7 +3690,7 @@ fn official_compatibility_index(app: tauri::AppHandle) -> OfficialCompatibilityI
             available: true,
             updated_at: Some(updated_at),
             error: Some(error),
-            games: serde_json::from_value(data).unwrap_or_default(),
+            games: cached_compatibility_games(data, current_host_compatibility_os()),
         };
     }
     OfficialCompatibilityIndex {
@@ -3402,7 +3842,7 @@ fn log_reports_title_id(log_root: &Path, log_path: &Path) -> bool {
     let Ok(path) = fs::canonicalize(log_path) else {
         return false;
     };
-    if !path.starts_with(root) {
+    if !path_starts_with(&path, &root) {
         return false;
     }
     fs::metadata(&path)
@@ -3716,80 +4156,113 @@ fn validate_github_token(token: &str) -> Result<String, String> {
     }
     Ok(token.to_string())
 }
-fn github_token() -> Option<String> {
+fn github_token() -> Result<Option<String>, String> {
     for variable in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(token) = env::var(variable) {
             if let Ok(token) = validate_github_token(&token) {
-                return Some(token);
+                return Ok(Some(token));
             }
         }
     }
-    let output = Command::new("secret-tool")
-        .args(["lookup", "service", "kytyps5-studio", "account", "github"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    #[cfg(unix)]
+    {
+        let token = {
+            let output = match Command::new("secret-tool")
+                .args(["lookup", "service", "kytyps5-studio", "account", "github"])
+                .output()
+            {
+                Ok(output) => output,
+                Err(_) => return Ok(None),
+            };
+            if !output.status.success() {
+                return Ok(None);
+            }
+            String::from_utf8(output.stdout).map_err(|error| error.to_string())?
+        };
+        Ok(Some(validate_github_token(
+            token.trim_end_matches(['\r', '\n']),
+        )?))
     }
-    let token = String::from_utf8(output.stdout).ok()?;
-    validate_github_token(token.trim_end_matches(['\r', '\n'])).ok()
+    #[cfg(windows)]
+    {
+        let Some(token) = windows_credentials::get()? else {
+            return Ok(None);
+        };
+        Ok(Some(validate_github_token(
+            token.trim_end_matches(['\r', '\n']),
+        )?))
+    }
 }
 #[tauri::command]
 fn save_github_token(token: String) -> Result<(), String> {
     let token = validate_github_token(&token)?;
-    let mut child = Command::new("secret-tool")
-        .args([
-            "store",
-            "--label=KytyPS5 Studio GitHub token",
-            "service",
-            "kytyps5-studio",
-            "account",
-            "github",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Linux Secret Service is unavailable: {error}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or("Could not open secure credential input")?
-        .write_all(format!("{token}\n").as_bytes())
-        .map_err(|error| error.to_string())?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "Could not store the token in Secret Service: {detail}"
-        ));
+    #[cfg(unix)]
+    {
+        let mut child = Command::new("secret-tool")
+            .args([
+                "store",
+                "--label=KytyPS5 Studio GitHub token",
+                "service",
+                "kytyps5-studio",
+                "account",
+                "github",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("Linux Secret Service is unavailable: {error}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or("Could not open secure credential input")?
+            .write_all(format!("{token}\n").as_bytes())
+            .map_err(|error| error.to_string())?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "Could not store the token in Secret Service: {detail}"
+            ));
+        }
+        Ok(())
     }
-    Ok(())
+    #[cfg(windows)]
+    {
+        windows_credentials::save(&token)
+    }
 }
 #[tauri::command]
 fn delete_github_token() -> Result<(), String> {
-    let status = Command::new("secret-tool")
-        .args(["clear", "service", "kytyps5-studio", "account", "github"])
-        .status()
-        .map_err(|error| format!("Linux Secret Service is unavailable: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("Could not remove the GitHub token from Secret Service".into())
+    #[cfg(unix)]
+    {
+        let status = Command::new("secret-tool")
+            .args(["clear", "service", "kytyps5-studio", "account", "github"])
+            .status()
+            .map_err(|error| format!("Linux Secret Service is unavailable: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("Could not remove the GitHub token from Secret Service".into())
+        }
+    }
+    #[cfg(windows)]
+    {
+        windows_credentials::delete()
     }
 }
 #[tauri::command]
-fn github_token_status() -> bool {
-    github_token().is_some()
+fn github_token_status() -> Result<bool, String> {
+    Ok(github_token()?.is_some())
 }
 fn github_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
     let mut request = ureq::get(url)
         .header("User-Agent", "KytyPS5-Studio")
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28");
-    if let Some(token) = github_token() {
+    if let Some(token) = github_token()? {
         request = request.header("Authorization", &format!("Bearer {token}"));
     }
     let mut response = request.call().map_err(|error| {
@@ -3810,7 +4283,7 @@ fn github_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
 const APP_RELEASES_API: &str = "https://api.github.com/repos/Febsho/KytyPs5-Studio/releases/latest";
 const APP_RELEASES_DOWNLOAD_PREFIX: &str =
     "https://github.com/Febsho/KytyPs5-Studio/releases/download/";
-const MAX_APPIMAGE_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_APP_UPDATE_ASSET_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
 fn release_version_tuple(value: &str) -> Option<Vec<u64>> {
     value
@@ -3841,6 +4314,7 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(unix)]
 fn running_appimage_path() -> Option<PathBuf> {
     let path = env::var_os("APPIMAGE").map(PathBuf::from)?;
     if !path
@@ -3865,6 +4339,7 @@ fn latest_app_release() -> Result<GithubAppRelease, String> {
     Ok(release)
 }
 
+#[cfg(unix)]
 fn appimage_asset(release: &GithubAppRelease) -> Option<&GithubAppReleaseAsset> {
     let name = match env::consts::ARCH {
         "x86_64" => ["x86_64", "amd64"],
@@ -3877,11 +4352,34 @@ fn appimage_asset(release: &GithubAppRelease) -> Option<&GithubAppReleaseAsset> 
     })
 }
 
+#[cfg(any(windows, test))]
+fn nsis_asset(release: &GithubAppRelease) -> Option<&GithubAppReleaseAsset> {
+    release.assets.iter().find(|asset| {
+        let lower = asset.name.to_ascii_lowercase();
+        lower.ends_with("-setup.exe")
+            && (lower.contains("x64") || lower.contains("x86_64") || lower.contains("amd64"))
+    })
+}
+
+#[cfg(any(windows, test))]
+fn nsis_update_arguments(current_executable: &Path) -> Result<[OsString; 2], String> {
+    let install_directory = current_executable
+        .parent()
+        .filter(|directory| directory.is_absolute())
+        .ok_or("Could not determine the absolute application install directory")?;
+    let mut install_directory_argument = OsString::from("/D=");
+    install_directory_argument.push(install_directory.as_os_str());
+    Ok([OsString::from("/UPDATE"), install_directory_argument])
+}
+
 #[tauri::command]
 fn check_app_update() -> Result<AppUpdateInfo, String> {
     let release = latest_app_release()?;
     let current_version = env!("CARGO_PKG_VERSION").to_string();
+    #[cfg(unix)]
     let asset = appimage_asset(&release);
+    #[cfg(windows)]
+    let asset = nsis_asset(&release);
     let latest_version = release.tag_name.clone();
     let release_url = release.html_url.clone();
     let update_available = version_is_newer(&latest_version, &current_version);
@@ -3894,7 +4392,16 @@ fn check_app_update() -> Result<AppUpdateInfo, String> {
         release_url,
         asset_name,
         download_size_bytes,
-        running_appimage: running_appimage_path().is_some(),
+        running_appimage: {
+            #[cfg(unix)]
+            {
+                running_appimage_path().is_some()
+            }
+            #[cfg(windows)]
+            {
+                false
+            }
+        },
     })
 }
 
@@ -3903,18 +4410,24 @@ fn release_asset_url(
     asset: &GithubAppReleaseAsset,
 ) -> Result<String, String> {
     let url = url::Url::parse(&asset.browser_download_url).map_err(|error| error.to_string())?;
+    let expected_url = url::Url::parse(&format!(
+        "{APP_RELEASES_DOWNLOAD_PREFIX}{}/{}",
+        release.tag_name, asset.name
+    ))
+    .map_err(|error| error.to_string())?;
     if url.scheme() != "https"
         || url.host_str() != Some("github.com")
-        || url.path()
-            != format!(
-                "/Febsho/KytyPs5-Studio/releases/download/{}/{}",
-                release.tag_name, asset.name
-            )
+        || url.path() != expected_url.path()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
         || !asset
             .browser_download_url
             .starts_with(APP_RELEASES_DOWNLOAD_PREFIX)
     {
-        return Err("GitHub returned an unexpected AppImage download URL".into());
+        return Err("GitHub returned an unexpected release download URL".into());
     }
     Ok(asset.browser_download_url.clone())
 }
@@ -3936,6 +4449,7 @@ fn release_asset_text(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(unix)]
 fn download_and_install_app_update() -> Result<String, String> {
     let target = running_appimage_path().ok_or(
         "In-place updates are available only when KytyPS5 Studio is running from an AppImage",
@@ -3947,7 +4461,7 @@ fn download_and_install_app_update() -> Result<String, String> {
     }
     let asset = appimage_asset(&release)
         .ok_or("This release has no AppImage for the current system architecture")?;
-    if asset.size == 0 || asset.size > MAX_APPIMAGE_SIZE {
+    if asset.size == 0 || asset.size > MAX_APP_UPDATE_ASSET_SIZE {
         return Err("The AppImage release asset has an invalid or excessive size".into());
     }
     let checksums = release
@@ -4011,7 +4525,7 @@ fn download_and_install_app_update() -> Result<String, String> {
                 break;
             }
             total = total.saturating_add(read as u64);
-            if total > MAX_APPIMAGE_SIZE || total > asset.size {
+            if total > MAX_APP_UPDATE_ASSET_SIZE || total > asset.size {
                 return Err("Downloaded AppImage exceeded its declared size".into());
             }
             file.write_all(&buffer[..read])
@@ -4057,9 +4571,195 @@ fn download_and_install_app_update() -> Result<String, String> {
     result
 }
 
+#[cfg(any(windows, test))]
+struct UpdateReservation {
+    jobs: Arc<Jobs>,
+    preserve: bool,
+}
+
+#[cfg(any(windows, test))]
+impl Drop for UpdateReservation {
+    fn drop(&mut self) {
+        if !self.preserve {
+            self.jobs.updating.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn download_and_install_app_update(app: tauri::AppHandle) -> Result<String, String> {
+    let _session_lifecycle = SESSION_LIFECYCLE_LOCK
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let jobs = app.state::<Arc<Jobs>>();
+    let _control = jobs.control.lock().map_err(|error| error.to_string())?;
+    if jobs.active.load(Ordering::SeqCst) {
+        return Err("Finish the active build before installing a Studio update".into());
+    }
+    if jobs.updating.swap(true, Ordering::SeqCst) {
+        return Err("A KytyPS5 Studio update is already in progress".into());
+    }
+    let mut reservation = UpdateReservation {
+        jobs: jobs.inner().clone(),
+        preserve: false,
+    };
+    drop(_control);
+    let connection = db(&app)?;
+    if has_active_game_sessions(&connection)? {
+        return Err("Close the active emulator session before installing a Studio update".into());
+    }
+    let current_executable = env::current_exe()
+        .map_err(|error| format!("Could not locate the running application: {error}"))?;
+    let update_arguments = nsis_update_arguments(&current_executable)?;
+    let release = latest_app_release()?;
+    let current_version = env!("CARGO_PKG_VERSION");
+    if !version_is_newer(&release.tag_name, current_version) {
+        return Err("KytyPS5 Studio is already up to date".into());
+    }
+    let asset = nsis_asset(&release).ok_or("This release has no NSIS installer for Windows x64")?;
+    if asset.size == 0 || asset.size > MAX_APP_UPDATE_ASSET_SIZE {
+        return Err("The NSIS release asset has an invalid or excessive size".into());
+    }
+    let expected_digest = if let Some(digest) = asset
+        .digest
+        .as_deref()
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+    {
+        digest.to_ascii_lowercase()
+    } else {
+        let checksums = release
+            .assets
+            .iter()
+            .find(|candidate| candidate.name == "SHA256SUMS")
+            .ok_or("The release does not include SHA256SUMS; update was not installed")?;
+        release_asset_text(checksums, &release)?
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let digest = fields.next()?;
+                let name = fields.next()?.trim_start_matches('*');
+                (name == asset.name).then(|| digest.to_ascii_lowercase())
+            })
+            .ok_or("SHA256SUMS does not contain the NSIS installer checksum")?
+    };
+    if expected_digest.len() != 64 || !expected_digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("GitHub returned an invalid NSIS installer SHA-256 checksum".into());
+    }
+    let url = release_asset_url(&release, asset)?;
+    let mut response = ureq::get(&url)
+        .header("User-Agent", "KytyPS5-Studio")
+        .header("Accept", "application/octet-stream")
+        .call()
+        .map_err(|error| format!("Could not download the NSIS installer: {error}"))?;
+    let update_dir = state_paths(&app)?.cache.join("updates");
+    fs::create_dir_all(&update_dir)
+        .map_err(|error| format!("Could not create the update staging directory: {error}"))?;
+    let canonical_cache = fs::canonicalize(state_paths(&app)?.cache)
+        .map_err(|error| format!("Managed cache directory is unavailable: {error}"))?;
+    let canonical_update = fs::canonicalize(&update_dir)
+        .map_err(|error| format!("Update staging directory is unavailable: {error}"))?;
+    if !path_starts_with(&canonical_update, &canonical_cache)
+        || fs::symlink_metadata(&update_dir)
+            .map_err(|error| error.to_string())?
+            .file_type()
+            .is_symlink()
+    {
+        return Err("Update staging directory is outside the managed cache".into());
+    }
+    let tag: String = release
+        .tag_name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-'))
+        .take(64)
+        .collect();
+    let installer = update_dir.join(format!("KytyPS5-Studio-{tag}-{}.exe", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&installer)
+        .map_err(|error| format!("Could not create the staged NSIS installer: {error}"))?;
+    let result = (|| -> Result<(), String> {
+        let mut hasher = Sha256::new();
+        let mut reader = response.body_mut().as_reader();
+        let mut buffer = [0_u8; 128 * 1024];
+        let mut total = 0_u64;
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            total = total.saturating_add(count as u64);
+            if total > MAX_APP_UPDATE_ASSET_SIZE || total > asset.size {
+                return Err("Downloaded NSIS installer exceeded its declared size".into());
+            }
+            file.write_all(&buffer[..count])
+                .map_err(|error| error.to_string())?;
+            hasher.update(&buffer[..count]);
+        }
+        if total != asset.size {
+            return Err(format!(
+                "NSIS installer size mismatch: expected {}, received {total}",
+                asset.size
+            ));
+        }
+        if format!("{:x}", hasher.finalize()) != expected_digest {
+            return Err("NSIS installer checksum did not match the GitHub release checksum".into());
+        }
+        let mut signature = [0_u8; 2];
+        let mut verification = fs::File::open(&installer).map_err(|error| error.to_string())?;
+        verification
+            .read_exact(&mut signature)
+            .map_err(|error| format!("Could not validate downloaded NSIS installer: {error}"))?;
+        if signature != *b"MZ" {
+            return Err("Downloaded NSIS installer is not a Windows executable".into());
+        }
+        file.sync_all().map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&installer);
+        return Err(error);
+    }
+    if let Err(error) = Command::new(&installer).args(&update_arguments).spawn() {
+        let _ = fs::remove_file(&installer);
+        return Err(format!(
+            "Could not launch the verified NSIS installer: {error}"
+        ));
+    }
+    reservation.preserve = true;
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(500));
+        app.exit(0);
+    });
+    Ok(format!(
+        "Verified KytyPS5 Studio {} installer started. Studio will close while the installer updates the application.",
+        release.tag_name
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn has_active_game_sessions(connection: &Connection) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE ended_at IS NULL)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Could not verify active emulator sessions: {error}"))
+}
+
 #[tauri::command]
+#[cfg(unix)]
 fn install_app_update() -> Result<String, String> {
     download_and_install_app_update()
+}
+#[tauri::command]
+#[cfg(windows)]
+fn install_app_update(app: tauri::AppHandle) -> Result<String, String> {
+    download_and_install_app_update(app)
 }
 fn cached_community_prs(
     conn: &Connection,
@@ -4508,7 +5208,7 @@ fn start_community_build(
             fs::create_dir_all(&work_root).map_err(|e| e.to_string())?;
             let work_root = fs::canonicalize(&work_root).map_err(|error| error.to_string())?;
             let cache_root = fs::canonicalize(&paths.cache).map_err(|error| error.to_string())?;
-            if !work_root.starts_with(&cache_root) {
+            if !path_starts_with(&work_root, &cache_root) {
                 return Err("Community worktree cache is outside Studio's managed cache".into());
             }
             let worktree = work_root.join(format!(
@@ -4918,6 +5618,7 @@ fn github_repository_details(
     })
 }
 #[tauri::command]
+#[cfg(not(windows))]
 fn system_info(app: tauri::AppHandle) -> Result<SystemInfo, String> {
     let p = state_paths(&app)?;
     let cpu = fs::read_to_string("/proc/cpuinfo")
@@ -4992,6 +5693,32 @@ fn system_info(app: tauri::AppHandle) -> Result<SystemInfo, String> {
             ("data".into(), p.data.display().to_string()),
             ("cache".into(), p.cache.display().to_string()),
             ("config".into(), p.config.display().to_string()),
+        ]),
+    })
+}
+#[tauri::command]
+#[cfg(windows)]
+fn system_info(app: tauri::AppHandle) -> Result<SystemInfo, String> {
+    let paths = state_paths(&app)?;
+    let diagnostics = windows_diagnostics::collect()?;
+    Ok(SystemInfo {
+        os: diagnostics.os,
+        arch: env::consts::ARCH.into(),
+        cpu: diagnostics.cpu,
+        memory_total_bytes: diagnostics.memory_total_bytes,
+        memory_available_bytes: diagnostics.memory_available_bytes,
+        controllers: diagnostics.controllers,
+        session: diagnostics.session,
+        gpu: diagnostics.gpu,
+        dependencies: diagnostics
+            .dependencies
+            .into_iter()
+            .map(|(name, present)| Dependency { name, present })
+            .collect(),
+        paths: HashMap::from([
+            ("data".into(), paths.data.display().to_string()),
+            ("cache".into(), paths.cache.display().to_string()),
+            ("config".into(), paths.config.display().to_string()),
         ]),
     })
 }
@@ -5089,6 +5816,7 @@ fn drain_job_output<R: Read>(
         }
     }
 }
+#[allow(clippy::too_many_arguments)] // Execution context is intentionally passed as separate borrowed inputs.
 fn execute(
     app: &tauri::AppHandle,
     jobs: &Jobs,
@@ -5131,8 +5859,14 @@ fn execute(
     if let Some(d) = cwd {
         c.current_dir(d);
     }
+    #[cfg(windows)]
+    if program.eq_ignore_ascii_case("cmake") {
+        windows_build::apply_environment(&mut c)?;
+    }
     c.process_group(0);
+    prepare_owned_child(&mut c);
     let mut child = c.spawn().map_err(|e| e.to_string())?;
+    attach_owned_child(&mut child)?;
     let pid = child.id() as i32;
     jobs.pid.store(pid, Ordering::SeqCst);
     if jobs.cancel_requested.load(Ordering::SeqCst) {
@@ -5431,22 +6165,13 @@ fn inspect_build_source(
         .lines()
         .map(str::to_string)
         .collect::<Vec<_>>();
+    let compiler = default_build_compiler();
     let cache_dir = state_paths(&app)?
         .cache
         .join("builds")
         .join(repository_id.to_string())
-        .join(format!("{commit_sha}-{build_type}-clang-emulator"));
-    let compiler = "clang";
-    let mut cmake_arguments = vec![
-        "-G Ninja".into(),
-        format!("-DCMAKE_BUILD_TYPE={build_type}"),
-        format!("-DCMAKE_C_COMPILER={compiler}"),
-        format!("-DCMAKE_CXX_COMPILER={compiler}++"),
-    ];
-    cmake_arguments.extend(linux_x86_64_cmake_cpu_flags(
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-    ));
+        .join(format!("{commit_sha}-{build_type}-{compiler}-emulator"));
+    let cmake_arguments = displayed_cmake_arguments(&build_type)?;
     Ok(BuildSourceInfo {
         branch: if branch.is_empty() {
             format!(
@@ -5470,12 +6195,76 @@ fn validate_build_options(options: &BuildOptions) -> Result<String, String> {
     {
         return Err("Invalid build options".into());
     }
-    let compiler = options.compiler.clone().unwrap_or_else(|| "clang".into());
-    if compiler != "clang" {
-        return Err("Unsupported compiler selection".into());
+    let compiler = options
+        .compiler
+        .clone()
+        .unwrap_or_else(|| default_build_compiler().into());
+    #[cfg(windows)]
+    return match compiler.as_str() {
+        "clang" | "clang-cl" => Ok("clang-cl".into()),
+        _ => Err(
+            "Windows emulator builds require clang-cl with the Visual Studio x64 toolchain".into(),
+        ),
+    };
+    #[cfg(not(windows))]
+    match compiler.as_str() {
+        "clang" => Ok(compiler),
+        _ => Err("Linux emulator builds require clang".into()),
     }
-    Ok(compiler)
 }
+fn default_build_compiler() -> &'static str {
+    default_build_compiler_for(cfg!(windows))
+}
+fn default_build_compiler_for(windows: bool) -> &'static str {
+    if windows {
+        "clang-cl"
+    } else {
+        "clang"
+    }
+}
+fn cmake_configuration_arguments(build_type: &str) -> Result<Vec<String>, String> {
+    #[cfg(windows)]
+    {
+        windows_build::cmake_arguments(build_type)
+    }
+    #[cfg(not(windows))]
+    {
+        let compiler = default_build_compiler();
+        let mut arguments = vec![
+            "-G".into(),
+            "Ninja".into(),
+            format!("-DCMAKE_BUILD_TYPE={build_type}"),
+            format!("-DCMAKE_C_COMPILER={compiler}"),
+            format!("-DCMAKE_CXX_COMPILER={compiler}++"),
+        ];
+        arguments.extend(linux_x86_64_cmake_cpu_flags(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        ));
+        Ok(arguments)
+    }
+}
+fn displayed_cmake_arguments(build_type: &str) -> Result<Vec<String>, String> {
+    #[cfg(windows)]
+    {
+        windows_build::display_cmake_arguments(build_type)
+    }
+    #[cfg(not(windows))]
+    {
+        let arguments = cmake_configuration_arguments(build_type)?;
+        let mut displayed = Vec::new();
+        let mut iter = arguments.into_iter();
+        while let Some(argument) = iter.next() {
+            if argument == "-G" {
+                displayed.push(format!("-G {}", iter.next().unwrap_or_default()));
+            } else {
+                displayed.push(argument);
+            }
+        }
+        Ok(displayed)
+    }
+}
+#[cfg(any(not(windows), test))]
 const BUILD_DEPENDENCIES: &[&str] = &[
     "cmake",
     "ninja",
@@ -5484,8 +6273,10 @@ const BUILD_DEPENDENCIES: &[&str] = &[
     "pkg-config",
     "python3",
 ];
+#[cfg(any(not(windows), test))]
 const BUILD_PKG_CONFIG_DEPENDENCIES: &[&str] =
     &["vulkan", "x11", "wayland-client", "libpulse", "libudev"];
+#[cfg(any(not(windows), test))]
 fn missing_build_dependencies<F>(mut available: F) -> Vec<&'static str>
 where
     F: FnMut(&str) -> bool,
@@ -5496,6 +6287,7 @@ where
         .filter(|name| !available(name))
         .collect()
 }
+#[cfg(any(not(windows), test))]
 fn missing_pkg_config_dependencies<F>(mut available: F) -> Vec<&'static str>
 where
     F: FnMut(&str) -> bool,
@@ -5506,6 +6298,7 @@ where
         .filter(|name| !available(name))
         .collect()
 }
+#[cfg(any(not(windows), test))]
 fn linux_x86_64_cmake_cpu_flags(target_os: &str, target_arch: &str) -> Vec<String> {
     if target_os == "linux" && target_arch == "x86_64" {
         vec!["-DCMAKE_CXX_FLAGS=-msse4.1".into()]
@@ -5518,41 +6311,52 @@ fn verify_build_dependencies(app: &tauri::AppHandle, job_kind: &str) -> Result<(
         app,
         job_kind,
         "Dependency verification",
-        "Checking required Linux build tools",
+        if cfg!(windows) {
+            "Checking Windows emulator build tools"
+        } else {
+            "Checking Linux emulator build tools"
+        },
         false,
         true,
     );
-    let mut missing = missing_build_dependencies(command_exists);
-    if !command_exists("glslangValidator") && !command_exists("glslang") {
-        missing.push("glslangValidator or glslang");
+    #[cfg(windows)]
+    {
+        windows_build::validate()
     }
-    let missing_packages = if command_exists("pkg-config") {
-        missing_pkg_config_dependencies(|name| {
-            host_tool_command("pkg-config")
-                .args(["--exists", name])
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
-        })
-    } else {
-        Vec::new()
-    };
-    if missing.is_empty() && missing_packages.is_empty() {
-        Ok(())
-    } else {
-        let mut issues = missing;
-        issues.extend(missing_packages.into_iter().map(|name| match name {
-            "vulkan" => "Vulkan development files",
-            "x11" => "X11 development files",
-            "wayland-client" => "Wayland development files",
-            "libpulse" => "PulseAudio development files",
-            "libudev" => "libudev development files",
-            _ => name,
-        }));
-        Err(format!(
+    #[cfg(not(windows))]
+    {
+        let mut missing = missing_build_dependencies(command_exists);
+        if !command_exists("glslangValidator") && !command_exists("glslang") {
+            missing.push("glslangValidator or glslang");
+        }
+        let missing_packages = if command_exists("pkg-config") {
+            missing_pkg_config_dependencies(|name| {
+                host_tool_command("pkg-config")
+                    .args(["--exists", name])
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false)
+            })
+        } else {
+            Vec::new()
+        };
+        if missing.is_empty() && missing_packages.is_empty() {
+            Ok(())
+        } else {
+            let mut issues = missing;
+            issues.extend(missing_packages.into_iter().map(|name| match name {
+                "vulkan" => "Vulkan development files",
+                "x11" => "X11 development files",
+                "wayland-client" => "Wayland development files",
+                "libpulse" => "PulseAudio development files",
+                "libudev" => "libudev development files",
+                _ => name,
+            }));
+            Err(format!(
             "Missing build dependencies: {}. Install these with your distribution package manager, then retry.",
             issues.join(", ")
         ))
+        }
     }
 }
 fn validate_clean_source_checkout(source: &Path) -> Result<(), String> {
@@ -5605,6 +6409,7 @@ impl Drop for IncompleteInstall {
         }
     }
 }
+#[allow(clippy::too_many_arguments)] // Database columns remain explicit at this single insertion boundary.
 fn insert_registered_build(
     connection: &Connection,
     repository_id: i64,
@@ -5623,6 +6428,7 @@ fn insert_registered_build(
         .map_err(|error| error.to_string())?;
     Ok(inserted == 1)
 }
+#[allow(clippy::too_many_arguments)] // Build orchestration uses explicit inputs shared by both host platforms.
 fn build_and_register(
     app: &tauri::AppHandle,
     jobs: &Jobs,
@@ -5672,23 +6478,9 @@ fn build_and_register(
     fs::create_dir_all(&build_dir).map_err(|e| e.to_string())?;
     let build_dir_s = build_dir.display().to_string();
     let source_s = source.display().to_string();
-    let cxx = format!("{compiler}++");
-    let mut conf = vec![
-        "-S".into(),
-        source_s,
-        "-B".into(),
-        build_dir_s.clone(),
-        "-G".into(),
-        "Ninja".into(),
-        format!("-DCMAKE_BUILD_TYPE={}", options.build_type),
-        format!("-DCMAKE_C_COMPILER={compiler}"),
-        format!("-DCMAKE_CXX_COMPILER={cxx}"),
-        "-DKYTY_BUILD_LAUNCHER=OFF".into(),
-    ];
-    conf.extend(linux_x86_64_cmake_cpu_flags(
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-    ));
+    let mut conf = vec!["-S".into(), source_s, "-B".into(), build_dir_s.clone()];
+    conf.extend(cmake_configuration_arguments(&options.build_type)?);
+    conf.push("-DKYTY_BUILD_LAUNCHER=OFF".into());
     let log_path = build_dir.join("build.log");
     fs::write(&log_path, b"").map_err(|e| e.to_string())?;
     execute(
@@ -5742,7 +6534,7 @@ fn build_and_register(
         false,
         true,
     );
-    verify_emulator(&install.join("kyty_emulator"))?;
+    verify_emulator(&install.join(emulator_binary_name()))?;
     ensure_job_not_cancelled(jobs)?;
     fs::copy(&log_path, install.join("build.log")).map_err(|e| e.to_string())?;
     let install_size_bytes = directory_size_bytes(&install);
@@ -5845,7 +6637,10 @@ fn remove_replaced_install(previous: &Path, replacement: &Path, managed_root: &P
     let Ok(canonical) = fs::canonicalize(previous) else {
         return;
     };
-    if canonical != root && canonical.starts_with(&root) && canonical != replacement {
+    if !paths_equal(&canonical, &root)
+        && path_starts_with(&canonical, &root)
+        && !paths_equal(&canonical, replacement)
+    {
         let _ = fs::remove_dir_all(canonical);
     }
 }
@@ -5992,7 +6787,7 @@ fn start_update_build(
                 .optional()
                 .map_err(|error| error.to_string())?;
             if let Some(path) = existing {
-                if verify_emulator(&Path::new(&path).join("kyty_emulator")).is_ok() {
+                if verify_emulator(&Path::new(&path).join(emulator_binary_name())).is_ok() {
                     mark_repository_build_commit(&app, id, &commit, &branch)?;
                     if activate_after_build {
                         let existing_id: i64 = conn
@@ -6042,24 +6837,27 @@ fn start_update_build(
     });
     Ok(job_id)
 }
-#[tauri::command]
-fn cancel_job(jobs: tauri::State<'_, Arc<Jobs>>) -> Result<(), String> {
+fn request_job_cancellation(jobs: &Jobs) -> Result<(), String> {
     let _control = jobs.control.lock().map_err(|error| error.to_string())?;
     if !jobs.active.load(Ordering::SeqCst) || !jobs.cancellable.load(Ordering::SeqCst) {
         return Err("No cancellable job is running".into());
     }
     jobs.cancel_requested.store(true, Ordering::SeqCst);
     let pid = jobs.pid.load(Ordering::SeqCst);
-    if pid <= 0 {
+    if pid == 0 {
         return Ok(());
     }
     stop_process_group(pid)
 }
 #[tauri::command]
+fn cancel_job(jobs: tauri::State<'_, Arc<Jobs>>) -> Result<(), String> {
+    request_job_cancellation(jobs.inner())
+}
+#[tauri::command]
 fn validate_build(app: tauri::AppHandle, id: i64) -> Result<String, String> {
     let c = db(&app)?;
     let b = build(&c, id)?;
-    let validation = verify_emulator(&Path::new(&b.path).join("kyty_emulator"));
+    let validation = verify_emulator(&Path::new(&b.path).join(emulator_binary_name()));
     match validation {
         Ok(()) => {
             c.execute(
@@ -6083,7 +6881,7 @@ fn validate_build(app: tauri::AppHandle, id: i64) -> Result<String, String> {
 fn activate_build(app: tauri::AppHandle, id: i64) -> Result<(), String> {
     let mut c = db(&app)?;
     let b = build(&c, id)?;
-    verify_emulator(&Path::new(&b.path).join("kyty_emulator"))?;
+    verify_emulator(&Path::new(&b.path).join(emulator_binary_name()))?;
     let tx = c.transaction().map_err(|e| e.to_string())?;
     tx.execute(
         "UPDATE builds SET validation_status='verified' WHERE id=?",
@@ -6136,7 +6934,7 @@ fn retire_missing_build(c: &mut Connection, id: i64) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         candidates
             .into_iter()
-            .find(|(_, candidate)| Path::new(candidate).join("kyty_emulator").is_file())
+            .find(|(_, candidate)| emulator_executable(Path::new(candidate)).is_file())
             .map(|(candidate, _)| candidate)
     } else {
         None
@@ -6183,7 +6981,7 @@ fn remove_managed_build(c: &mut Connection, id: i64, managed_root: &Path) -> Res
             .map_err(|e| e.to_string())?;
         candidates
             .into_iter()
-            .find(|(_, path)| Path::new(path).join("kyty_emulator").is_file())
+            .find(|(_, path)| emulator_executable(Path::new(path)).is_file())
             .map(|(candidate, _)| candidate)
     } else {
         None
@@ -6210,7 +7008,7 @@ fn remove_managed_build(c: &mut Connection, id: i64, managed_root: &Path) -> Res
         return Err("Build path is not a managed installation directory".into());
     }
     let canonical = fs::canonicalize(&original).map_err(|e| e.to_string())?;
-    if canonical == root || !canonical.starts_with(&root) {
+    if paths_equal(&canonical, &root) || !path_starts_with(&canonical, &root) {
         return Err("Build path is outside Studio's managed installations".into());
     }
     let name = canonical
@@ -6255,18 +7053,20 @@ fn remove_managed_build(c: &mut Connection, id: i64, managed_root: &Path) -> Res
         .map_err(|e| format!("Build entry removed, but staged files could not be cleaned up: {e}"))
 }
 fn emulator_help(executable: &Path) -> Result<String, String> {
-    let metadata =
-        fs::metadata(executable).map_err(|_| "Emulator executable is missing".to_string())?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+    if !is_emulator_executable(executable) {
         return Err("Emulator path is not an executable file".into());
     }
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("--help")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
+        .process_group(0);
+    prepare_owned_child(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|e| format!("Could not run emulator validation: {e}"))?;
+    attach_owned_child(&mut child)?;
     let stdout = child
         .stdout
         .take()
@@ -6404,7 +7204,7 @@ fn calculate_game_size(path: &Path) -> Option<i64> {
             .is_some_and(|parent| parent.join("sce_sys").is_dir())
     {
         path.parent().unwrap_or(path)
-    } else if path.file_name().is_some_and(|name| name == "eboot.bin")
+    } else if path.file_name().is_some_and(is_eboot_filename)
         && path.parent().is_some_and(|parent| {
             parent
                 .file_name()
@@ -6418,7 +7218,7 @@ fn calculate_game_size(path: &Path) -> Option<i64> {
         path.parent().and_then(Path::parent).unwrap_or(path)
     } else if path.is_dir() {
         path
-    } else if path.file_name().is_some_and(|name| name == "eboot.bin")
+    } else if path.file_name().is_some_and(is_eboot_filename)
         || path
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("elf"))
@@ -6548,11 +7348,23 @@ fn create_game_session(
     tx.commit().map_err(|e| e.to_string())?;
     Ok(id)
 }
+fn is_eboot_filename(name: &std::ffi::OsStr) -> bool {
+    is_eboot_filename_for(name, cfg!(windows))
+}
+
+fn is_eboot_filename_for(name: &std::ffi::OsStr, windows: bool) -> bool {
+    if windows {
+        name.eq_ignore_ascii_case("eboot.bin")
+    } else {
+        name == "eboot.bin"
+    }
+}
+
 fn supported_game_path(path: &Path) -> bool {
     if path.is_dir() {
         is_elf_file(&path.join("eboot.bin"))
     } else {
-        if path.file_name().and_then(|s| s.to_str()) == Some("eboot.bin") {
+        if path.file_name().is_some_and(is_eboot_filename) {
             is_elf_file(path)
         } else {
             match path
@@ -6652,9 +7464,9 @@ fn is_zarchive_file(path: &Path) -> bool {
     if root_name_type & 0x8000_0000 != 0
         || root_name_type & 0x7fff_ffff != 0x7fff_ffff
         || root_count > 100_000
-        || !root_start
+        || root_start
             .checked_add(root_count)
-            .is_some_and(|end| end <= entries)
+            .is_none_or(|end| end > entries)
     {
         return false;
     }
@@ -6833,7 +7645,7 @@ async fn read_game_background(
 fn game_artwork_root(game_path: &Path) -> Option<PathBuf> {
     if game_path.is_dir() {
         Some(game_path.to_path_buf())
-    } else if game_path.file_name().and_then(|name| name.to_str()) == Some("eboot.bin")
+    } else if game_path.file_name().is_some_and(is_eboot_filename)
         || game_path
             .extension()
             .and_then(|extension| extension.to_str())
@@ -6847,7 +7659,7 @@ fn game_artwork_root(game_path: &Path) -> Option<PathBuf> {
 fn read_game_png(path: &Path, game_root: &Path, maximum_size: u64) -> Option<Vec<u8>> {
     let root = fs::canonicalize(game_root).ok()?;
     let path = fs::canonicalize(path).ok()?;
-    if !path.starts_with(&root) || !path.is_file() {
+    if !path_starts_with(&path, &root) || !path.is_file() {
         return None;
     }
     let file = fs::File::open(&path).ok()?;
@@ -6991,7 +7803,7 @@ fn has_game_ancestor(path: &Path, scan_root: &Path) -> bool {
         return false;
     };
     loop {
-        if !directory.starts_with(scan_root) {
+        if !path_starts_with(directory, scan_root) {
             return false;
         }
         if is_elf_file(&directory.join("eboot.bin")) {
@@ -7053,7 +7865,7 @@ fn scan_games_sync(app: tauri::AppHandle, path: String) -> Result<GameScanResult
             rejected += 1;
             continue;
         }
-        let is_eboot = entry.file_name() == "eboot.bin" && p.is_file();
+        let is_eboot = is_eboot_filename(entry.file_name()) && p.is_file();
         if !is_eboot && has_game_ancestor(p, &root) {
             continue;
         }
@@ -7101,7 +7913,7 @@ fn scan_games_sync(app: tauri::AppHandle, path: String) -> Result<GameScanResult
                 Err(_) => rejected += 1,
             }
         }
-        if entries_seen % 64 == 0 {
+        if entries_seen.is_multiple_of(64) {
             emit_game_scan(
                 &app,
                 GameScanEvent {
@@ -7473,10 +8285,7 @@ fn fetch_game_cheats(
     let index = read_remote_text(PS5_CHEAT_INDEX, 4 * 1024 * 1024)?;
     let mut filenames = index
         .lines()
-        .filter_map(|line| {
-            line.split_once('=')
-                .map(|(filename, title)| (filename, title))
-        })
+        .filter_map(|line| line.split_once('='))
         .filter(|(filename, _)| {
             valid_cheat_filename(filename) && filename.split('_').next() == Some(title_id)
         })
@@ -7726,16 +8535,133 @@ fn set_profile(app: tauri::AppHandle, game_id: i64, mut profile: Profile) -> Res
     c.execute("INSERT INTO profiles(game_id,screen_width,screen_height,present_mode,perf_overlay,fullscreen,controller_color,controller_volume,controller_vibration,keyboard_player,options_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(game_id) DO UPDATE SET screen_width=excluded.screen_width,screen_height=excluded.screen_height,present_mode=excluded.present_mode,perf_overlay=excluded.perf_overlay,fullscreen=excluded.fullscreen,controller_color=excluded.controller_color,controller_volume=excluded.controller_volume,controller_vibration=excluded.controller_vibration,keyboard_player=excluded.keyboard_player,options_json=excluded.options_json",params![game_id,profile.screen_width,profile.screen_height,profile.present_mode,profile.perf_overlay,profile.fullscreen,profile.controller_color,profile.controller_volume,profile.controller_vibration,profile.keyboard_player,options_json]).map_err(|e|e.to_string())?;
     Ok(())
 }
+#[cfg(unix)]
 fn steam_shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn steam_vdf_string(out: &mut Vec<u8>, key: &str, value: &str) {
+#[cfg(windows)]
+fn steam_registry_path() -> Option<PathBuf> {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+        KEY_READ, REG_SZ,
+    };
+
+    fn read_value(root: HKEY, subkey: &str, value_name: &str) -> Option<PathBuf> {
+        let subkey = subkey.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let value_name = value_name.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let mut key = std::ptr::null_mut();
+        if unsafe { RegOpenKeyExW(root, subkey.as_ptr(), 0, KEY_READ, &mut key) } != 0 {
+            return None;
+        }
+        let path = (|| {
+            let mut value_type = 0;
+            let mut byte_count = 0;
+            if unsafe {
+                RegQueryValueExW(
+                    key,
+                    value_name.as_ptr(),
+                    std::ptr::null(),
+                    &mut value_type,
+                    std::ptr::null_mut(),
+                    &mut byte_count,
+                )
+            } != 0
+                || value_type != REG_SZ
+                || byte_count < 2
+                || byte_count % 2 != 0
+                || byte_count > 65_536
+            {
+                return None;
+            }
+            let mut data = vec![0_u16; (byte_count / 2) as usize];
+            if unsafe {
+                RegQueryValueExW(
+                    key,
+                    value_name.as_ptr(),
+                    std::ptr::null(),
+                    &mut value_type,
+                    data.as_mut_ptr().cast(),
+                    &mut byte_count,
+                )
+            } != 0
+                || value_type != REG_SZ
+            {
+                return None;
+            }
+            let end = data
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(data.len());
+            let value = OsString::from_wide(&data[..end]);
+            (!value.is_empty()).then(|| PathBuf::from(value))
+        })();
+        unsafe { RegCloseKey(key) };
+        path
+    }
+
+    [
+        (HKEY_CURRENT_USER, "Software\\Valve\\Steam"),
+        (HKEY_LOCAL_MACHINE, "Software\\Valve\\Steam"),
+        (HKEY_LOCAL_MACHINE, "Software\\WOW6432Node\\Valve\\Steam"),
+    ]
+    .into_iter()
+    .find_map(|(root, key)| {
+        read_value(root, key, "SteamPath").or_else(|| read_value(root, key, "InstallPath"))
+    })
+}
+
+#[cfg(any(windows, test))]
+fn windows_command_line_quote(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for character in value.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                quoted.push(character);
+            }
+        }
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(any(windows, test))]
+fn steam_windows_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    let utf16_len = path.encode_utf16().count();
+    if utf16_len >= 260 {
+        return path.into_owned();
+    }
+    if let Some(unc_path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc_path}")
+    } else if let Some(path) = path.strip_prefix(r"\\?\") {
+        path.to_owned()
+    } else {
+        path.into_owned()
+    }
+}
+
+fn steam_vdf_string(out: &mut Vec<u8>, key: &str, value: &str) -> Result<(), String> {
+    if key.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
+        return Err("Steam shortcut contains a string with an embedded NUL byte".into());
+    }
     out.push(1);
     out.extend_from_slice(key.as_bytes());
     out.push(0);
     out.extend_from_slice(value.as_bytes());
     out.push(0);
+    Ok(())
 }
 
 fn steam_vdf_int(out: &mut Vec<u8>, key: &str, value: u32) {
@@ -7759,16 +8685,30 @@ fn steam_vdf_key(bytes: &[u8], mut pos: usize) -> Result<(String, usize), String
     ))
 }
 
-fn steam_vdf_skip(bytes: &[u8], kind: u8, mut pos: usize) -> Result<usize, String> {
+const STEAM_VDF_MAX_NESTING: usize = 64;
+
+fn steam_vdf_skip(bytes: &[u8], kind: u8, pos: usize) -> Result<usize, String> {
+    steam_vdf_skip_nested(bytes, kind, pos, 0)
+}
+
+fn steam_vdf_skip_nested(
+    bytes: &[u8],
+    kind: u8,
+    mut pos: usize,
+    depth: usize,
+) -> Result<usize, String> {
     match kind {
         0 => loop {
+            if depth >= STEAM_VDF_MAX_NESTING {
+                return Err("Steam shortcuts file exceeds the supported nesting depth".into());
+            }
             let next = *bytes.get(pos).ok_or("Steam shortcuts file is malformed")?;
             pos += 1;
             if next == 8 {
                 return Ok(pos);
             }
             let (_, value_pos) = steam_vdf_key(bytes, pos)?;
-            pos = steam_vdf_skip(bytes, next, value_pos)?;
+            pos = steam_vdf_skip_nested(bytes, next, value_pos, depth + 1)?;
         },
         1 | 5 => {
             if kind == 1 {
@@ -7823,6 +8763,80 @@ fn steam_root_end(bytes: &[u8]) -> Result<(usize, u32), String> {
     }
 }
 
+fn steam_next_entry_index(root_end: usize, max_index: u32) -> Result<u32, String> {
+    if max_index == 0 && root_end == 12 {
+        Ok(0)
+    } else {
+        max_index
+            .checked_add(1)
+            .ok_or_else(|| "Steam shortcuts.vdf has no available entry index".into())
+    }
+}
+
+fn steam_vdf_string_value(bytes: &[u8], mut pos: usize) -> Result<(String, usize), String> {
+    let start = pos;
+    while pos < bytes.len() && bytes[pos] != 0 {
+        pos += 1;
+    }
+    if pos >= bytes.len() {
+        return Err("Steam shortcuts file is malformed".into());
+    }
+    let value = std::str::from_utf8(&bytes[start..pos])
+        .map_err(|_| "Steam shortcuts file contains invalid UTF-8")?
+        .to_string();
+    Ok((value, pos + 1))
+}
+
+fn steam_shortcut_exists(
+    bytes: &[u8],
+    executable: &str,
+    launch_options: &str,
+) -> Result<bool, String> {
+    let _ = steam_root_end(bytes)?;
+    let mut pos = 12;
+    loop {
+        let kind = *bytes.get(pos).ok_or("Steam shortcuts file is incomplete")?;
+        if kind == 8 {
+            return Ok(false);
+        }
+        pos += 1;
+        let (_, value_pos) = steam_vdf_key(bytes, pos)?;
+        if kind != 0 {
+            return Err("Steam shortcuts file has a non-object entry in its root".into());
+        }
+        let mut entry_pos = value_pos;
+        let mut entry_executable = None;
+        let mut entry_options = None;
+        loop {
+            let field_kind = *bytes
+                .get(entry_pos)
+                .ok_or("Steam shortcut entry is incomplete")?;
+            if field_kind == 8 {
+                pos = entry_pos + 1;
+                break;
+            }
+            entry_pos += 1;
+            let (field, field_value_pos) = steam_vdf_key(bytes, entry_pos)?;
+            if field_kind == 1 && matches!(field.as_str(), "Exe" | "LaunchOptions") {
+                let (value, next) = steam_vdf_string_value(bytes, field_value_pos)?;
+                if field == "Exe" {
+                    entry_executable = Some(value);
+                } else {
+                    entry_options = Some(value);
+                }
+                entry_pos = next;
+            } else {
+                entry_pos = steam_vdf_skip(bytes, field_kind, field_value_pos)?;
+            }
+        }
+        if entry_executable.as_deref() == Some(executable)
+            && entry_options.as_deref() == Some(launch_options)
+        {
+            return Ok(true);
+        }
+    }
+}
+
 fn steam_crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0_u32;
     for byte in bytes {
@@ -7835,13 +8849,36 @@ fn steam_crc32(bytes: &[u8]) -> u32 {
 }
 
 fn steam_config_dir() -> Result<PathBuf, String> {
+    #[cfg(unix)]
     let h = home()?;
+    #[cfg(unix)]
     let roots = [
         h.join(".steam/steam"),
         h.join(".steam/root"),
         h.join(".local/share/Steam"),
         h.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"),
     ];
+    #[cfg(windows)]
+    let roots = {
+        let mut roots = Vec::new();
+        if let Some(root) = env::var_os("STEAM_PATH").filter(|value| !value.is_empty()) {
+            roots.push(PathBuf::from(root));
+        }
+        if let Some(root) = steam_registry_path() {
+            roots.push(root);
+        }
+        for key in ["PROGRAMFILES(X86)", "PROGRAMFILES", "LOCALAPPDATA"] {
+            if let Some(root) = env::var_os(key).filter(|value| !value.is_empty()) {
+                let root = PathBuf::from(root);
+                if key == "LOCALAPPDATA" {
+                    roots.push(root.join("Programs").join("Steam"));
+                } else {
+                    roots.push(root.join("Steam"));
+                }
+            }
+        }
+        roots
+    };
     let mut candidates = Vec::new();
     for root in roots {
         let userdata = root.join("userdata");
@@ -7884,7 +8921,8 @@ fn add_game_to_steam(
     game_id: i64,
     image_path: String,
 ) -> Result<String, String> {
-    if fs::read_dir("/proc")
+    #[cfg(unix)]
+    let steam_running = fs::read_dir("/proc")
         .ok()
         .into_iter()
         .flatten()
@@ -7893,8 +8931,10 @@ fn add_game_to_steam(
             fs::read_to_string(entry.path().join("comm"))
                 .ok()
                 .is_some_and(|name| matches!(name.trim(), "steam" | "steam-runtime"))
-        })
-    {
+        });
+    #[cfg(windows)]
+    let steam_running = windows_process::process_name_exists("steam.exe")?;
+    if steam_running {
         return Err("Close Steam completely, then add the game again so Steam cannot overwrite its shortcut list.".into());
     }
     let image = fs::canonicalize(&image_path)
@@ -7948,12 +8988,8 @@ fn add_game_to_steam(
             *value = canonicalize_option_path(flag, value)?;
         }
     }
-    let exe = Path::new(&b.path).join("kyty_emulator");
-    if !exe.is_file()
-        || fs::metadata(&exe)
-            .map(|m| m.permissions().mode() & 0o111 == 0)
-            .unwrap_or(true)
-    {
+    let exe = emulator_executable(Path::new(&b.path));
+    if !is_emulator_executable(&exe) {
         return Err("The selected emulator build is missing or not executable".into());
     }
     let game_path = fs::canonicalize(&g.path)
@@ -7966,25 +9002,47 @@ fn add_game_to_steam(
     }
     let args = extra_profile_arguments(&options, &capabilities.switch_options);
     let config = steam_config_dir()?;
-    let launcher_dir = state_paths(&app)?.data.join("steam-launchers");
-    fs::create_dir_all(&launcher_dir).map_err(|e| e.to_string())?;
-    let launcher = launcher_dir.join(format!("game-{game_id}.sh"));
-    let mut script = format!(
-        "#!/bin/sh\nexec {} --game {}",
-        steam_shell_quote(&exe.display().to_string()),
-        steam_shell_quote(&game_path.display().to_string())
-    );
-    for arg in args {
-        script.push(' ');
-        script.push_str(&steam_shell_quote(&arg.to_string_lossy()));
-    }
-    script.push('\n');
-    fs::write(&launcher, script)
-        .map_err(|e| format!("Could not create Steam game launcher: {e}"))?;
-    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    let (exe_field, start_dir, launch_options) = {
+        let launcher_dir = state_paths(&app)?.data.join("steam-launchers");
+        fs::create_dir_all(&launcher_dir).map_err(|e| e.to_string())?;
+        let launcher = launcher_dir.join(format!("game-{game_id}.sh"));
+        let mut script = format!(
+            "#!/bin/sh\nexec {} --game {}",
+            steam_shell_quote(&exe.display().to_string()),
+            steam_shell_quote(&game_path.display().to_string())
+        );
+        for arg in args {
+            script.push(' ');
+            script.push_str(&steam_shell_quote(&arg.to_string_lossy()));
+        }
+        script.push('\n');
+        fs::write(&launcher, script)
+            .map_err(|e| format!("Could not create Steam game launcher: {e}"))?;
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))
+            .map_err(|e| e.to_string())?;
+        let exe_field = format!("\"{}\"", launcher.display());
+        (exe_field, format!("\"{}\"", b.path), String::new())
+    };
+    #[cfg(windows)]
+    let (exe_field, start_dir, launch_options) = {
+        let exe_field = format!("\"{}\"", steam_windows_path(&exe));
+        let game_path = steam_windows_path(&game_path);
+        let mut arguments = vec![OsString::from("--game"), OsString::from(&game_path)];
+        arguments.extend(args);
+        let launch_options = arguments
+            .iter()
+            .map(|argument| windows_command_line_quote(&argument.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let start_dir = format!(
+            "\"{}\"",
+            steam_windows_path(exe.parent().unwrap_or(Path::new(&b.path)))
+        );
+        (exe_field, start_dir, launch_options)
+    };
 
     let app_name = format!("{} · KytyPS5 Studio", g.title);
-    let exe_field = format!("\"{}\"", launcher.display());
     let app_id = steam_crc32(format!("{exe_field}{app_name}").as_bytes()) | 0x8000_0000;
     let launch_id = (u64::from(app_id) << 32) | 0x0200_0000;
     let grid = config.join("grid");
@@ -7995,39 +9053,32 @@ fn add_game_to_steam(
     let mut shortcuts = if shortcuts_path.exists() {
         fs::read(&shortcuts_path).map_err(|e| e.to_string())?
     } else {
-        b"\0shortcuts\0\0\x08\x08\x08".to_vec()
+        b"\0shortcuts\0\0\x08\x08".to_vec()
     };
-    if !shortcuts
-        .windows(launcher.to_string_lossy().len())
-        .any(|part| part == launcher.to_string_lossy().as_bytes())
-    {
+    if !steam_shortcut_exists(&shortcuts, &exe_field, &launch_options)? {
         let (root_end, max_index) = steam_root_end(&shortcuts)?;
         let mut entry = Vec::new();
         entry.push(0);
-        let entry_index = if max_index == 0 && root_end == 12 {
-            0
-        } else {
-            max_index.saturating_add(1)
-        };
+        let entry_index = steam_next_entry_index(root_end, max_index)?;
         entry.extend_from_slice(entry_index.to_string().as_bytes());
         entry.push(0);
         steam_vdf_int(&mut entry, "appid", app_id);
-        steam_vdf_string(&mut entry, "AppName", &app_name);
-        steam_vdf_string(&mut entry, "Exe", &exe_field);
-        steam_vdf_string(&mut entry, "StartDir", &format!("\"{}\"", b.path));
-        steam_vdf_string(&mut entry, "icon", &artwork.display().to_string());
-        steam_vdf_string(&mut entry, "ShortcutPath", "");
-        steam_vdf_string(&mut entry, "LaunchOptions", "");
+        steam_vdf_string(&mut entry, "AppName", &app_name)?;
+        steam_vdf_string(&mut entry, "Exe", &exe_field)?;
+        steam_vdf_string(&mut entry, "StartDir", &start_dir)?;
+        steam_vdf_string(&mut entry, "icon", &artwork.display().to_string())?;
+        steam_vdf_string(&mut entry, "ShortcutPath", "")?;
+        steam_vdf_string(&mut entry, "LaunchOptions", &launch_options)?;
         steam_vdf_int(&mut entry, "IsHidden", 0);
         steam_vdf_int(&mut entry, "AllowDesktopConfig", 1);
         steam_vdf_int(&mut entry, "AllowOverlay", 1);
         steam_vdf_int(&mut entry, "OpenVR", 0);
         steam_vdf_int(&mut entry, "Devkit", 0);
-        steam_vdf_string(&mut entry, "DevkitGameID", "");
+        steam_vdf_string(&mut entry, "DevkitGameID", "")?;
         steam_vdf_int(&mut entry, "DevkitOverrideAppID", 0);
         steam_vdf_int(&mut entry, "LastPlayTime", 0);
-        steam_vdf_string(&mut entry, "FlatpakAppID", "");
-        steam_vdf_string(&mut entry, "sortas", &app_name);
+        steam_vdf_string(&mut entry, "FlatpakAppID", "")?;
+        steam_vdf_string(&mut entry, "sortas", &app_name)?;
         entry.push(0);
         entry.extend_from_slice(b"tags\0");
         entry.push(8);
@@ -8043,7 +9094,8 @@ fn add_game_to_steam(
                 .open(&temporary)?;
             file.write_all(&shortcuts)?;
             file.sync_all()?;
-            fs::rename(&temporary, &shortcuts_path)
+            drop(file);
+            replace_file(&temporary, &shortcuts_path)
         })();
         if let Err(error) = write_result {
             let _ = fs::remove_file(&temporary);
@@ -8058,6 +9110,9 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
     let _session_lifecycle = SESSION_LIFECYCLE_LOCK
         .lock()
         .map_err(|error| error.to_string())?;
+    if app.state::<Arc<Jobs>>().updating.load(Ordering::SeqCst) {
+        return Err("KytyPS5 Studio is installing an application update".into());
+    }
     let mut c = db(&app)?;
     let g = game(&c, game_id)?;
     let game_profile = profile(&c, game_id)?;
@@ -8101,7 +9156,7 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
     {
         return Err("The selected emulator build no longer supports this game's saved profile. Clear unsupported profile options before launching.".into());
     }
-    let exe = Path::new(&b.path).join("kyty_emulator");
+    let exe = Path::new(&b.path).join(emulator_binary_name());
     let game_path = fs::canonicalize(&g.path)
         .map_err(|_| "The registered game path is missing or inaccessible".to_string())?;
     if !supported_game_path(&game_path) {
@@ -8110,11 +9165,7 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
                 .into(),
         );
     }
-    if !exe.is_file()
-        || fs::metadata(&exe)
-            .map(|m| m.permissions().mode() & 0o111 == 0)
-            .unwrap_or(true)
-    {
+    if !is_emulator_executable(&exe) {
         return Err("Emulator or game path no longer exists".into());
     }
     let log = state_paths(&app)?.data.join("logs");
@@ -8143,6 +9194,7 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    prepare_owned_child(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -8164,6 +9216,15 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
             return Err(format!("Could not start emulator: {error}"));
         }
     };
+    if let Err(error) = attach_owned_child(&mut child) {
+        let _ = c.execute(
+            "UPDATE sessions SET ended_at=?,outcome='ownership_error' WHERE id=? AND ended_at IS NULL",
+            params![now(), session_id],
+        );
+        return Err(format!(
+            "Could not safely manage the emulator process: {error}"
+        ));
+    }
     let pid = child.id();
     let process = (0..10).find_map(|_| {
         let stat = proc_stat(pid);
@@ -8173,8 +9234,7 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
         stat
     });
     let Some(process) = process else {
-        let cleanup = stop_process_group(pid as i32);
-        let wait = child.wait();
+        let (cleanup, wait) = stop_and_reap_owned_child(&mut child);
         let message = "Could not verify the emulator process identity";
         let _ = c.execute(
             "UPDATE sessions SET ended_at=?,outcome='identity_error' WHERE id=? AND ended_at IS NULL",
@@ -8185,9 +9245,7 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
             (cleanup, wait) => format!(
                 "{message}; process cleanup: {}; child wait: {}",
                 cleanup.err().unwrap_or_else(|| "ok".into()),
-                wait.err()
-                    .map(|error| error.to_string())
-                    .unwrap_or_else(|| "ok".into())
+                wait.err().unwrap_or_else(|| "ok".into())
             ),
         });
     };
@@ -8196,36 +9254,37 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
         params![pid as i64, process.start_ticks as i64, session_id],
     );
     if let Err(error) = tracking {
-        let _ = stop_process_group(pid as i32);
-        let _ = child.wait();
+        let (cleanup, wait) = stop_and_reap_owned_child(&mut child);
         let _ = c.execute(
             "UPDATE sessions SET ended_at=?,outcome='tracking_error' WHERE id=?",
             params![now(), session_id],
         );
         return Err(format!(
-            "Emulator started as PID {pid}, but session tracking failed: {error}"
+            "Emulator started as PID {pid}, but session tracking failed: {error}{}{}",
+            cleanup
+                .err()
+                .map(|error| format!("; process cleanup failed: {error}"))
+                .unwrap_or_default(),
+            wait.err()
+                .map(|error| format!("; child wait failed: {error}"))
+                .unwrap_or_default()
         ));
     }
     emit(&app, "game", "Running", format!("PID {pid}"), false, true);
     thread::spawn(move || {
         let result = (|| -> Result<(Option<i32>, String), String> {
-            let setup = child
-                .stdout
-                .as_ref()
-                .map(|stream| set_nonblocking_fd(stream.as_raw_fd()))
-                .transpose()
-                .and_then(|_| {
-                    child
-                        .stderr
-                        .as_ref()
-                        .map(|stream| set_nonblocking_fd(stream.as_raw_fd()))
-                        .transpose()
-                });
+            let setup = configure_session_output(&child);
             if let Err(error) = setup {
-                let _ = stop_process_group(pid as i32);
-                let _ = child.wait();
+                let (cleanup, wait) = stop_and_reap_owned_child(&mut child);
                 return Err(format!(
-                    "Could not prepare nonblocking emulator log pipes: {error}"
+                    "Could not prepare emulator log pipes: {error}{}{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; process cleanup failed: {error}"))
+                        .unwrap_or_default(),
+                    wait.err()
+                        .map(|error| format!("; child wait failed: {error}"))
+                        .unwrap_or_default()
                 ));
             }
             let stop_readers = Arc::new(AtomicBool::new(false));
@@ -8357,12 +9416,15 @@ fn process_metrics(
         .collect::<Result<_, _>>()?;
     drop(statement);
 
+    #[cfg(unix)]
     let clock_ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+    #[cfg(windows)]
+    let clock_ticks = windows_process::cpu_clock_ticks_per_second();
     let now_instant = Instant::now();
     let now_wall = now();
     let mut previous = samples.0.lock().map_err(|e| e.to_string())?;
     let mut active_ids = HashSet::new();
-    let mut lost: Vec<(i64, Option<i64>, &'static str)> = Vec::new();
+    let mut lost: Vec<(i64, Option<i64>, Option<u32>, &'static str)> = Vec::new();
     let mut result = Vec::with_capacity(active.len());
     for (
         session_id,
@@ -8381,7 +9443,7 @@ fn process_metrics(
         let runtime = now_wall.saturating_sub(started_at).max(0);
         let Some(pid) = pid.and_then(|pid| u32::try_from(pid).ok()) else {
             let status = if runtime > 10 {
-                lost.push((session_id, None, "launch_interrupted"));
+                lost.push((session_id, None, None, "launch_interrupted"));
                 "Launch interrupted; process was not recorded"
             } else {
                 "Starting"
@@ -8402,11 +9464,11 @@ fn process_metrics(
             continue;
         };
 
-        let expected_executable = Path::new(&build_path).join("kyty_emulator");
+        let expected_executable = Path::new(&build_path).join(emulator_binary_name());
         let stat = expected_start.and_then(|expected| {
             proc_stat(pid).filter(|stat| {
                 verified_session_process(
-                    pid as i32,
+                    i64::from(pid),
                     Some(expected),
                     *stat,
                     process_executable_matches(pid, &expected_executable),
@@ -8417,7 +9479,7 @@ fn process_metrics(
             let sample = previous.entry(session_id).or_default();
             sample.missing_samples = sample.missing_samples.saturating_add(1);
             let status = if sample.missing_samples >= PROCESS_MISSING_SAMPLE_LIMIT {
-                lost.push((session_id, Some(started_at), "process_lost"));
+                lost.push((session_id, Some(started_at), Some(pid), "process_lost"));
                 "Process ended; exit status unavailable"
             } else {
                 "Checking process status"
@@ -8472,12 +9534,19 @@ fn process_metrics(
         });
     }
     previous.retain(|session_id, _| {
-        active_ids.contains(session_id) && !lost.iter().any(|(lost_id, _, _)| lost_id == session_id)
+        active_ids.contains(session_id)
+            && !lost.iter().any(|(lost_id, _, _, _)| lost_id == session_id)
     });
     drop(previous);
     if !lost.is_empty() {
+        #[cfg(windows)]
+        for (_, _, pid, _) in &lost {
+            if let Some(pid) = pid {
+                windows_process::release_child(*pid);
+            }
+        }
         let mut conn = db(&app)?;
-        for (session_id, started_at, outcome) in lost {
+        for (session_id, started_at, _, outcome) in lost {
             record_lost_session(&mut conn, session_id, now_wall, started_at, outcome)?;
         }
     }
@@ -8496,18 +9565,30 @@ fn stop_game_session(app: tauri::AppHandle, session_id: i64) -> Result<String, S
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| "Active game session was not found".to_string())?;
+    #[cfg(windows)]
+    let pid = pid
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 1)
+        .ok_or("The session has no verified emulator process ID")?;
+    #[cfg(not(windows))]
     let pid = pid
         .and_then(|value| i32::try_from(value).ok())
         .filter(|value| *value > 1)
         .ok_or("The session has no verified emulator process ID")?;
-    let expected_executable = Path::new(&build_path).join("kyty_emulator");
+    let expected_executable = Path::new(&build_path).join(emulator_binary_name());
     #[cfg(target_os = "linux")]
     stop_verified_session_group(pid, expected_start, &expected_executable)?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    windows_process::terminate_verified(
+        pid,
+        expected_start.ok_or("The session has no verified process creation time")?,
+        &expected_executable,
+    )?;
+    #[cfg(all(not(target_os = "linux"), not(windows)))]
     {
         let actual = proc_stat(pid as u32).ok_or("The emulator process has already exited")?;
         if !verified_session_process(
-            pid,
+            i64::from(pid),
             expected_start,
             actual,
             process_executable_matches(pid as u32, &expected_executable),
@@ -8523,15 +9604,14 @@ fn recent_sessions(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, Stri
     let c = db(&app)?;
     let mut s=c.prepare("SELECT sessions.id,sessions.game_id,sessions.build_id,games.title,sessions.started_at,sessions.ended_at,sessions.exit_code,sessions.outcome,sessions.log_path,builds.commit_sha,builds.build_type,sessions.process_pid FROM sessions JOIN games ON games.id=sessions.game_id JOIN builds ON builds.id=sessions.build_id ORDER BY sessions.id DESC LIMIT 10").map_err(|e|e.to_string())?;
     let rows=s.query_map([],|r|Ok(serde_json::json!({"id":r.get::<_,i64>(0)?,"game_id":r.get::<_,i64>(1)?,"build_id":r.get::<_,i64>(2)?,"title":r.get::<_,String>(3)?,"started_at":r.get::<_,i64>(4)?,"ended_at":r.get::<_,Option<i64>>(5)?,"exit_code":r.get::<_,Option<i32>>(6)?,"outcome":r.get::<_,Option<String>>(7)?,"log_path":r.get::<_,String>(8)?,"commit_sha":r.get::<_,String>(9)?,"build_type":r.get::<_,String>(10)?,"pid":r.get::<_,Option<i64>>(11)?}))).map_err(|e|e.to_string())?;
-    let result = rows.map(|r| r.map_err(|e| e.to_string())).collect();
-    result
+    rows.map(|r| r.map_err(|e| e.to_string())).collect()
 }
 #[tauri::command]
 fn read_log(path: String, app: tauri::AppHandle) -> Result<String, String> {
     let base = fs::canonicalize(state_paths(&app)?.data.join("logs"))
         .map_err(|e| format!("Managed log directory is unavailable: {e}"))?;
     let p = fs::canonicalize(path).map_err(|e| e.to_string())?;
-    if !p.starts_with(&base) || !p.is_file() {
+    if !path_starts_with(&p, &base) || !p.is_file() {
         return Err("Log path is outside the managed directory".into());
     }
     read_bounded_tail(&p, 4 * 1024 * 1024)
@@ -8541,7 +9621,7 @@ fn export_log(path: String, destination: String, app: tauri::AppHandle) -> Resul
     let log_root = fs::canonicalize(state_paths(&app)?.data.join("logs"))
         .map_err(|error| format!("Managed log directory is unavailable: {error}"))?;
     let source = fs::canonicalize(path).map_err(|error| error.to_string())?;
-    if !source.starts_with(&log_root) || !source.is_file() {
+    if !path_starts_with(&source, &log_root) || !source.is_file() {
         return Err("Log path is outside the managed log directory".into());
     }
     copy_file_atomically(&source, Path::new(&destination), 512 * 1024 * 1024)
@@ -8594,7 +9674,8 @@ fn copy_file_atomically(source: &Path, destination: &Path, limit: u64) -> Result
             return Err(format!("Log grew beyond the {limit}-byte export limit"));
         }
         output.sync_all().map_err(|error| error.to_string())?;
-        fs::rename(&temporary, &destination)
+        drop(output);
+        replace_file(&temporary, &destination)
             .map_err(|error| format!("Could not finalize exported log: {error}"))?;
         Ok(())
     })();
@@ -8628,7 +9709,7 @@ fn read_build_log(app: tauri::AppHandle, id: i64) -> Result<String, String> {
     let b = build(&c, id)?;
     let root = fs::canonicalize(&b.path).map_err(|e| e.to_string())?;
     let path = fs::canonicalize(root.join("build.log")).map_err(|e| e.to_string())?;
-    if !path.starts_with(&root) || !path.is_file() {
+    if !path_starts_with(&path, &root) || !path.is_file() {
         return Err("Build log is outside the registered installation".into());
     }
     read_bounded_tail(&path, 4 * 1024 * 1024)
@@ -8664,24 +9745,172 @@ fn discord_current_state(app: &tauri::AppHandle) -> Result<(bool, Option<Discord
     Ok((enabled, active))
 }
 
-fn discord_ipc_candidates() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(dir) = env::var_os("XDG_RUNTIME_DIR") {
-        dirs.push(PathBuf::from(dir));
-    }
-    dirs.push(PathBuf::from("/tmp"));
+#[cfg(unix)]
+type DiscordStream = UnixStream;
+#[cfg(windows)]
+type DiscordStream = fs::File;
+
+#[cfg(unix)]
+fn discord_ipc_candidates_from_dirs(dirs: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
     dirs.into_iter()
-        .flat_map(|dir| (0..10).map(move |i| dir.join(format!("discord-ipc-{i}"))))
+        .filter(|dir| seen.insert(dir.clone()))
+        .flat_map(|dir| (0..10).map(move |index| dir.join(format!("discord-ipc-{index}"))))
         .collect()
 }
 
-fn discord_write_frame(stream: &mut UnixStream, op: u32, payload: &[u8]) -> std::io::Result<()> {
-    stream.write_all(&(op as u32).to_le_bytes())?;
-    stream.write_all(&(payload.len() as u32).to_le_bytes())?;
-    stream.write_all(payload)
+#[cfg(unix)]
+fn discord_ipc_candidates() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for variable in ["XDG_RUNTIME_DIR", "TMPDIR", "TMP", "TEMP"] {
+        if let Some(dir) = env::var_os(variable).filter(|dir| !dir.is_empty()) {
+            dirs.push(PathBuf::from(dir));
+        }
+    }
+    dirs.push(PathBuf::from("/tmp"));
+    discord_ipc_candidates_from_dirs(dirs)
 }
 
-fn connect_discord(client_id: &str) -> Option<UnixStream> {
+#[cfg(windows)]
+fn discord_ipc_candidates() -> Vec<PathBuf> {
+    (0..10)
+        .map(|index| PathBuf::from(format!(r"\\.\pipe\discord-ipc-{index}")))
+        .collect()
+}
+
+fn discord_write_frame<W: Write>(stream: &mut W, op: u32, payload: &[u8]) -> std::io::Result<()> {
+    let length = u32::try_from(payload.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Discord frame is too large",
+        )
+    })?;
+    let mut frame = Vec::with_capacity(8 + payload.len());
+    frame.extend_from_slice(&op.to_le_bytes());
+    frame.extend_from_slice(&length.to_le_bytes());
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame)
+}
+
+fn discord_ready_frame(opcode: u32, payload: &[u8]) -> bool {
+    opcode == 1
+        && serde_json::from_slice::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|message| message.get("evt")?.as_str().map(str::to_owned))
+            .as_deref()
+            == Some("READY")
+}
+
+const DISCORD_MAX_FRAME_BYTES: usize = 64 * 1024;
+
+fn discord_process_buffered_frames<W: Write>(
+    stream: &mut W,
+    buffered: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let mut consumed = 0;
+    while buffered.len().saturating_sub(consumed) >= 8 {
+        let header = &buffered[consumed..consumed + 8];
+        let opcode = u32::from_le_bytes(header[..4].try_into().unwrap());
+        let length = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+        if length > DISCORD_MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Discord IPC frame exceeded the supported size",
+            ));
+        }
+        let frame_end = consumed + 8 + length;
+        if buffered.len() < frame_end {
+            break;
+        }
+        let payload = &buffered[consumed + 8..frame_end];
+        match opcode {
+            2 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "Discord closed the Rich Presence connection",
+                ));
+            }
+            3 => discord_write_frame(stream, 4, payload)?,
+            1 | 4 => {}
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Discord IPC sent an unsupported opcode",
+                ));
+            }
+        }
+        consumed = frame_end;
+    }
+    if consumed > 0 {
+        buffered.drain(..consumed);
+    }
+    if buffered.len() > DISCORD_MAX_FRAME_BYTES + 8 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Discord IPC receive buffer exceeded the supported size",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn discord_poll_frames(stream: &mut DiscordStream, buffered: &mut Vec<u8>) -> std::io::Result<()> {
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Discord IPC connection closed",
+                ));
+            }
+            Ok(count) => buffered.extend_from_slice(&chunk[..count]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    discord_process_buffered_frames(stream, buffered)
+}
+
+#[cfg(windows)]
+fn discord_poll_frames(stream: &mut DiscordStream, buffered: &mut Vec<u8>) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    loop {
+        let mut available = 0_u32;
+        let ok = unsafe {
+            PeekNamedPipe(
+                stream.as_raw_handle().cast(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if available == 0 {
+            break;
+        }
+        let mut chunk = vec![0_u8; available.min(16 * 1024) as usize];
+        let count = stream.read(&mut chunk)?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Discord IPC connection closed",
+            ));
+        }
+        buffered.extend_from_slice(&chunk[..count]);
+    }
+    discord_process_buffered_frames(stream, buffered)
+}
+
+#[cfg(unix)]
+fn connect_discord(client_id: &str) -> Option<DiscordStream> {
     let mut stream = discord_ipc_candidates()
         .into_iter()
         .find_map(|path| UnixStream::connect(path).ok())?;
@@ -8696,8 +9925,108 @@ fn connect_discord(client_id: &str) -> Option<UnixStream> {
     }
     let mut response = vec![0u8; length];
     stream.read_exact(&mut response).ok()?;
-    let message: serde_json::Value = serde_json::from_slice(&response).ok()?;
-    (message.get("evt").and_then(|v| v.as_str()) == Some("READY")).then_some(stream)
+    if !discord_ready_frame(u32::from_le_bytes(header[..4].try_into().ok()?), &response) {
+        return None;
+    }
+    stream.set_nonblocking(true).ok()?;
+    Some(stream)
+}
+
+#[cfg(windows)]
+fn connect_discord_at(client_id: &str, path: &Path) -> Option<DiscordStream> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // Opening a busy synchronous named pipe can otherwise wait forever. Discord
+    // usually has a free instance; if it does not, skip it and try the next IPC
+    // slot rather than blocking the presence worker.
+    if unsafe { WaitNamedPipeW(path_wide.as_ptr(), 50) } == 0 {
+        return None;
+    }
+    let mut stream = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()?;
+    let handshake = serde_json::json!({"v": 1, "client_id": client_id});
+    discord_write_frame(&mut stream, 0, handshake.to_string().as_bytes()).ok()?;
+    read_windows_discord_ready(&mut stream).then_some(stream)
+}
+
+#[cfg(windows)]
+fn connect_discord(client_id: &str) -> Option<DiscordStream> {
+    discord_ipc_candidates()
+        .iter()
+        .find_map(|path| connect_discord_at(client_id, path))
+}
+
+#[cfg(windows)]
+fn read_windows_discord_ready(stream: &mut DiscordStream) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut header = [0_u8; 8];
+    loop {
+        let mut available = 0_u32;
+        let ok = unsafe {
+            PeekNamedPipe(
+                stream.as_raw_handle().cast(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || Instant::now() >= deadline {
+            return false;
+        }
+        if available >= header.len() as u32 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    if stream.read_exact(&mut header).is_err() {
+        return false;
+    }
+    let length = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+    if length > 64 * 1024 {
+        return false;
+    }
+    while Instant::now() < deadline {
+        let mut available = 0_u32;
+        let ok = unsafe {
+            PeekNamedPipe(
+                stream.as_raw_handle().cast(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return false;
+        }
+        if available >= length as u32 {
+            let mut response = vec![0_u8; length];
+            if stream.read_exact(&mut response).is_err() {
+                return false;
+            }
+            return discord_ready_frame(
+                u32::from_le_bytes(header[..4].try_into().unwrap()),
+                &response,
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    false
 }
 
 fn discord_game_artwork_url(title_id: &str) -> Option<String> {
@@ -8786,13 +10115,15 @@ fn discord_activity(
 
 fn start_discord_presence(app: tauri::AppHandle) {
     thread::spawn(move || {
-        let mut stream: Option<UnixStream> = None;
+        let mut stream: Option<DiscordStream> = None;
+        let mut incoming = Vec::new();
         let mut nonce = 0u64;
         let mut artwork_cache: HashMap<i64, Option<String>> = HashMap::new();
         loop {
             let (enabled, session) = discord_current_state(&app).unwrap_or_default();
             if !enabled {
                 stream = None;
+                incoming.clear();
                 thread::sleep(Duration::from_secs(5));
                 continue;
             }
@@ -8817,11 +10148,24 @@ fn start_discord_presence(app: tauri::AppHandle) {
                     "args": {"pid": std::process::id(), "activity": discord_activity(session.as_ref(), artwork_url)},
                     "nonce": nonce.to_string()
                 });
-                if discord_write_frame(connection, 1, payload.to_string().as_bytes()).is_err() {
+                let write_failed =
+                    discord_write_frame(connection, 1, payload.to_string().as_bytes()).is_err();
+                if write_failed {
                     stream = None;
+                    incoming.clear();
                 }
             }
-            thread::sleep(Duration::from_secs(15));
+            for _ in 0..15 {
+                thread::sleep(Duration::from_secs(1));
+                let poll_failed = stream.as_mut().is_some_and(|connection| {
+                    discord_poll_frames(connection, &mut incoming).is_err()
+                });
+                if poll_failed {
+                    stream = None;
+                    incoming.clear();
+                    break;
+                }
+            }
         }
     });
 }
@@ -8883,21 +10227,18 @@ fn notification_text(value: &str, maximum: usize) -> String {
         .collect()
 }
 #[tauri::command]
-fn desktop_notification(title: String, body: String) -> Result<(), String> {
+fn desktop_notification(app: tauri::AppHandle, title: String, body: String) -> Result<(), String> {
     let title = notification_text(&title, 120);
     let body = notification_text(&body, 2048);
-    let status = Command::new("notify-send")
-        .arg("--app-name=KytyPS5 Studio")
-        .arg("--")
-        .arg(title)
-        .arg(body)
-        .status()
-        .map_err(|error| format!("Desktop notifications are unavailable: {error}"))?;
-    if !status.success() {
-        return Err(format!("Desktop notification command exited with {status}"));
-    }
-    Ok(())
+    use tauri_plugin_notification::NotificationExt;
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|error| format!("Desktop notifications are unavailable: {error}"))
 }
+#[cfg(any(target_os = "linux", test))]
 fn should_disable_dmabuf_renderer(
     session_type: &str,
     user_override_present: bool,
@@ -8909,26 +10250,30 @@ fn should_disable_dmabuf_renderer(
 }
 use rusqlite::OptionalExtension;
 pub fn run() {
-    let session_type = env::var("XDG_SESSION_TYPE").unwrap_or_default();
-    let vendor_ids: Vec<_> = fs::read_dir("/sys/class/drm")
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| fs::read_to_string(entry.path().join("device/vendor")).ok())
-        .map(|vendor| vendor.trim().to_string())
-        .collect();
-    if should_disable_dmabuf_renderer(
-        &session_type,
-        env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some(),
-        &vendor_ids,
-    ) {
-        env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    #[cfg(target_os = "linux")]
+    {
+        let session_type = env::var("XDG_SESSION_TYPE").unwrap_or_default();
+        let vendor_ids: Vec<_> = fs::read_dir("/sys/class/drm")
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read_to_string(entry.path().join("device/vendor")).ok())
+            .map(|vendor| vendor.trim().to_string())
+            .collect();
+        if should_disable_dmabuf_renderer(
+            &session_type,
+            env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some(),
+            &vendor_ids,
+        ) {
+            env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
     }
     let p = Paths::new().expect("Cannot create application directories");
     p.db().expect("Cannot initialize database");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             start_discord_presence(app.handle().clone());
             Ok(())
@@ -8937,6 +10282,7 @@ pub fn run() {
         .manage(Arc::new(Jobs {
             pid: AtomicI32::new(0),
             active: AtomicBool::new(false),
+            updating: AtomicBool::new(false),
             job_id: AtomicU64::new(0),
             event_kind: Mutex::new(String::new()),
             cancel_requested: AtomicBool::new(false),
@@ -9023,7 +10369,574 @@ pub fn run() {
 }
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_containment_uses_case_folding_and_component_boundaries() {
+        use std::path::Path;
+
+        assert!(super::path_starts_with(
+            Path::new(r"\\?\C:\Users\Älice\Games\Title"),
+            Path::new(r"\\?\c:\users\äLICE\games")
+        ));
+        assert!(!super::path_starts_with(
+            Path::new(r"\\?\C:\Users\Alice2\Games"),
+            Path::new(r"\\?\C:\Users\Alice")
+        ));
+        assert!(super::path_starts_with(
+            Path::new(r"\\?\UNC\Server\Share\Games\Title"),
+            Path::new(r"\\?\UNC\server\share\games")
+        ));
+        assert!(super::paths_equal(
+            Path::new(r"C:\Users\Alice\Games"),
+            Path::new(r"c:\users\alice\games")
+        ));
+    }
+    #[cfg(not(windows))]
+    #[test]
+    fn path_containment_keeps_linux_case_sensitive_semantics() {
+        use std::path::Path;
+
+        assert!(super::path_starts_with(
+            Path::new("/home/alice/games/title"),
+            Path::new("/home/alice/games")
+        ));
+        assert!(!super::path_starts_with(
+            Path::new("/home/alice/Games/title"),
+            Path::new("/home/alice/games")
+        ));
+        assert!(!super::path_starts_with(
+            Path::new("/home/alice/games-backup"),
+            Path::new("/home/alice/games")
+        ));
+    }
+    #[test]
+    fn compatibility_summary_selects_each_hosts_report_and_falls_back_to_overall() {
+        let game = super::OfficialCompatibilityGame {
+            title_id: "PPSA12345".into(),
+            title: "Example".into(),
+            overall: "main-menu".into(),
+            status: "main-menu".into(),
+            preferred_os: "all".into(),
+            os: HashMap::from([
+                ("linux".into(), "playable".into()),
+                ("Windows".into(), "logo".into()),
+            ]),
+            report_counts: HashMap::new(),
+            latest_tested: None,
+        };
+        let linux = super::prioritize_compatibility_game(game.clone(), "linux");
+        assert_eq!(linux.preferred_os, "linux");
+        assert_eq!(linux.status, "playable");
+        let windows = super::prioritize_compatibility_game(game.clone(), "windows");
+        assert_eq!(windows.preferred_os, "windows");
+        assert_eq!(windows.status, "logo");
+        let fallback = super::prioritize_compatibility_game(game, "macos");
+        assert_eq!(fallback.preferred_os, "all");
+        assert_eq!(fallback.status, "main-menu");
+
+        let cached = serde_json::json!([{
+            "title_id": "PPSA12345",
+            "title": "Example",
+            "overall": "main-menu",
+            "status": "playable",
+            "preferred_os": "linux",
+            "os": { "linux": "playable", "windows": "logo" },
+            "report_counts": {},
+            "latest_tested": null
+        }]);
+        let reloaded = super::cached_compatibility_games(cached, "windows");
+        assert_eq!(reloaded[0].preferred_os, "windows");
+        assert_eq!(reloaded[0].status, "logo");
+    }
+    #[test]
+    fn official_compatibility_index_decodes_site_camel_case_and_prioritizes_host_report() {
+        let payload = serde_json::json!({
+            "version": 2,
+            "games": [{
+                "key": "PPSA12345",
+                "title": "Example",
+                "titleId": "PPSA12345",
+                "overall": "in-game",
+                "os": {"windows": "main-menu", "linux": "in-game"},
+                "reportCounts": {"windows": 1, "linux": 1},
+                "latestTested": "2026-10-20",
+                "cover": "https://example.invalid/cover.png"
+            }]
+        });
+        let index: super::OfficialSiteIndexPayload =
+            serde_json::from_value(payload).expect("current official index schema decodes");
+        let game = &index.games[0];
+        let prioritized = super::prioritize_compatibility_game(
+            super::OfficialCompatibilityGame {
+                title_id: game.title_id.clone().unwrap(),
+                title: game.title.clone(),
+                overall: game.overall.clone(),
+                status: game.overall.clone(),
+                preferred_os: "all".into(),
+                os: game.os.clone(),
+                report_counts: game.report_counts.clone(),
+                latest_tested: game.latest_tested.clone(),
+            },
+            "windows",
+        );
+        assert_eq!(prioritized.title_id, "PPSA12345");
+        assert_eq!(prioritized.preferred_os, "windows");
+        assert_eq!(prioritized.status, "main-menu");
+        assert_eq!(prioritized.report_counts["windows"], 1);
+    }
+
     use super::*;
+    #[cfg(windows)]
+    fn windows_test_command(program: &str, args: &[&str]) -> Command {
+        let mut command = Command::new(program);
+        command.args(args);
+        prepare_owned_child(&mut command);
+        command
+    }
+
+    #[test]
+    fn atomic_file_replacement_overwrites_existing_unicode_path() {
+        let root = std::env::temp_dir().join(format!(
+            "kyty-atomic-replace-{}-{}-ü",
+            std::process::id(),
+            now()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("shortcuts-ゲーム.vdf");
+        let temporary = root.join("shortcuts-ゲーム.vdf.tmp");
+        fs::write(&destination, b"old data").unwrap();
+        fs::write(&temporary, b"new data").unwrap();
+
+        replace_file(&temporary, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new data");
+        assert!(!temporary.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(any(windows, test))]
+    #[test]
+    fn windows_steam_launch_arguments_preserve_unicode_unc_and_quoted_paths() {
+        assert_eq!(
+            windows_command_line_quote(r"C:\Games\PS5 Titles\"),
+            r#""C:\Games\PS5 Titles\\""#
+        );
+        assert_eq!(
+            windows_command_line_quote(r"\\server\profile share\ゲーム\kyty_emulator.exe"),
+            r#""\\server\profile share\ゲーム\kyty_emulator.exe""#
+        );
+        assert_eq!(
+            windows_command_line_quote(r#"D:\保存したゲーム\a"b\"#),
+            r#""D:\保存したゲーム\a\"b\\""#
+        );
+        assert_eq!(windows_command_line_quote("a\"b"), r#""a\"b""#);
+    }
+    #[test]
+    fn steam_windows_paths_strip_verbatim_prefix_for_short_paths_only() {
+        assert_eq!(
+            steam_windows_path(Path::new(r"\\?\C:\Games\Title")),
+            r"C:\Games\Title"
+        );
+        assert_eq!(
+            steam_windows_path(Path::new(r"\\?\UNC\server\share\Title")),
+            r"\\server\share\Title"
+        );
+
+        let long_path = format!(r"\\?\C:\{}", "x".repeat(260));
+        assert_eq!(steam_windows_path(Path::new(&long_path)), long_path);
+    }
+    #[test]
+    fn steam_shortcuts_vdf_empty_root_accepts_a_new_entry_without_extra_terminators() {
+        let mut shortcuts = b"\0shortcuts\0\0\x08\x08".to_vec();
+        let (root_end, max_index) = steam_root_end(&shortcuts).unwrap();
+        assert_eq!(max_index, 0);
+        assert_eq!(steam_next_entry_index(root_end, max_index).unwrap(), 0);
+        assert_eq!(&shortcuts[root_end..], b"\x08\x08");
+
+        let mut entry = vec![0];
+        entry.extend_from_slice(b"0\0");
+        steam_vdf_string(&mut entry, "AppName", "Studio test").unwrap();
+        entry.push(8);
+        shortcuts.splice(root_end..root_end, entry);
+
+        let (root_end, max_index) = steam_root_end(&shortcuts).unwrap();
+        assert_eq!(max_index, 0);
+        assert_eq!(steam_next_entry_index(root_end, max_index).unwrap(), 1);
+        assert_eq!(&shortcuts[root_end..], b"\x08\x08");
+    }
+    #[test]
+    fn steam_shortcut_index_overflow_is_reported_without_reusing_an_entry() {
+        let mut shortcuts = b"\0shortcuts\0\0".to_vec();
+        shortcuts.push(0);
+        shortcuts.extend_from_slice(b"4294967295\0");
+        shortcuts.extend_from_slice(b"\x08\x08\x08");
+        let (root_end, max_index) = steam_root_end(&shortcuts).unwrap();
+        assert_eq!(max_index, u32::MAX);
+        assert_eq!(
+            steam_next_entry_index(root_end, max_index).unwrap_err(),
+            "Steam shortcuts.vdf has no available entry index"
+        );
+    }
+    #[test]
+    fn steam_shortcut_deduplication_matches_executable_and_game_arguments() {
+        let mut shortcuts = b"\0shortcuts\0\0\x08\x08".to_vec();
+        let (root_end, _) = steam_root_end(&shortcuts).unwrap();
+        let mut entry = vec![0];
+        entry.extend_from_slice(b"0\0");
+        steam_vdf_string(
+            &mut entry,
+            "Exe",
+            r#""C:\Program Files\Kyty\kyty_emulator.exe""#,
+        )
+        .unwrap();
+        steam_vdf_string(
+            &mut entry,
+            "LaunchOptions",
+            r#""--game" "D:\保存したゲーム\Game One""#,
+        )
+        .unwrap();
+        entry.push(8);
+        shortcuts.splice(root_end..root_end, entry);
+
+        let executable = r#""C:\Program Files\Kyty\kyty_emulator.exe""#;
+        assert!(steam_shortcut_exists(
+            &shortcuts,
+            executable,
+            r#""--game" "D:\保存したゲーム\Game One""#
+        )
+        .unwrap());
+        assert!(!steam_shortcut_exists(
+            &shortcuts,
+            executable,
+            r#""--game" "D:\保存したゲーム\Game Two""#
+        )
+        .unwrap());
+        assert!(!steam_shortcut_exists(
+            &shortcuts,
+            r#""C:\Program Files\Kyty\kyty_emulator.exe.old""#,
+            r#""--game" "D:\保存したゲーム\Game One""#
+        )
+        .unwrap());
+    }
+    #[test]
+    fn steam_shortcut_vdf_strings_reject_nuls_and_preserve_unicode() {
+        let mut output = Vec::new();
+        steam_vdf_string(&mut output, "AppName", "KytyPS5 · ゲーム 🎮").unwrap();
+        assert!(output
+            .windows("ゲーム 🎮".len())
+            .any(|part| part == "ゲーム 🎮".as_bytes()));
+
+        let before = output.clone();
+        assert!(steam_vdf_string(&mut output, "AppName", "bad\0title")
+            .unwrap_err()
+            .contains("NUL"));
+        assert_eq!(
+            output, before,
+            "rejected strings do not mutate the VDF buffer"
+        );
+        assert!(steam_vdf_string(&mut output, "bad\0key", "value").is_err());
+    }
+    #[test]
+    fn steam_shortcuts_vdf_rejects_excessive_object_nesting() {
+        let mut nested = Vec::new();
+        for _ in 0..=STEAM_VDF_MAX_NESTING {
+            nested.extend_from_slice(b"\0nested\0");
+        }
+        nested.resize(nested.len() + STEAM_VDF_MAX_NESTING + 1, 8);
+
+        assert!(steam_vdf_skip(&nested, 0, 0)
+            .unwrap_err()
+            .contains("nesting depth"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn discord_ipc_search_uses_standard_temp_fallbacks_in_order_without_duplicates() {
+        let candidates = discord_ipc_candidates_from_dirs([
+            PathBuf::from("/run/user/1000"),
+            PathBuf::from("/custom/tmp"),
+            PathBuf::from("/custom/tmp"),
+            PathBuf::from("/tmp"),
+        ]);
+        assert_eq!(candidates.len(), 30);
+        assert_eq!(candidates[0], PathBuf::from("/run/user/1000/discord-ipc-0"));
+        assert_eq!(candidates[10], PathBuf::from("/custom/tmp/discord-ipc-0"));
+        assert_eq!(candidates[20], PathBuf::from("/tmp/discord-ipc-0"));
+    }
+    #[test]
+    fn discord_rpc_frames_are_written_as_one_buffer() {
+        #[derive(Default)]
+        struct RecordingWriter {
+            calls: usize,
+            bytes: Vec<u8>,
+        }
+        impl Write for RecordingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = RecordingWriter::default();
+        discord_write_frame(&mut writer, 1, b"payload").unwrap();
+
+        assert_eq!(writer.calls, 1);
+        assert_eq!(&writer.bytes[..4], &1_u32.to_le_bytes());
+        assert_eq!(&writer.bytes[4..8], &7_u32.to_le_bytes());
+        assert_eq!(&writer.bytes[8..], b"payload");
+    }
+    #[test]
+    fn discord_handshake_requires_the_ready_opcode_and_event() {
+        let ready = br#"{"evt":"READY"}"#;
+        assert!(discord_ready_frame(1, ready));
+        assert!(!discord_ready_frame(0, ready));
+        assert!(!discord_ready_frame(1, br#"{"evt":"ERROR"}"#));
+        assert!(!discord_ready_frame(1, b"not JSON"));
+    }
+    #[test]
+    fn discord_rpc_answers_ping_after_receiving_a_complete_frame() {
+        let payload = b"ping-payload";
+        let mut incoming = Vec::new();
+        incoming.extend_from_slice(&3_u32.to_le_bytes());
+        incoming.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        incoming.extend_from_slice(payload);
+        let mut writer = Vec::new();
+
+        discord_process_buffered_frames(&mut writer, &mut incoming).unwrap();
+
+        assert!(incoming.is_empty());
+        assert_eq!(&writer[..4], &4_u32.to_le_bytes());
+        assert_eq!(&writer[4..8], &(payload.len() as u32).to_le_bytes());
+        assert_eq!(&writer[8..], payload);
+    }
+    #[test]
+    fn discord_rpc_keeps_partial_frames_until_the_payload_arrives() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&3_u32.to_le_bytes());
+        frame.extend_from_slice(&4_u32.to_le_bytes());
+        frame.extend_from_slice(b"pong");
+        let mut incoming = frame[..10].to_vec();
+        let mut writer = Vec::new();
+
+        discord_process_buffered_frames(&mut writer, &mut incoming).unwrap();
+
+        assert!(writer.is_empty());
+        assert_eq!(incoming, frame[..10]);
+        incoming.extend_from_slice(&frame[10..]);
+        discord_process_buffered_frames(&mut writer, &mut incoming).unwrap();
+
+        assert!(incoming.is_empty());
+        assert_eq!(&writer[..4], &4_u32.to_le_bytes());
+        assert_eq!(&writer[8..], b"pong");
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_discord_client_handshakes_over_a_real_named_pipe() {
+        use std::{
+            io::Read,
+            os::windows::io::{AsRawHandle, FromRawHandle, RawHandle},
+            sync::mpsc,
+        };
+        use windows_sys::Win32::System::Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe,
+        };
+
+        let pipe_name = format!(r"\\.\pipe\kytyps5-studio-test-{}", std::process::id());
+        let pipe_wide = pipe_name.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let path = PathBuf::from(&pipe_name);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (pong_tx, pong_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let handle = unsafe {
+                CreateNamedPipeW(
+                    pipe_wide.as_ptr(),
+                    0x0000_0003,
+                    0,
+                    1,
+                    4096,
+                    4096,
+                    2_000,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!handle.is_null() && handle as isize != -1);
+            let mut pipe = unsafe { fs::File::from_raw_handle(handle as RawHandle) };
+            ready_tx.send(()).unwrap();
+            let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) };
+            assert!(connected != 0 || std::io::Error::last_os_error().raw_os_error() == Some(535));
+
+            let mut header = [0_u8; 8];
+            pipe.read_exact(&mut header).unwrap();
+            assert_eq!(u32::from_le_bytes(header[..4].try_into().unwrap()), 0);
+            let length = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
+            let mut payload = vec![0; length];
+            pipe.read_exact(&mut payload).unwrap();
+            let handshake: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(handshake["v"], 1);
+            assert_eq!(handshake["client_id"], "test-client");
+
+            let ready = serde_json::json!({"evt": "READY"}).to_string();
+            discord_write_frame(&mut pipe, 1, ready.as_bytes()).unwrap();
+            discord_write_frame(&mut pipe, 3, b"ping").unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut available = 0_u32;
+            loop {
+                let ok = unsafe {
+                    PeekNamedPipe(
+                        pipe.as_raw_handle().cast(),
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut available,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 || Instant::now() >= deadline {
+                    pong_tx.send(false).unwrap();
+                    return;
+                }
+                if available >= 8 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let mut pong_header = [0_u8; 8];
+            pipe.read_exact(&mut pong_header).unwrap();
+            let opcode = u32::from_le_bytes(pong_header[..4].try_into().unwrap());
+            let length = u32::from_le_bytes(pong_header[4..].try_into().unwrap()) as usize;
+            let mut pong_payload = vec![0_u8; length];
+            pipe.read_exact(&mut pong_payload).unwrap();
+            pong_tx
+                .send(opcode == 4 && pong_payload == b"ping")
+                .unwrap();
+        });
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("fake Discord server created its named pipe");
+
+        let mut connection =
+            connect_discord_at("test-client", &path).expect("client accepts Discord READY frame");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut incoming = Vec::new();
+        loop {
+            discord_poll_frames(&mut connection, &mut incoming).unwrap();
+            if let Ok(correct_pong) = pong_rx.try_recv() {
+                assert!(
+                    correct_pong,
+                    "client returns a PONG frame with the ping payload"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "client responds to Discord PING");
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(connection);
+        server
+            .join()
+            .expect("fake Discord server completed handshake");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unix_emulator_detection_keeps_the_linux_filename_and_execute_bit() {
+        let root = std::env::temp_dir().join(format!(
+            "kyty-emulator-path-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = emulator_executable(&root);
+        fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(emulator_binary_name(), "kyty_emulator");
+        assert!(is_emulator_executable(&executable));
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_emulator_executable(&executable));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_storage_paths_follow_local_and_roaming_appdata() {
+        let paths = Paths::from_windows_roots(
+            PathBuf::from(r"C:\Users\Jörg Test\AppData\Local"),
+            PathBuf::from(r"C:\Users\Jörg Test\AppData\Roaming"),
+        );
+        assert_eq!(
+            paths.data,
+            PathBuf::from(r"C:\Users\Jörg Test\AppData\Local\kytyps5-studio")
+        );
+        assert_eq!(
+            paths.cache,
+            PathBuf::from(r"C:\Users\Jörg Test\AppData\Local\kytyps5-studio\Cache")
+        );
+        assert_eq!(
+            paths.config,
+            PathBuf::from(r"C:\Users\Jörg Test\AppData\Roaming\kytyps5-studio")
+        );
+        let unc = Paths::from_windows_roots(
+            PathBuf::from(r"\\server\profile share\Local"),
+            PathBuf::from(r"\\server\profile share\Roaming"),
+        );
+        assert!(unc.data.starts_with(r"\\server\profile share\Local"));
+        assert!(unc.config.starts_with(r"\\server\profile share\Roaming"));
+    }
+    #[test]
+    fn windows_job_pid_slot_round_trips_the_full_unsigned_pid_range() {
+        for pid in [2_u32, i32::MAX as u32, i32::MAX as u32 + 1, u32::MAX] {
+            assert_eq!(windows_pid_from_job_slot(pid as i32), Some(pid));
+        }
+        assert_eq!(windows_pid_from_job_slot(0), None);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_emulator_detection_requires_the_native_executable_suffix() {
+        let root = std::env::temp_dir().join(format!(
+            "kyty-emulator-path-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = emulator_executable(&root);
+        fs::write(&executable, b"test executable fixture").unwrap();
+        assert_eq!(emulator_binary_name(), "kyty_emulator.exe");
+        assert!(is_emulator_executable(&executable));
+        let incorrect = root.join("kyty_emulator");
+        fs::write(&incorrect, b"not a Windows executable").unwrap();
+        assert!(!is_emulator_executable(&incorrect));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_profile_paths_preserve_unicode_and_spaces_when_canonicalized() {
+        let root = std::env::temp_dir().join(format!(
+            "KytyPS5 Studio 路徑-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let directory = root.join("遊戲資料");
+        fs::create_dir_all(&directory).unwrap();
+        let canonical_directory = fs::canonicalize(&directory).unwrap();
+
+        let normalized_directory =
+            canonicalize_option_path("--addcont-dir", directory.to_string_lossy().as_ref())
+                .unwrap();
+        assert_eq!(PathBuf::from(normalized_directory), canonical_directory);
+
+        let output_file = directory.join("遊戲日誌.txt");
+        let normalized_output = canonicalize_option_path(
+            "--printf-output-file",
+            output_file.to_string_lossy().as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            PathBuf::from(normalized_output),
+            canonical_directory.join("遊戲日誌.txt")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn lost_session_completion_and_playtime_are_atomic_and_idempotent() {
         let mut connection = Connection::open_in_memory().unwrap();
@@ -9141,7 +11054,11 @@ mod tests {
         fs::create_dir_all(&registered).unwrap();
         fs::create_dir_all(&unrelated).unwrap();
         fs::write(partial.join("partial-file"), b"partial").unwrap();
-        fs::write(existing_executable.join("kyty_emulator"), b"preserve").unwrap();
+        fs::write(
+            existing_executable.join(emulator_binary_name()),
+            b"preserve",
+        )
+        .unwrap();
         fs::write(registered.join("partial-file"), b"tracked").unwrap();
         fs::write(unrelated.join("file"), b"preserve").unwrap();
         fs::create_dir_all(&outside).unwrap();
@@ -9159,7 +11076,7 @@ mod tests {
             b"partial".len() as u64
         );
         assert!(!partial.exists());
-        assert!(existing_executable.join("kyty_emulator").exists());
+        assert!(existing_executable.join(emulator_binary_name()).exists());
         assert!(registered.join("partial-file").exists());
         assert!(unrelated.join("file").exists());
         assert!(outside.join("preserve").exists());
@@ -9241,6 +11158,15 @@ mod tests {
         assert!(github_search_has_more(49, 20, 1_500));
         assert!(!github_search_has_more(50, 20, 1_500));
         assert!(github_search_has_more(2, 20, 250));
+    }
+    #[test]
+    fn eboot_filename_matching_follows_host_filesystem_case_rules() {
+        let lowercase = std::ffi::OsStr::new("eboot.bin");
+        let uppercase = std::ffi::OsStr::new("EBOOT.BIN");
+        assert!(is_eboot_filename_for(lowercase, false));
+        assert!(!is_eboot_filename_for(uppercase, false));
+        assert!(is_eboot_filename_for(lowercase, true));
+        assert!(is_eboot_filename_for(uppercase, true));
     }
     #[test]
     fn session_logs_have_a_hard_size_limit_and_mark_truncated_output() {
@@ -9648,6 +11574,205 @@ mod tests {
         assert!(!process_group_exists(pid));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_child_does_not_run_before_job_assignment() {
+        let root = env::temp_dir().join(format!(
+            "KytyPS5 Studio suspended child {} {}",
+            std::process::id(),
+            now()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join("started.txt");
+        let command_line = format!(
+            "echo started > {}",
+            windows_command_line_quote(&marker.to_string_lossy())
+        );
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/d", "/c", &command_line])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        prepare_owned_child(&mut command);
+        let mut child = command
+            .spawn()
+            .expect("Windows command processor is available");
+
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            !marker.exists(),
+            "a managed Windows child must remain suspended before job assignment"
+        );
+        attach_owned_child(&mut child).expect("child joins its cleanup job and resumes");
+        let status = wait_for_child_with_timeout(
+            &mut child,
+            Duration::from_secs(5),
+            "suspended-child regression test",
+        )
+        .expect("resumed child exits successfully");
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(&marker).unwrap().trim(), "started");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bounded_windows_child_wait_kills_and_reaps_the_owned_job_on_timeout() {
+        let mut child = windows_test_command(
+            "cmd.exe",
+            &["/d", "/c", "cmd.exe /d /c ping -n 30 127.0.0.1 >NUL"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("Windows command processor is available");
+        let pid = child.id();
+        attach_owned_child(&mut child).expect("timeout child joins its cleanup job");
+
+        let started = Instant::now();
+        let result =
+            wait_for_child_with_timeout(&mut child, Duration::from_millis(100), "test command");
+
+        assert!(result.unwrap_err().contains("time limit"));
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "timed out child is reaped"
+        );
+        assert!(
+            windows_process::snapshot(pid).is_none(),
+            "timed out process no longer has a live resource snapshot"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_timeout_does_not_block_when_the_job_registry_is_unavailable() {
+        let mut child = windows_test_command(
+            "cmd.exe",
+            &["/d", "/c", "cmd.exe /d /c ping -n 30 127.0.0.1 >NUL"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("Windows command processor is available");
+        let pid = child.id();
+        attach_owned_child(&mut child).expect("timeout child joins its cleanup job");
+        let retained_job = windows_process::take_job_for_test(pid)
+            .expect("test can simulate a lost job registry entry");
+
+        let started = Instant::now();
+        let result =
+            wait_for_child_with_timeout(&mut child, Duration::from_millis(100), "test command");
+
+        let error = result.expect_err("missing job registry entry must report cleanup failure");
+        assert!(error.contains("No owned Windows process job"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(6));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the simulated process is still live"
+        );
+        child.kill().expect("test process can be stopped directly");
+        let _ = child.wait();
+        drop(retained_job);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_cancellation_stops_the_owned_process_and_sets_cancel_state() {
+        let mut child = windows_test_command(
+            "cmd.exe",
+            &["/d", "/c", "cmd.exe /d /c ping -n 30 127.0.0.1 >NUL"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("Windows command processor is available");
+        let pid = child.id() as i32;
+        attach_owned_child(&mut child).expect("child joins its cleanup job");
+        let jobs = Jobs {
+            pid: AtomicI32::new(pid),
+            active: AtomicBool::new(true),
+            updating: AtomicBool::new(false),
+            job_id: AtomicU64::new(1),
+            event_kind: Mutex::new("build".into()),
+            cancel_requested: AtomicBool::new(false),
+            cancellable: AtomicBool::new(true),
+            control: Mutex::new(()),
+        };
+
+        request_job_cancellation(&jobs).expect("active cancellable job should stop");
+        let status = wait_for_child_with_timeout(
+            &mut child,
+            Duration::from_secs(2),
+            "cancelled test command",
+        )
+        .expect("cancelled child is reaped");
+
+        assert!(jobs.cancel_requested.load(Ordering::SeqCst));
+        assert!(
+            !status.success(),
+            "cancelled child should not exit successfully"
+        );
+        assert!(
+            windows_process::snapshot(pid as u32).is_none(),
+            "cancelled process no longer has a live resource snapshot"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owned_job_kills_descendants_after_the_root_exits() {
+        let pid_file = env::temp_dir().join(format!(
+            "kytyps5-studio-child-{}-{}.txt",
+            std::process::id(),
+            now()
+        ));
+        let _ = fs::remove_file(&pid_file);
+        let script = "$child = Start-Process -FilePath 'cmd.exe' -ArgumentList '/d /c ping -n 30 127.0.0.1 >NUL' -PassThru; [System.IO.File]::WriteAllText($env:KYTY_TEST_CHILD_PID_FILE, [string]$child.Id)";
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .env("KYTY_TEST_CHILD_PID_FILE", &pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        prepare_owned_child(&mut command);
+        let mut child = command.spawn().expect("Windows PowerShell is available");
+        attach_owned_child(&mut child).expect("root process joins its cleanup job");
+
+        let started = Instant::now();
+        let (status, cleanup) = wait_for_child_and_cleanup_group(&mut child, || {}).unwrap();
+        let descendant_pid = fs::read_to_string(&pid_file)
+            .expect("PowerShell recorded the descendant PID")
+            .trim()
+            .parse::<u32>()
+            .expect("PowerShell recorded a valid descendant PID");
+        let _ = fs::remove_file(&pid_file);
+
+        assert!(status.success(), "PowerShell exited with {status}");
+        assert!(cleanup.is_ok(), "descendant cleanup failed: {cleanup:?}");
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(
+            windows_process::snapshot(descendant_pid).is_none_or(|snapshot| !snapshot.running),
+            "descendant process survived cleanup of its owned job"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn exited_emulator_group_cleans_descendants_that_hold_output_pipes() {
@@ -9868,9 +11993,12 @@ mod tests {
         let outside = dir.join("outside.png");
         fs::write(&outside, bytes).unwrap();
         assert!(read_game_png(&outside, &root, 64).is_none());
-        let linked = root.join("sce_sys/linked.png");
-        std::os::unix::fs::symlink(&outside, &linked).unwrap();
-        assert!(read_game_png(&linked, &root, 64).is_none());
+        #[cfg(unix)]
+        {
+            let linked = root.join("sce_sys/linked.png");
+            std::os::unix::fs::symlink(&outside, &linked).unwrap();
+            assert!(read_game_png(&linked, &root, 64).is_none());
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -10271,9 +12399,13 @@ mod tests {
         let install = root.join("commit-release");
         let replacement_install = root.join("replacement-release");
         fs::create_dir_all(&install).unwrap();
-        fs::write(install.join("kyty_emulator"), b"emulator").unwrap();
+        fs::write(install.join(emulator_binary_name()), b"emulator").unwrap();
         fs::create_dir_all(&replacement_install).unwrap();
-        fs::write(replacement_install.join("kyty_emulator"), b"emulator").unwrap();
+        fs::write(
+            replacement_install.join(emulator_binary_name()),
+            b"emulator",
+        )
+        .unwrap();
         let mut db = Connection::open_in_memory().unwrap();
         db.execute_batch("CREATE TABLE builds(id INTEGER PRIMARY KEY,path TEXT,active INTEGER,validation_status TEXT,removed_at INTEGER,created_at INTEGER); CREATE TABLE games(id INTEGER PRIMARY KEY,build_id INTEGER); CREATE TABLE sessions(id INTEGER PRIMARY KEY,build_id INTEGER,ended_at INTEGER); CREATE TABLE community_build_results(id INTEGER PRIMARY KEY,build_id INTEGER); CREATE TABLE manual_compatibility_observations(id INTEGER PRIMARY KEY,build_id INTEGER); INSERT INTO builds VALUES(1,'placeholder',1,'verified',NULL,2); INSERT INTO builds VALUES(2,'replacement-placeholder',0,'verified',NULL,1);").unwrap();
         db.execute(
@@ -10317,24 +12449,27 @@ mod tests {
             })
             .unwrap();
         assert_eq!(game_build, None);
-        let outside = dir.join("unmanaged-install");
-        fs::create_dir_all(&outside).unwrap();
-        fs::write(outside.join("keep.txt"), b"keep").unwrap();
-        let link = root.join("linked-build");
-        std::os::unix::fs::symlink(&outside, &link).unwrap();
-        db.execute(
+        #[cfg(unix)]
+        {
+            let outside = dir.join("unmanaged-install");
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(outside.join("keep.txt"), b"keep").unwrap();
+            let link = root.join("linked-build");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            db.execute(
             "INSERT INTO builds(id,path,active,validation_status,removed_at,created_at) VALUES(3,?,0,'verified',NULL,0)",
             [link.display().to_string()],
         )
         .unwrap();
-        assert!(remove_managed_build(&mut db, 3, &root).is_err());
-        db.execute(
-            "UPDATE builds SET path=? WHERE id=3",
-            [outside.display().to_string()],
-        )
-        .unwrap();
-        assert!(remove_managed_build(&mut db, 3, &root).is_err());
-        assert!(outside.join("keep.txt").is_file());
+            assert!(remove_managed_build(&mut db, 3, &root).is_err());
+            db.execute(
+                "UPDATE builds SET path=? WHERE id=3",
+                [outside.display().to_string()],
+            )
+            .unwrap();
+            assert!(remove_managed_build(&mut db, 3, &root).is_err());
+            assert!(outside.join("keep.txt").is_file());
+        }
         db.execute("INSERT INTO games VALUES(2,2)", []).unwrap();
         remove_managed_build(&mut db, 2, &root).unwrap();
         let active_count: i64 = db
@@ -10353,11 +12488,12 @@ mod tests {
         assert_eq!(preferred_build, None);
         fs::remove_dir_all(dir).unwrap();
     }
+    #[cfg(unix)]
     #[test]
     fn executable_validation_requires_a_successful_game_help_response() {
         let dir = std::env::temp_dir().join(format!("kyty-emulator-verify-{}", now()));
         fs::create_dir_all(&dir).unwrap();
-        let executable = dir.join("kyty_emulator");
+        let executable = dir.join(emulator_binary_name());
         fs::write(
             &executable,
             "#!/bin/sh\nprintf 'usage: kyty_emulator --game <dir>\\n'\n",
@@ -10436,6 +12572,102 @@ mod tests {
         }
     }
     #[test]
+    fn release_asset_validation_accepts_encoded_installer_filenames_only_on_github() {
+        let asset_url = "https://github.com/Febsho/KytyPs5-Studio/releases/download/v0.3.0/KytyPS5%20Studio_0.3.0_x64-setup.exe";
+        let release = GithubAppRelease {
+            tag_name: "v0.3.0".into(),
+            html_url: "https://github.com/Febsho/KytyPs5-Studio/releases/tag/v0.3.0".into(),
+            prerelease: false,
+            draft: false,
+            assets: Vec::new(),
+        };
+        let asset = GithubAppReleaseAsset {
+            name: "KytyPS5 Studio_0.3.0_x64-setup.exe".into(),
+            browser_download_url: asset_url.into(),
+            size: 10,
+            digest: None,
+        };
+        assert_eq!(release_asset_url(&release, &asset).unwrap(), asset_url);
+
+        let untrusted = GithubAppReleaseAsset {
+            browser_download_url: asset_url.replace("github.com", "example.com"),
+            ..asset
+        };
+        assert!(release_asset_url(&release, &untrusted).is_err());
+    }
+    #[test]
+    fn windows_update_selects_only_the_x64_nsis_installer() {
+        let release = GithubAppRelease {
+            tag_name: "v0.3.1".into(),
+            html_url: "https://github.com/Febsho/KytyPs5-Studio/releases/tag/v0.3.1".into(),
+            prerelease: false,
+            draft: false,
+            assets: [
+                "KytyPS5-Studio-linux-x86_64.AppImage",
+                "KytyPS5-Studio-windows-x64.exe",
+                "KytyPS5-Studio-windows-x86-setup.exe",
+                "KytyPS5-Studio-windows-x64-setup.exe",
+            ]
+            .into_iter()
+            .map(|name| GithubAppReleaseAsset {
+                name: name.into(),
+                browser_download_url: String::new(),
+                size: 1,
+                digest: None,
+            })
+            .collect(),
+        };
+
+        assert_eq!(
+            nsis_asset(&release).map(|asset| asset.name.as_str()),
+            Some("KytyPS5-Studio-windows-x64-setup.exe")
+        );
+    }
+    #[test]
+    fn windows_update_arguments_preserve_unicode_custom_install_paths() {
+        let executable = std::env::temp_dir()
+            .join("KytyPS5 Studio")
+            .join("保存したゲーム")
+            .join("kytyps5-studio.exe");
+        let install_directory = executable.parent().unwrap();
+        let mut expected_install_argument = OsString::from("/D=");
+        expected_install_argument.push(install_directory.as_os_str());
+
+        let arguments = nsis_update_arguments(&executable).unwrap();
+
+        assert_eq!(arguments[0], "/UPDATE");
+        assert_eq!(arguments[1], expected_install_argument);
+        assert!(arguments[1].to_string_lossy().contains("保存したゲーム"));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn explorer_path_is_resolved_from_system_root_not_path_search() {
+        assert_eq!(
+            super::windows_explorer_path(std::ffi::OsStr::new(r"C:\Windows")),
+            PathBuf::from(r"C:\Windows\explorer.exe")
+        );
+    }
+    #[test]
+    fn update_preflight_blocks_only_sessions_that_have_not_ended() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions(ended_at INTEGER);
+                 INSERT INTO sessions VALUES(NULL);
+                 INSERT INTO sessions VALUES(123);",
+            )
+            .unwrap();
+        assert!(has_active_game_sessions(&connection).unwrap());
+
+        connection
+            .execute(
+                "UPDATE sessions SET ended_at=456 WHERE ended_at IS NULL",
+                [],
+            )
+            .unwrap();
+        assert!(!has_active_game_sessions(&connection).unwrap());
+    }
+    #[test]
     fn automatic_update_policy_is_limited_to_safe_modes() {
         assert!(valid_auto_update_mode("notify"));
         assert!(valid_auto_update_mode("build"));
@@ -10478,12 +12710,20 @@ mod tests {
             compiler: None,
             clean: false,
         };
-        assert_eq!(validate_build_options(&options).unwrap(), "clang");
+        assert_eq!(
+            validate_build_options(&options).unwrap(),
+            default_build_compiler()
+        );
         let invalid = BuildOptions {
             build_type: "Other".into(),
             ..options
         };
         assert!(validate_build_options(&invalid).is_err());
+    }
+    #[test]
+    fn compiler_selection_tracks_the_host_abi_without_changing_linux() {
+        assert_eq!(default_build_compiler_for(true), "clang-cl");
+        assert_eq!(default_build_compiler_for(false), "clang");
     }
 
     #[test]
@@ -10491,12 +12731,16 @@ mod tests {
         let jobs = Jobs {
             pid: AtomicI32::new(0),
             active: AtomicBool::new(false),
+            updating: AtomicBool::new(false),
             job_id: AtomicU64::new(0),
             event_kind: Mutex::new(String::new()),
             cancel_requested: AtomicBool::new(false),
             cancellable: AtomicBool::new(false),
             control: Mutex::new(()),
         };
+        jobs.updating.store(true, Ordering::SeqCst);
+        assert!(begin_job(&jobs, "Already running", true, "build").is_err());
+        jobs.updating.store(false, Ordering::SeqCst);
         let first = begin_job(&jobs, "Already running", true, "build").unwrap();
         assert_eq!(jobs.job_id.load(Ordering::SeqCst), first);
         assert_eq!(ACTIVE_JOB_ID.load(Ordering::SeqCst), first);
@@ -10507,6 +12751,37 @@ mod tests {
         let second = begin_job(&jobs, "Already running", true, "clone").unwrap();
         assert_ne!(first, second);
         ACTIVE_JOB_ID.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn update_reservation_releases_after_failure_and_persists_after_installer_start() {
+        let jobs = Arc::new(Jobs {
+            pid: AtomicI32::new(0),
+            active: AtomicBool::new(false),
+            updating: AtomicBool::new(true),
+            job_id: AtomicU64::new(0),
+            event_kind: Mutex::new(String::new()),
+            cancel_requested: AtomicBool::new(false),
+            cancellable: AtomicBool::new(false),
+            control: Mutex::new(()),
+        });
+        {
+            let _reservation = UpdateReservation {
+                jobs: jobs.clone(),
+                preserve: false,
+            };
+        }
+        assert!(!jobs.updating.load(Ordering::SeqCst));
+
+        jobs.updating.store(true, Ordering::SeqCst);
+        {
+            let mut reservation = UpdateReservation {
+                jobs: jobs.clone(),
+                preserve: false,
+            };
+            reservation.preserve = true;
+        }
+        assert!(jobs.updating.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -10660,6 +12935,18 @@ mod tests {
         assert!(!verified_session_process(42, Some(9876), actual, false));
     }
     #[test]
+    fn session_identity_accepts_windows_pids_above_signed_32_bit_range() {
+        let pid = i64::from(i32::MAX as u32 + 1);
+        let actual = ProcStat {
+            state: 'R',
+            process_group: pid,
+            cpu_ticks: 0,
+            start_ticks: 9876,
+            resident_bytes: 0,
+        };
+        assert!(verified_session_process(pid, Some(9876), actual, true));
+    }
+    #[test]
     fn build_registration_reports_ignored_installation_paths() {
         let connection = Connection::open_in_memory().unwrap();
         connection
@@ -10740,6 +13027,21 @@ mod tests {
         assert!(supported_game_path(&dir.join("game.elf")));
         assert!(!supported_game_path(&dir.join("fake.elf")));
         assert!(!supported_game_path(&dir.join("notes.txt")));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_game_import_accepts_case_variant_eboot_filename() {
+        let dir = env::temp_dir().join(format!("kyty-windows-eboot-case-{}", now()));
+        let game = dir.join("Title");
+        fs::create_dir_all(&game).unwrap();
+        let eboot = game.join("EBOOT.BIN");
+        fs::write(&eboot, b"\x7fELF\x02\x01").unwrap();
+
+        assert!(supported_game_path(&game));
+        assert!(supported_game_path(&eboot));
+        assert_eq!(game_artwork_root(&eboot), Some(game));
+
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

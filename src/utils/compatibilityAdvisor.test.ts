@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Build, Game, OfficialCompatibilityDetails, Repo } from "../types/studio";
-import { recommendVerifiedBuild } from "./compatibility";
+import { currentCompatibilityOS, recommendVerifiedBuild } from "./compatibility";
 
 const game: Game = {
   id: 1, path: "/games/test", title: "Test", favorite: false, build_id: null,
@@ -25,6 +25,19 @@ const report = (overrides: Partial<OfficialCompatibilityDetails["reports"][numbe
 });
 const details = (reports: OfficialCompatibilityDetails["reports"]): OfficialCompatibilityDetails => ({
   version: 2, key: "PPSA12345", title: "Test", titleId: "PPSA12345", reports,
+});
+
+describe("host operating system detection", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it.each([
+    ["Windows NT 10.0; Win64; x64", "windows"],
+    ["Macintosh; Intel Mac OS X 14_0", "macos"],
+    ["X11; Linux x86_64", "linux"],
+  ] as const)("maps %s to %s", (userAgent, expected) => {
+    vi.stubGlobal("navigator", { userAgent });
+    expect(currentCompatibilityOS()).toBe(expected);
+  });
 });
 
 describe("Smart Fork & Build Advisor", () => {
@@ -63,5 +76,14 @@ describe("Smart Fork & Build Advisor", () => {
     ]), [build], [repo]);
     expect(recommendation?.report.os).toBe("linux");
     expect(recommendation?.status).toBe("logo");
+  });
+
+  it("uses Windows-specific evidence for Windows recommendations", () => {
+    const recommendation = recommendVerifiedBuild(game, details([
+      report({ os: "linux", status: "playable" }),
+      report({ os: "Windows", status: "in-game" }),
+    ]), [build], [repo], "windows");
+    expect(recommendation?.report.os).toBe("Windows");
+    expect(recommendation?.status).toBe("in-game");
   });
 });

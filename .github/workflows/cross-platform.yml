@@ -1,0 +1,459 @@
+name: Cross-platform CI and release artifacts
+
+on:
+  pull_request:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Frontend and Rust checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential curl file libayatana-appindicator3-dev \
+            libssl-dev libwebkit2gtk-4.1-dev librsvg2-dev libxdo-dev pkg-config shellcheck
+      - name: Lint GitHub Actions workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/cross-platform.yml
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm run check
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - run: cargo check --locked --manifest-path src-tauri/Cargo.toml
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+  windows:
+    name: Windows checks (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Install Windows native build tools
+        shell: pwsh
+        run: |
+          choco install cmake ninja llvm --yes --no-progress
+          $llvmBin = Join-Path ${env:ProgramFiles} 'LLVM\bin'
+          if (-not (Test-Path (Join-Path $llvmBin 'clang-cl.exe'))) {
+            throw "LLVM installation did not provide clang-cl.exe at $llvmBin"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
+          foreach ($tool in @('cmake.exe', 'ninja.exe')) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              throw "$tool was not available after installing the Windows native build tools"
+            }
+          }
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm run check
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - run: cargo check --locked --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
+      - run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - name: Install NSIS bundler
+        if: matrix.runner == 'windows-2022'
+        shell: pwsh
+        run: |
+          choco install nsis --yes --no-progress
+          $nsis = Join-Path ${env:ProgramFiles(x86)} 'NSIS'
+          if (-not (Test-Path (Join-Path $nsis 'makensis.exe'))) {
+            throw "NSIS installation did not provide makensis.exe at $nsis"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $nsis
+      - name: Build NSIS installer
+        if: matrix.runner == 'windows-2022'
+        run: npm run tauri build -- --bundles nsis
+      - name: Install and smoke launch the Windows app
+        if: matrix.runner == 'windows-2022'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis/*.exe' -File | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer was not produced' }
+          $installPath = Join-Path $env:TEMP "KytyPS5 Studio CI ゲーム-$env:GITHUB_RUN_ID"
+          # NSIS requires /D= to be last and forbids quotes, even when the path contains spaces.
+          $install = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', "/D=$installPath") -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "NSIS install failed with exit code $($install.ExitCode)" }
+          $app = Join-Path $installPath 'kytyps5-studio.exe'
+          if (-not (Test-Path $app)) { throw "Installed application was not found at $app" }
+          $process = $null
+          try {
+            $process = Start-Process -FilePath $app -WorkingDirectory $installPath -PassThru
+            $windowReady = $false
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              $process.Refresh()
+              if ($process.HasExited) { throw "KytyPS5 Studio exited during startup with code $($process.ExitCode)" }
+              if ($process.MainWindowHandle -ne 0) {
+                $windowReady = $true
+                break
+              }
+              Start-Sleep -Seconds 1
+            }
+            if (-not $windowReady) { throw 'KytyPS5 Studio did not create a main window within 30 seconds' }
+            $localData = Join-Path $env:LOCALAPPDATA 'kytyps5-studio'
+            $cache = Join-Path $localData 'Cache'
+            $config = Join-Path $env:APPDATA 'kytyps5-studio'
+            foreach ($path in @($localData, $cache, $config)) {
+              if (-not (Test-Path $path -PathType Container)) { throw "First-run storage directory was not created: $path" }
+            }
+            if (-not (Test-Path (Join-Path $localData 'studio.sqlite3') -PathType Leaf)) {
+              throw "First-run database was not created in LocalAppData: $localData"
+            }
+          } finally {
+            if ($process -and -not $process.HasExited) {
+              & taskkill.exe /PID $process.Id /T /F | Out-Null
+            }
+          }
+      - name: Exercise the in-place NSIS update flow
+        if: matrix.runner == 'windows-2022'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem 'src-tauri/target/release/bundle/nsis/*.exe' -File | Select-Object -First 1
+          if (-not $installer) { throw 'NSIS installer was not produced' }
+          $installPath = Join-Path $env:TEMP "KytyPS5 Studio CI ゲーム-$env:GITHUB_RUN_ID"
+          $app = Join-Path $installPath 'kytyps5-studio.exe'
+          $appProcess = $null
+          $update = $null
+          try {
+            $appProcess = Start-Process -FilePath $app -WorkingDirectory $installPath -PassThru
+            $windowReady = $false
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              $appProcess.Refresh()
+              if ($appProcess.HasExited) { throw "App exited before update test with code $($appProcess.ExitCode)" }
+              if ($appProcess.MainWindowHandle -ne 0) {
+                $windowReady = $true
+                break
+              }
+              Start-Sleep -Seconds 1
+            }
+            if (-not $windowReady) { throw 'App did not create a main window before the update test' }
+            $update = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', '/UPDATE', "/D=$installPath") -PassThru
+            if ($update.WaitForExit(1000)) {
+              throw 'In-place update completed while the application executable was still running'
+            }
+            $appProcess.Refresh()
+            if ($appProcess.HasExited) {
+              throw 'Application exited before the update lock check could be verified'
+            }
+            if (-not $appProcess.HasExited) {
+              & taskkill.exe /PID $appProcess.Id /T /F | Out-Null
+            }
+            $update.WaitForExit()
+          } finally {
+            if ($appProcess -and -not $appProcess.HasExited) {
+              & taskkill.exe /PID $appProcess.Id /T /F | Out-Null
+            }
+          }
+          if ($update.ExitCode -ne 0) { throw "NSIS in-place update failed with exit code $($update.ExitCode)" }
+          if (-not (Test-Path $app)) { throw "Updated application was not found at $app" }
+          $database = Join-Path $env:LOCALAPPDATA 'kytyps5-studio/studio.sqlite3'
+          if (-not (Test-Path $database -PathType Leaf)) {
+            throw "In-place update did not preserve the user database: $database"
+          }
+          $process = $null
+          try {
+            $process = Start-Process -FilePath $app -WorkingDirectory $installPath -PassThru
+            $windowReady = $false
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              $process.Refresh()
+              if ($process.HasExited) { throw "Updated app exited during startup with code $($process.ExitCode)" }
+              if ($process.MainWindowHandle -ne 0) {
+                $windowReady = $true
+                break
+              }
+              Start-Sleep -Seconds 1
+            }
+            if (-not $windowReady) { throw 'Updated app did not create a main window within 30 seconds' }
+          } finally {
+            if ($process -and -not $process.HasExited) {
+              & taskkill.exe /PID $process.Id /T /F | Out-Null
+            }
+          }
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.runner == 'windows-2022'
+        with:
+          name: kytyps5-windows-x64
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  windows-emulator-build:
+    name: Native Windows emulator build
+    runs-on: windows-2022
+    steps:
+      - name: Install Windows native build tools
+        shell: pwsh
+        run: |
+          choco install cmake ninja llvm --yes --no-progress
+          $llvmBin = Join-Path ${env:ProgramFiles} 'LLVM\bin'
+          if (-not (Test-Path (Join-Path $llvmBin 'clang-cl.exe'))) {
+            throw "LLVM installation did not provide clang-cl.exe at $llvmBin"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $llvmBin
+          foreach ($tool in @('cmake.exe', 'ninja.exe')) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              throw "$tool was not available after installing the Windows native build tools"
+            }
+          }
+      - uses: actions/cache@v4
+        id: vulkan-sdk-cache
+        with:
+          path: C:\VulkanSDK\1.4.313.0
+          key: vulkan-sdk-windows-x64-1.4.313.0
+      - name: Install Vulkan SDK shader compiler
+        if: steps.vulkan-sdk-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'vulkansdk-windows-X64-1.4.313.0.exe'
+          Invoke-WebRequest 'https://sdk.lunarg.com/sdk/download/1.4.313.0/windows/vulkansdk-windows-X64-1.4.313.0.exe' -OutFile $installer
+          $install = Start-Process -FilePath $installer -ArgumentList @('--root', 'C:\VulkanSDK\1.4.313.0', '--accept-licenses', '--default-answer', '--confirm-command', 'install') -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Vulkan SDK installation failed with exit code $($install.ExitCode)" }
+          if (-not (Test-Path 'C:\VulkanSDK\1.4.313.0\Bin\glslangValidator.exe')) { throw 'Vulkan SDK did not install glslangValidator.exe' }
+      - name: Expose Vulkan SDK tools
+        shell: pwsh
+        run: |
+          $sdk = 'C:\VulkanSDK\1.4.313.0'
+          if (-not (Test-Path (Join-Path $sdk 'Bin\glslangValidator.exe'))) { throw "glslangValidator.exe is missing from $sdk" }
+          Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$sdk"
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $sdk 'Bin')
+      - name: Clone KytyPS5 and its submodules
+        shell: pwsh
+        run: |
+          git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/KytyPS5/KytyPS5.git "$env:RUNNER_TEMP\KytyPS5"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not clone the KytyPS5 source and submodules' }
+      - name: Configure, build, install, and validate kyty_emulator.exe
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -version '[17.0,18.0)' -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vs) { throw 'Visual Studio 2022 x64 C++ Build Tools were not found' }
+          $llvmBin = Join-Path $vs 'VC\Tools\Llvm\bin'
+          if (Test-Path (Join-Path $llvmBin 'clang-cl.exe')) { $env:PATH = "$llvmBin;$env:PATH" }
+          foreach ($tool in @('clang-cl.exe', 'cmake.exe', 'ninja.exe')) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool is required for the native emulator build" }
+          }
+          $devCommand = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
+          $source = Join-Path $env:RUNNER_TEMP 'KytyPS5'
+          $build = Join-Path $env:RUNNER_TEMP 'KytyPS5-build'
+          $install = Join-Path $env:RUNNER_TEMP 'KytyPS5-install'
+          $commands = @(
+            ('call "{0}" -no_logo -arch=x64 -host_arch=x64' -f $devCommand),
+            ('cmake -S "{0}" -B "{1}" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DKYTY_BUILD_LAUNCHER=OFF' -f $source, $build),
+            ('cmake --build "{0}" --target kyty_emulator audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests shader_recompiler_compute_tests resource_tracking_tests scalar_provenance_tests resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel 4' -f $build),
+            ('ctest --test-dir "{0}" --output-on-failure --no-tests=error -R "^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"' -f $build),
+            ('cmake --install "{0}" --prefix "{1}"' -f $build, $install)
+          ) -join ' && '
+          & $env:ComSpec /d /s /c $commands
+          if ($LASTEXITCODE -ne 0) { throw "Native Windows emulator build failed with exit code $LASTEXITCODE" }
+          $emulator = Join-Path $install 'kyty_emulator.exe'
+          if (-not (Test-Path $emulator)) { throw "Installed emulator was not found at $emulator" }
+          $help = & $emulator --help 2>&1
+          if ($LASTEXITCODE -ne 0) { $help | Write-Host; throw "Installed emulator validation failed with exit code $LASTEXITCODE" }
+
+  linux-emulator-build:
+    name: Native Linux emulator build and regression tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install emulator build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            clang cmake git glslang-tools lld ninja-build pkg-config \
+            libasound2-dev libdbus-1-dev libgl1-mesa-dev libpulse-dev \
+            libudev-dev libwayland-dev libx11-dev libxcursor-dev libxext-dev \
+            libxfixes-dev libxi-dev libxkbcommon-dev libxrandr-dev libxss-dev \
+            libxtst-dev wayland-protocols
+      - name: Clone KytyPS5 and its submodules
+        run: git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/KytyPS5/KytyPS5.git "$RUNNER_TEMP/KytyPS5"
+      - name: Configure, build, install, and test kyty_emulator
+        run: |
+          source="$RUNNER_TEMP/KytyPS5"
+          build="$RUNNER_TEMP/KytyPS5-build"
+          install="$RUNNER_TEMP/KytyPS5-install"
+          cmake -S "$source" -B "$build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DKYTY_BUILD_LAUNCHER=OFF
+          cmake --build "$build" --target kyty_emulator \
+            page_manager_tests memory_tracker_tests audio_out2_port_tests \
+            pad_haptics_tests controller_settings_tests host_input_tests \
+            ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+            resource_tracking_tests scalar_provenance_tests \
+            resource_materialization_tests shader_vertex_metadata_tests \
+            archive_file_tests avplayer_file_tests --parallel 4
+          ctest --test-dir "$build" --output-on-failure --no-tests=error \
+            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+          cmake --install "$build" --prefix "$install"
+          test -x "$install/kyty_emulator"
+          "$install/kyty_emulator" --help >/dev/null
+
+  appimage:
+    name: AppImage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Install Tauri and AppImage dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential curl file libayatana-appindicator3-dev \
+            dbus-x11 libnotify-bin libssl-dev libwebkit2gtk-4.1-dev \
+            librsvg2-dev libxdo-dev patchelf pkg-config xdg-utils xvfb
+      - run: npm ci
+      - name: Build AppImage
+        run: npm run tauri build -- --bundles appimage
+      - name: Collect AppImage artifact
+        run: |
+          mkdir -p artifacts
+          cp src-tauri/target/release/bundle/appimage/*.AppImage artifacts/
+          test -n "$(find artifacts -maxdepth 1 -name '*.AppImage' -print -quit)"
+      - name: Validate AppImage contents
+        run: |
+          appimage="$(find artifacts -maxdepth 1 -name '*.AppImage' -print -quit)"
+          mkdir appimage-check
+          cd appimage-check
+          "$GITHUB_WORKSPACE/$appimage" --appimage-extract >/dev/null
+          test -x squashfs-root/AppRun
+          test -n "$(find squashfs-root/usr/share/applications -maxdepth 1 -name '*.desktop' -print -quit)"
+          test -n "$(find squashfs-root -maxdepth 1 -name '*.png' -print -quit)"
+          rm -rf squashfs-root
+      - name: Smoke launch AppImage in a disposable desktop session
+        run: |
+          appimage="$(find artifacts -maxdepth 1 -name '*.AppImage' -print -quit)"
+          data_dir="$(mktemp -d)"
+          cache_dir="$(mktemp -d)"
+          config_dir="$(mktemp -d)"
+          set +e
+          xvfb-run -a dbus-run-session -- env \
+            XDG_DATA_HOME="$data_dir" XDG_CACHE_HOME="$cache_dir" XDG_CONFIG_HOME="$config_dir" \
+            timeout --signal=TERM 15s "$GITHUB_WORKSPACE/$appimage" \
+            --appimage-extract-and-run >appimage-smoke.log 2>&1
+          status=$?
+          set -e
+          if [ "$status" -ne 124 ]; then
+            cat appimage-smoke.log
+            echo "AppImage exited before the smoke-test timeout (status $status)"
+            exit 1
+          fi
+          test -f "$data_dir/kytyps5-studio/studio.sqlite3"
+          test -d "$cache_dir/kytyps5-studio"
+          test -d "$config_dir/kytyps5-studio"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kytyps5-linux-appimage
+          path: artifacts/*.AppImage
+          if-no-files-found: error
+          compression-level: 0
+
+  arch-package:
+    name: Arch Linux package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with current Arch Linux toolchain
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            archlinux:base-devel \
+            bash -euxo pipefail -c '
+              pacman -Syu --noconfirm --needed \
+                git nodejs npm rust cargo webkit2gtk-4.1 gtk3 appmenu-gtk-module xdotool \
+                libayatana-appindicator librsvg xdg-utils xdg-desktop-portal zenity libnotify libsecret \
+                pkgconf cmake ninja clang
+              useradd --create-home builder
+              chown -R builder:builder /workspace
+              su - builder -s /bin/bash -c "cd /workspace && ./packaging/arch/test-flags.sh && ./packaging/arch/build-package.sh"
+              mkdir -p /workspace/artifacts
+              package=$(find /workspace/packaging/arch -maxdepth 1 -name "kytyps5-studio-*.pkg.tar.zst" -print -quit)
+              test -n "$package"
+              bsdtar -tf "$package" | grep -Fx "usr/bin/kytyps5-studio"
+              bsdtar -tf "$package" | grep -Fx "usr/share/applications/kytyps5-studio.desktop"
+              bsdtar -tf "$package" | grep -Fx "usr/share/icons/hicolor/512x512/apps/kytyps5-studio.png"
+              cp "$package" /workspace/artifacts/
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kytyps5-linux-arch
+          path: artifacts/*.pkg.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    name: Publish cross-platform release assets
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [checks, windows, windows-emulator-build, linux-emulator-build, appimage, arch-package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract this version's patch notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v heading="## $version" '
+            $0 == heading { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kytyps5-linux-*
+          path: release-assets
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: kytyps5-windows-x64
+          path: release-assets
+      - name: Create checksums
+        run: cd release-assets && sha256sum -- * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          body_path: release-notes.md

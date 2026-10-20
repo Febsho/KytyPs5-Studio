@@ -109,7 +109,7 @@ export function DiagnosticsPage({
             </strong>
           </div>
           <div className="kv">
-            <span>Kernel driver</span>
+            <span>Graphics driver</span>
             <strong>{graphics?.drivers.join(", ") || "Unavailable"}</strong>
           </div>
           <div className="kv">
@@ -152,7 +152,7 @@ export function DiagnosticsPage({
             </>
           ) : (
             <p className="hint">
-              No controller devices were detected through Linux input devices.
+              No supported game controllers were detected by host diagnostics.
             </p>
           )}
         </div>

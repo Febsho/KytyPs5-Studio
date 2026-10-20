@@ -15,7 +15,7 @@ import type {
 } from "../types/studio";
 import { date, formatBytes, short } from "../utils/format";
 import { trophyGrade, trophyGrades } from "../utils/trophies";
-import { compatibilityOsLabel, compatibilityStatusLabel, normalizeTitleId, officialCompatibilityForGame, recommendVerifiedBuild } from "../utils/compatibility";
+import { compatibilityOsLabel, compatibilityStatusLabel, currentCompatibilityOS, normalizeTitleId, officialCompatibilityForGame, recommendVerifiedBuild } from "../utils/compatibility";
 
 type Tab = "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Cheats";
 export type GameDetailsPageProps = {
@@ -164,8 +164,9 @@ export function GameDetailsPage({
     builds,
     repos,
   );
-  const exactLinuxReports = officialCompatibilityDetails?.reports.filter(
-    (report) => normalizeTitleId(report.titleId) === normalizeTitleId(currentGame.title_id) && report.os.trim().toLowerCase() === "linux",
+  const hostOS = currentCompatibilityOS();
+  const exactHostReports = officialCompatibilityDetails?.reports.filter(
+    (report) => normalizeTitleId(report.titleId) === normalizeTitleId(currentGame.title_id) && report.os.trim().toLowerCase() === hostOS,
   ) ?? [];
   return (
     <section className="page game-details-page">
@@ -398,13 +399,13 @@ export function GameDetailsPage({
             {currentGame.title_id && !officialCompatibilityIndex?.available && <p className="hint">{officialCompatibilityIndex?.error || "Compatibility data is unavailable."} No status has been inferred.</p>}
             <section className="smart-advisor" aria-label="Smart fork and build recommendation">
               <div className="smart-advisor-heading">
-                <div><span className="eyebrow">SMART FORK &amp; BUILD ADVISOR</span><h3>Linux-tested build</h3></div>
+                <div><span className="eyebrow">SMART FORK &amp; BUILD ADVISOR</span><h3>{compatibilityOsLabel(hostOS)}-tested build</h3></div>
                 {recommendation && <strong className="official-status">{compatibilityStatusLabel(recommendation.status)}</strong>}
               </div>
               {!currentGame.title_id || !officialCompatibilityDetails ? <p className="hint">Waiting for an exact-title compatibility report.</p> : !recommendation ? <>
                 <strong className="smart-advisor-empty">Not enough data</strong>
-                <p className="hint">A recommendation requires an exact PPSA Linux report that names one tested source commit, plus a matching verified local build or checkout. GitHub activity, stars, PRs, and local process exits do not count as proof.</p>
-                {exactLinuxReports.length > 0 && <p className="hint">{exactLinuxReports.length} exact-title Linux {exactLinuxReports.length === 1 ? "report is" : "reports are"} available; none can be tied unambiguously to a verified local source commit.</p>}
+                <p className="hint">A recommendation requires an exact PPSA {compatibilityOsLabel(hostOS)} report that names one tested source commit, plus a matching verified local build or checkout. GitHub activity, stars, PRs, and local process exits do not count as proof.</p>
+                {exactHostReports.length > 0 && <p className="hint">{exactHostReports.length} exact-title {compatibilityOsLabel(hostOS)} {exactHostReports.length === 1 ? "report is" : "reports are"} available; none can be tied unambiguously to a verified local source commit.</p>}
               </> : <>
                 <div className="smart-advisor-build">
                   <strong>{recommendation.repo.owner}/{recommendation.repo.name}</strong>
@@ -439,11 +440,11 @@ export function GameDetailsPage({
                   <strong className={`official-status status-${(summary?.status || "untested").toLowerCase().replaceAll(/[^a-z]+/g, "-")}`}>
                     {compatibilityStatusLabel(summary?.status)}
                   </strong>
-                  <span>{summary?.preferred_os === "linux" ? "Linux test prioritized" : Object.keys(platformStatuses).length ? "Best reported result · no Linux test" : "No official test report"}</span>
+                  <span>{summary?.preferred_os === hostOS ? `${compatibilityOsLabel(hostOS)} test prioritized` : Object.keys(platformStatuses).length ? `Best reported result · no ${compatibilityOsLabel(hostOS)} test` : "No official test report"}</span>
                   {summary?.latest_tested && <span>Latest test {summary.latest_tested}</span>}
                 </div>
                 <div className="official-platform-results">
-                  {(["linux", "windows", "macos"] as const).map((os) => <div className={`official-platform-result ${os === "linux" ? "preferred" : ""}`} key={os}>
+                  {(["linux", "windows", "macos"] as const).map((os) => <div className={`official-platform-result ${os === summary?.preferred_os ? "preferred" : ""}`} key={os}>
                     <span>{compatibilityOsLabel(os)}</span>
                     <strong>{compatibilityStatusLabel(platformStatuses[os])}</strong>
                     {summary?.report_counts[os] !== undefined && <small>{summary.report_counts[os]} {summary.report_counts[os] === 1 ? "report" : "reports"}</small>}
@@ -452,7 +453,7 @@ export function GameDetailsPage({
                 {officialCompatibilityError && <p className="hint">Detailed report unavailable: {officialCompatibilityError}</p>}
                 {!officialCompatibilityDetails && !officialCompatibilityError && <p className="hint">Loading official test details…</p>}
                 {officialCompatibilityDetails?.reports?.some((report) => normalizeTitleId(report.titleId) === normalizeTitleId(currentGame.title_id)) ? <div className="official-report-list">
-                  {[...officialCompatibilityDetails.reports].filter((report) => normalizeTitleId(report.titleId) === normalizeTitleId(currentGame.title_id)).sort((a, b) => Number(b.os === "linux") - Number(a.os === "linux")).map((report, index) => <article className="official-report" key={`${report.slug}-${index}`}>
+                  {[...officialCompatibilityDetails.reports].filter((report) => normalizeTitleId(report.titleId) === normalizeTitleId(currentGame.title_id)).sort((a, b) => Number(b.os.toLowerCase() === hostOS) - Number(a.os.toLowerCase() === hostOS)).map((report, index) => <article className="official-report" key={`${report.slug}-${index}`}>
                     <div className="official-report-heading">
                       <strong>{compatibilityOsLabel(report.os)} · {compatibilityStatusLabel(report.status)}</strong>
                       <span>{report.testedDate}</span>

@@ -5,7 +5,10 @@ import type { SettingsPageProps } from "./SettingsPage";
 import { SettingsPage } from "./SettingsPage";
 import type { ProfileCapabilities } from "../types/studio";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 const capabilities: ProfileCapabilities = {
   screen_width: true,
@@ -58,6 +61,70 @@ function props(overrides: Partial<SettingsPageProps> = {}): SettingsPageProps {
 }
 
 describe("SettingsPage", () => {
+  it("describes Windows storage and credential services on Windows", () => {
+    vi.stubGlobal("navigator", { userAgent: "Windows NT 10.0; Win64; x64" });
+    render(<SettingsPage {...props()} />);
+
+    expect(screen.getByText(/LocalAppData.*Roaming AppData/)).toBeTruthy();
+    expect(screen.getByText(/Windows Credential Manager/)).toBeTruthy();
+  });
+
+  it("requires the user to install a Windows update and blocks it during a game session", () => {
+    vi.stubGlobal("navigator", { userAgent: "Windows NT 10.0; Win64; x64" });
+    render(<SettingsPage {...props({
+      activeSessions: true,
+      appUpdate: {
+        current_version: "0.3.0",
+        latest_version: "0.3.1",
+        update_available: true,
+        release_url: "https://github.com/Febsho/KytyPs5-Studio/releases/tag/v0.3.1",
+        asset_name: "KytyPS5-Studio_0.3.1_x64-setup.exe",
+        download_size_bytes: 1024,
+        running_appimage: false,
+      },
+      onInstallAppUpdate: vi.fn(),
+    })} />);
+
+    expect(screen.getByText(/opens only after you choose to install it/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Install Verified Update" }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByText(/Finish active builds and close emulator sessions/)).toBeTruthy();
+  });
+
+  it("starts a verified Windows update only when the user selects install", () => {
+    vi.stubGlobal("navigator", { userAgent: "Windows NT 10.0; Win64; x64" });
+    const onInstallAppUpdate = vi.fn();
+    render(<SettingsPage {...props({
+      appUpdate: {
+        current_version: "0.3.0",
+        latest_version: "0.3.1",
+        update_available: true,
+        release_url: "https://github.com/Febsho/KytyPs5-Studio/releases/tag/v0.3.1",
+        asset_name: "KytyPS5-Studio_0.3.1_x64-setup.exe",
+        download_size_bytes: 1024,
+        running_appimage: false,
+      },
+      onInstallAppUpdate,
+    })} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Install Verified Update" }));
+
+    expect(onInstallAppUpdate).toHaveBeenCalledOnce();
+  });
+
+  it("surfaces credential-store errors instead of reporting anonymous access", () => {
+    render(
+      <SettingsPage
+        {...props({ githubTokenError: "Credential Manager access was denied" })}
+      />,
+    );
+
+    expect(screen.getByRole("alert").textContent).toBe(
+      "Credential Manager access was denied",
+    );
+    expect(screen.getByText("Credential store unavailable")).toBeTruthy();
+    expect(screen.queryByText("Anonymous API access")).toBeNull();
+  });
+
   it("warns about defaults unsupported by the active build and can clear them", () => {
     const page = props();
     render(<SettingsPage {...page} />);

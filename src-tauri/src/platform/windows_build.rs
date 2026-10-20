@@ -371,6 +371,8 @@ pub fn display_cmake_arguments(build_type: &str) -> Result<Vec<String>, String> 
 }
 
 fn command_environment() -> Result<Vec<(OsString, OsString)>, String> {
+    use std::os::windows::process::CommandExt;
+
     let installation = visual_studio_installation()?;
     let developer_command = installation
         .join("Common7")
@@ -387,7 +389,9 @@ fn command_environment() -> Result<Vec<(OsString, OsString)>, String> {
             .join("&")
     );
     let output = Command::new("cmd.exe")
-        .args(["/d", "/u", "/c", &command_line])
+        // cmd.exe's /c parser does not follow the normal Windows argv quoting
+        // rules, so pass its complete command line verbatim.
+        .raw_arg(format!("/d /u /c \"{command_line}\""))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

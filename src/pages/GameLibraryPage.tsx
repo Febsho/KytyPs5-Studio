@@ -198,7 +198,6 @@ export function GameLibraryPage({
             setContextMenu({ game, x: event.clientX, y: event.clientY });
           }}
           mode={libraryView}
-          compatibilityIndex={officialCompatibilityIndex}
         />
         {currentGame && filteredGames.some((game) => game.id === currentGame.id) && (
           <div className="panel detail">

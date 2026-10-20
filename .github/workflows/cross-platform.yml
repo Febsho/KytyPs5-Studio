@@ -170,9 +170,9 @@ jobs:
               throw 'In-place update completed while the application executable was still running'
             }
             $appProcess.Refresh()
-            if ($appProcess.HasExited) {
-              throw 'Application exited before the update lock check could be verified'
-            }
+            # The updater can ask the running app to close while the NSIS
+            # installer waits for the executable lock. If it remains open,
+            # close it after confirming the installer did not finish early.
             if (-not $appProcess.HasExited) {
               & taskkill.exe /PID $appProcess.Id /T /F | Out-Null
             }

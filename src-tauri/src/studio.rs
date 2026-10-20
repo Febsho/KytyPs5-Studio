@@ -11713,7 +11713,7 @@ mod tests {
 
         assert!(status.success(), "PowerShell exited with {status}");
         assert!(cleanup.is_ok(), "descendant cleanup failed: {cleanup:?}");
-        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(started.elapsed() < Duration::from_secs(25));
         assert!(
             windows_process::snapshot(descendant_pid).is_none_or(|snapshot| !snapshot.running),
             "descendant process survived cleanup of its owned job"

@@ -6606,7 +6606,7 @@ async fn start_install_build_tools(
             #[cfg(windows)]
             let commands = windows_build::install_commands()?;
             #[cfg(target_os = "linux")]
-            let commands = vec![linux_build_tool_install_command()?];
+            let commands = [linux_build_tool_install_command()?];
             #[cfg(not(any(windows, target_os = "linux")))]
             return Err(
                 "Automatic build tool installation is supported on Windows and Linux only.".into(),

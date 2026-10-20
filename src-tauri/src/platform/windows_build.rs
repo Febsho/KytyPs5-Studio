@@ -44,7 +44,7 @@ fn visual_studio_installation() -> Result<PathBuf, String> {
         .args([
             "-latest",
             "-version",
-            "[17.0,19.0)",
+            "[17.0,18.0)",
             "-products",
             "*",
             "-requires",
@@ -374,11 +374,12 @@ fn command_environment() -> Result<Vec<(OsString, OsString)>, String> {
     let installation = visual_studio_installation()?;
     let developer_command = installation.join("Common7/Tools/VsDevCmd.bat");
     let command_line = format!(
-        "call \"{}\" -no_logo -arch=x64 -host_arch=x64 >nul 2>&1 && ({} )",
+        "call \"{}\" -no_logo -arch=x64 -host_arch=x64 && ({} )",
         developer_command.display(),
         BUILD_ENVIRONMENT
             .iter()
             .map(|name| format!("set {name}"))
+            .chain(std::iter::once("ver >nul".to_string()))
             .collect::<Vec<_>>()
             .join("&")
     );
@@ -391,12 +392,15 @@ fn command_environment() -> Result<Vec<(OsString, OsString)>, String> {
             format!("Could not initialize the Visual Studio x64 environment: {error}")
         })?;
     if !output.status.success() {
+        let stdout = decode_command_output(&output.stdout)
+            .unwrap_or_else(|_| String::from_utf8_lossy(&output.stdout).into_owned());
+        let stderr = decode_command_output(&output.stderr)
+            .unwrap_or_else(|_| String::from_utf8_lossy(&output.stderr).into_owned());
         return Err(format!(
-            "Visual Studio x64 environment setup failed with {}: {}. Verify the x64 C++ workload and Windows SDK.",
+            "Visual Studio x64 environment setup failed with {}. stdout: {} stderr: {}. Verify the VS 2022 x64 C++ workload and Windows SDK.",
             output.status,
-            decode_command_output(&output.stderr)
-                .unwrap_or_else(|_| String::from_utf8_lossy(&output.stderr).into_owned())
-                .trim()
+            stdout.trim(),
+            stderr.trim()
         ));
     }
     let allowed = BUILD_ENVIRONMENT

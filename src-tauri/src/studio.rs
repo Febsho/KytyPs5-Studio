@@ -10749,6 +10749,7 @@ mod tests {
         let pipe_wide = pipe_name.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
         let path = PathBuf::from(&pipe_name);
         let (ready_tx, ready_rx) = mpsc::channel();
+        let (ready_consumed_tx, ready_consumed_rx) = mpsc::channel();
         let (pong_tx, pong_rx) = mpsc::channel();
         let server = thread::spawn(move || {
             let handle = unsafe {
@@ -10781,10 +10782,11 @@ mod tests {
 
             let ready = serde_json::json!({"evt": "READY"}).to_string();
             discord_write_frame(&mut pipe, 1, ready.as_bytes()).unwrap();
-            // Let the client finish the READY handshake before sending the
-            // next event; synchronous named pipes can otherwise coalesce both
-            // writes while the client is still reading the handshake frame.
-            thread::sleep(Duration::from_millis(50));
+            // Wait until connect_discord_at has consumed READY before sending
+            // another frame. This keeps the test deterministic under load.
+            ready_consumed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("client consumed the Discord READY frame");
             discord_write_frame(&mut pipe, 3, b"ping").unwrap();
 
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -10825,6 +10827,9 @@ mod tests {
 
         let mut connection =
             connect_discord_at("test-client", &path).expect("client accepts Discord READY frame");
+        ready_consumed_tx
+            .send(())
+            .expect("fake Discord server waits for READY consumption");
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut incoming = Vec::new();
         loop {

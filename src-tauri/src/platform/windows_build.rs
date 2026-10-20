@@ -44,7 +44,7 @@ fn visual_studio_installation() -> Result<PathBuf, String> {
         .args([
             "-latest",
             "-version",
-            "[17.0,18.0)",
+            "[17.0,19.0)",
             "-products",
             "*",
             "-requires",
@@ -61,7 +61,7 @@ fn visual_studio_installation() -> Result<PathBuf, String> {
     }
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if path.is_empty() {
-        return Err("Visual Studio 2022 C++ Build Tools were not found. Install the Desktop development with C++ workload and Windows 10/11 SDK.".into());
+        return Err("Visual Studio C++ Build Tools were not found. Install the Desktop development with C++ workload and Windows 10/11 SDK.".into());
     }
     let path = PathBuf::from(path);
     let dev_command = path.join("Common7/Tools/VsDevCmd.bat");

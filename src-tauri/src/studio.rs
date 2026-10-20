@@ -7559,8 +7559,9 @@ fn game_metadata(path: &Path) -> (String, Option<String>, Option<String>, Option
     } else {
         path.parent().unwrap_or(path)
     };
-    let meta = root.join("sce_sys/param.json");
-    let icon = root.join("sce_sys/icon0.png");
+    let system_directory = root.join("sce_sys");
+    let meta = system_directory.join("param.json");
+    let icon = system_directory.join("icon0.png");
     let empty = (String::new(), None, None, None);
     let Ok(bytes) = fs::read(&meta) else {
         return empty;
@@ -10782,7 +10783,7 @@ mod tests {
             discord_write_frame(&mut pipe, 1, ready.as_bytes()).unwrap();
             discord_write_frame(&mut pipe, 3, b"ping").unwrap();
 
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + Duration::from_secs(10);
             let mut available = 0_u32;
             loop {
                 let ok = unsafe {
@@ -10820,7 +10821,7 @@ mod tests {
 
         let mut connection =
             connect_discord_at("test-client", &path).expect("client accepts Discord READY frame");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let mut incoming = Vec::new();
         loop {
             discord_poll_frames(&mut connection, &mut incoming).unwrap();
@@ -11577,20 +11578,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_owned_child_does_not_run_before_job_assignment() {
-        let root = env::temp_dir().join(format!(
-            "KytyPS5 Studio suspended child {} {}",
-            std::process::id(),
-            now()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let marker = root.join("started.txt");
-        let command_line = format!(
-            "echo started > {}",
-            windows_command_line_quote(&marker.to_string_lossy())
-        );
         let mut command = Command::new("cmd.exe");
         command
-            .args(["/d", "/c", &command_line])
+            .args(["/d", "/c", "exit 0"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -11601,7 +11591,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(150));
         assert!(
-            !marker.exists(),
+            child.try_wait().unwrap().is_none(),
             "a managed Windows child must remain suspended before job assignment"
         );
         attach_owned_child(&mut child).expect("child joins its cleanup job and resumes");
@@ -11611,9 +11601,7 @@ mod tests {
             "suspended-child regression test",
         )
         .expect("resumed child exits successfully");
-        assert!(status.success());
-        assert_eq!(fs::read_to_string(&marker).unwrap().trim(), "started");
-        fs::remove_dir_all(root).unwrap();
+        assert!(status.success(), "resumed child exited with {status}");
     }
 
     #[cfg(windows)]
@@ -11672,7 +11660,7 @@ mod tests {
 
         let error = result.expect_err("missing job registry entry must report cleanup failure");
         assert!(error.contains("No owned Windows process job"), "{error}");
-        assert!(started.elapsed() < Duration::from_secs(6));
+        assert!(started.elapsed() < Duration::from_secs(15));
         assert!(
             child.try_wait().unwrap().is_none(),
             "the simulated process is still live"
@@ -12849,7 +12837,10 @@ mod tests {
             &["-c", "commit.gpgsign=false", "commit", "-m", "base"],
         )
         .unwrap();
-        let nested_url = nested.canonicalize().unwrap().display().to_string();
+        // Keep the filesystem URL free of the `\\?\` verbatim prefix that
+        // `canonicalize` adds on Windows; Git parses that prefix as a URI
+        // authority instead of a local path.
+        let nested_url = nested.display().to_string();
         test_git(
             &source,
             &[

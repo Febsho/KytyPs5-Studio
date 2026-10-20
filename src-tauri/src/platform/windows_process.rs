@@ -22,8 +22,8 @@ use windows_sys::Win32::{
         ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         Threading::{
             GetProcessTimes, OpenProcess, OpenThread, QueryFullProcessImageNameW, ResumeThread,
-            WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
-            PROCESS_TERMINATE, THREAD_SUSPEND_RESUME,
+            WaitForSingleObject, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SET_QUOTA, PROCESS_TERMINATE, PROCESS_VM_READ, THREAD_SUSPEND_RESUME,
         },
     },
     UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE},
@@ -31,6 +31,7 @@ use windows_sys::Win32::{
 
 const PROCESS_JOB_WAIT_MS: u32 = 3_000;
 const MAX_RECOVERED_JOB_PROCESSES: usize = 4_096;
+const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
 
 struct Handle(HANDLE);
 
@@ -92,7 +93,9 @@ fn create_job() -> Result<Handle, String> {
 }
 
 fn open_process(pid: u32, rights: u32) -> Result<Handle, String> {
-    let handle = unsafe { OpenProcess(rights, 0, pid) };
+    // `process_is_running` waits on the process handle, which requires
+    // SYNCHRONIZE in addition to the query rights used by its callers.
+    let handle = unsafe { OpenProcess(rights | PROCESS_SYNCHRONIZE, 0, pid) };
     if handle.is_null() {
         Err(win_error("Could not open the registered process"))
     } else {
@@ -499,7 +502,14 @@ pub struct Snapshot {
 }
 
 pub fn snapshot(pid: u32) -> Option<Snapshot> {
-    let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION).ok()?;
+    // K32GetProcessMemoryInfo requires PROCESS_QUERY_INFORMATION and
+    // PROCESS_VM_READ; limited-information rights alone only cover the
+    // creation time and executable identity queries.
+    let process = open_process(
+        pid,
+        PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+    )
+    .ok()?;
     let mut created = FILETIME::default();
     let mut exited = FILETIME::default();
     let mut kernel = FILETIME::default();
@@ -624,7 +634,7 @@ mod tests {
         assert!(
             super::filetime_value(windows_sys::Win32::Foundation::FILETIME {
                 dwLowDateTime: 0xffff_fffe,
-                dwHighDateTime: 0x1234_5678,
+                dwHighDateTime: 0xf234_5678,
             }) > i64::MAX as u64
         );
     }

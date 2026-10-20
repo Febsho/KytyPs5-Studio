@@ -39,6 +39,23 @@ describe("useStudioData", () => {
     expect(call).toHaveBeenCalledTimes(5);
   });
 
+  it("refreshes collections without rerunning system diagnostics", async () => {
+    const values: Record<string, unknown> = {
+      list_repos: [],
+      list_builds: [],
+      list_games: [],
+      recent_sessions: [],
+    };
+    const call = vi.fn(async <T,>(command: string) => values[command] as T);
+    const { result } = renderHook(() => useStudioData(call as StudioCommand));
+
+    await act(async () => result.current.refreshData());
+
+    expect(call).toHaveBeenCalledTimes(4);
+    expect(call).not.toHaveBeenCalledWith("system_info");
+    expect(result.current.system).toBeNull();
+  });
+
   it("keeps the previous snapshot when one refresh request fails", async () => {
     const call = vi.fn(async <T,>(command: string) => {
       if (command === "list_repos") return [{ id: 1 }] as T;

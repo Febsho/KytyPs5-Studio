@@ -31,6 +31,23 @@ export function useStudioData(call: StudioCommand) {
     setSystem(nextSystem);
     setSessions(nextSessions);
   }, [call]);
+  const refreshData = useCallback(async () => {
+    const request = ++refreshRequest.current;
+    const [nextRepos, nextBuilds, nextGames, nextSessions] = await Promise.all([
+      call<Repo[]>("list_repos"),
+      call<Build[]>("list_builds"),
+      call<Game[]>("list_games"),
+      call<Session[]>("recent_sessions"),
+    ]);
+    if (request !== refreshRequest.current) return;
+    setRepos(nextRepos);
+    setBuilds(nextBuilds);
+    setGames(nextGames);
+    setSessions(nextSessions);
+  }, [call]);
+  const refreshSystem = useCallback(async () => {
+    setSystem(await call<System>("system_info"));
+  }, [call]);
   const refreshBuilds = useCallback(async () => {
     setBuilds(await call<Build[]>("list_builds"));
   }, [call]);
@@ -43,6 +60,8 @@ export function useStudioData(call: StudioCommand) {
     sessions,
     setSessions,
     refresh,
+    refreshData,
+    refreshSystem,
     refreshBuilds,
   };
 }

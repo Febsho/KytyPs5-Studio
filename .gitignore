@@ -1,6 +1,7 @@
 node_modules/
 dist/
 src-tauri/target/
+src-tauri/target-test-build*/
 src-tauri/gen/
 *.log
 tsconfig.tsbuildinfo

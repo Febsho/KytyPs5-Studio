@@ -39,6 +39,7 @@ function props(
     onSelectRepo: vi.fn(),
     onBuild: vi.fn(),
     onBuildLatest: vi.fn(),
+    onInstallTools: vi.fn(),
     onCancel: vi.fn(),
     ...overrides,
   };
@@ -66,5 +67,33 @@ describe("BuildStudioPage", () => {
     expect(
       container.querySelector(".pipeline-steps .current")?.textContent,
     ).toContain("Configuring CMake");
+  });
+
+  it("offers a tool installer and blocks builds when Linux build requirements are missing", () => {
+    const page = props({
+      system: {
+        os: "Ubuntu Linux",
+        arch: "x86_64",
+        cpu: "CPU",
+        memory_total_bytes: 0,
+        memory_available_bytes: 0,
+        controllers: [],
+        session: "wayland",
+        gpu: "GPU",
+        dependencies: [
+          { name: "cmake", present: true },
+          { name: "clang", present: false },
+          { name: "vulkaninfo", present: false },
+        ],
+        paths: {},
+      },
+    });
+    const { container } = render(<BuildStudioPage {...page} />);
+
+    expect(screen.getByText(/Missing build tools: clang/)).toBeTruthy();
+    expect(screen.queryByText(/vulkaninfo/)).toBeNull();
+    expect((container.querySelector(".build-main-action") as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Install missing tools" }));
+    expect(page.onInstallTools).toHaveBeenCalledOnce();
   });
 });

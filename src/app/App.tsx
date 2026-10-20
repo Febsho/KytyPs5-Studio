@@ -76,6 +76,7 @@ import { CommunityBuildHistory } from "../components/community/CommunityBuildHis
 import { CommunityPRFilters } from "../components/community/CommunityPRFilters";
 import { CommunityPRTable } from "../components/community/CommunityPRTable";
 import { CommunityPRSelection } from "../components/community/CommunityPRSelection";
+import { ControllerRemapDialog } from "../components/settings/ControllerRemapDialog";
 import { useCommunityPRData } from "../hooks/useCommunityPRData";
 import { useGameProfile } from "../hooks/useGameProfile";
 import { useStudioData } from "../hooks/useStudioData";
@@ -83,6 +84,11 @@ import {
   refreshProcessMetricsNow,
   useProcessMetrics,
 } from "../hooks/useProcessMetrics";
+import {
+  mappedControlPressed,
+  readControllerMapping,
+  type ControllerMapping,
+} from "../utils/controllerMapping";
 
 const nav = [
   { id: "home", label: "Home", icon: Home },
@@ -123,6 +129,15 @@ export function App() {
     },
   );
   const [dragActive, setDragActive] = useState(false);
+  const [controllerRemapOpen, setControllerRemapOpen] = useState(false);
+  const controllerRemappingEnabled = false;
+  const controllerRemapOpenRef = useRef(false);
+  controllerRemapOpenRef.current = controllerRemapOpen;
+  const [controllerMapping, setControllerMapping] = useState<ControllerMapping>(
+    () => readControllerMapping(readUiState("controller_mapping")),
+  );
+  const controllerMappingRef = useRef(controllerMapping);
+  controllerMappingRef.current = controllerMapping;
   const [gameScan, setGameScan] = useState<GameScanEvent | null>(null);
   const [gameCompatibility, setGameCompatibility] =
     useState<GameCompatibility | null>(null);
@@ -146,6 +161,8 @@ export function App() {
   const [importMenuOpen, setImportMenuOpen] = useState(false);
   const importMenuRef = useRef<HTMLDivElement>(null);
   const appUpdateInFlight = useRef(false);
+  const repoUpdateCheckInFlight = useRef(false);
+  const pendingRepoUpdateCheck = useRef<(() => void) | null>(null);
   const [graphics, setGraphics] = useState<GraphicsDiagnostics | null>(null);
   const [repoUrl, setRepoUrl] = useState("");
   const [selectedRepo, setSelectedRepo] = useState<number | null>(() =>
@@ -181,7 +198,10 @@ export function App() {
     Math.max(1, Math.min(128, (navigator.hardwareConcurrency || 4) - 1)),
   );
   const [logs, setLogs] = useState<string[]>([]);
+  const pendingJobLogs = useRef<string[]>([]);
+  const logFlushScheduled = useRef(false);
   const [busy, setBusy] = useState(false);
+  const jobStartInFlight = useRef(false);
   const [currentBuildPhase, setCurrentBuildPhase] = useState("Idle");
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const jobStartedAt = useRef<number | null>(null);
@@ -233,6 +253,8 @@ export function App() {
   const [discordPresenceEnabled, setDiscordPresenceEnabled] = useState(true);
   const [processMetrics, setProcessMetrics] = useState<ProcessMetric[]>([]);
   const processMetricsRef = useRef<ProcessMetric[]>([]);
+  const gamepadWindowFocused = useRef(true);
+  const gamepadGameRunning = useRef(false);
   const sessionPerformanceSamples = useRef(
     new Map<number, SessionPerformanceSamples>(),
   );
@@ -305,7 +327,8 @@ export function App() {
     system,
     sessions,
     setSessions,
-    refresh,
+    refreshData,
+    refreshSystem,
     refreshBuilds,
   } = useStudioData(call);
   useEffect(() => {
@@ -449,7 +472,7 @@ export function App() {
       if (!disposed) {
         if (failures.length)
           setMessage(`Build validation failed — ${failures.join("; ")}`);
-        refresh().catch(() => {});
+        refreshData().catch(() => {});
       }
     })();
     return () => {
@@ -460,7 +483,7 @@ export function App() {
     let stop: (() => void) | undefined;
     listen<GameScanEvent>("studio-game-scan", (event) => {
       setGameScan(event.payload);
-      if (event.payload.done) refresh().catch(() => {});
+      if (event.payload.done) refreshData().catch(() => {});
     })
       .then((unlisten) => {
         stop = unlisten;
@@ -470,23 +493,31 @@ export function App() {
       );
     return () => stop?.();
   }, []);
+  const queueJobLog = (line: string) => {
+    pendingJobLogs.current.push(line);
+    if (logFlushScheduled.current) return;
+    logFlushScheduled.current = true;
+    window.requestAnimationFrame(() => {
+      logFlushScheduled.current = false;
+      const next = pendingJobLogs.current.splice(0);
+      if (next.length)
+        setLogs((old) => [...old, ...next].slice(-800));
+    });
+  };
   const handleJobEvent = (j: Job) => {
     const isJob =
       j.kind === "build" ||
       j.kind === "clone" ||
-      j.kind === "community-build";
-    if (isJob)
-      setLogs((old) => [
-        ...old.slice(-799),
-        `[${j.channel} · ${j.phase}] ${j.line}`,
-      ]);
-    if ((j.kind === "build" || j.kind === "community-build") && !j.done)
+      j.kind === "community-build" ||
+      j.kind === "install-tools";
+    if (isJob) queueJobLog(`[${j.channel} · ${j.phase}] ${j.line}`);
+    if ((j.kind === "build" || j.kind === "community-build" || j.kind === "install-tools") && !j.done)
       setCurrentBuildPhase(j.phase);
     if (j.done) {
       if (isJob) {
         setBusy(false);
         jobEventGate.current.complete(j.job_id);
-        if (j.kind === "build" || j.kind === "community-build")
+        if (j.kind === "build" || j.kind === "community-build" || j.kind === "install-tools")
           setCurrentBuildPhase(
             j.phase === "Cancelled"
               ? "Cancelled"
@@ -520,21 +551,23 @@ export function App() {
           body: j.line,
         }).catch(() => {});
       }
-      refresh().catch(() => {});
+      refreshData().catch(() => {});
+      if (j.kind === "install-tools") refreshSystem().catch(() => {});
     }
   };
   const activateJob = (jobId: number) => {
     jobEventGate.current.activate(jobId).forEach(handleJobEvent);
   };
   useEffect(() => {
-    refresh().catch(() => {});
+    refreshData().catch(() => {});
     let stop = () => {};
     listen<Job>("studio-job", (e) => {
       const j = e.payload;
       const isJob =
         j.kind === "build" ||
         j.kind === "clone" ||
-        j.kind === "community-build";
+        j.kind === "community-build" ||
+        j.kind === "install-tools";
       if (isJob) jobEventGate.current.receive(j).forEach(handleJobEvent);
       else handleJobEvent(j);
     }).then((f) => {
@@ -542,6 +575,10 @@ export function App() {
     });
     return () => stop();
   }, []);
+  useEffect(() => {
+    if (page === "build" || page === "diagnostics")
+      void refreshSystem().catch(() => {});
+  }, [page, refreshSystem]);
   useEffect(() => {
     if (!busy) return;
     const tick = () => {
@@ -717,7 +754,18 @@ export function App() {
       }
       sessionPerformanceSamples.current.set(metric.session_id, sample);
     }
-    setProcessMetrics(metrics);
+    setProcessMetrics((current) => {
+      if (current.length === metrics.length && current.every((metric, index) => {
+        const next = metrics[index];
+        return metric.session_id === next.session_id &&
+          metric.game_id === next.game_id &&
+          metric.runtime_seconds === next.runtime_seconds &&
+          metric.cpu_percent === next.cpu_percent &&
+          metric.resident_bytes === next.resident_bytes &&
+          metric.status === next.status;
+      })) return current;
+      return metrics;
+    });
     processMetricsRef.current = metrics;
     setProcessMetricsReady(true);
     const completed = wasActive
@@ -732,8 +780,8 @@ export function App() {
     }
   }, []);
   const refreshSessionData = useCallback(() => {
-    refresh().catch(() => {});
-  }, [refresh]);
+    refreshData().catch(() => {});
+  }, [refreshData]);
   const reportProcessMetricsError = useCallback((error: unknown) => {
     setMessage(`Process telemetry unavailable: ${String(error)}`);
   }, []);
@@ -746,10 +794,16 @@ export function App() {
   const gameRunning = processMetrics.some(
     (metric) => !/(ended|interrupted)/i.test(metric.status),
   );
+  gamepadGameRunning.current = gameRunning;
   useEffect(() => {
     let disposed = false;
     let timer: number | undefined;
     const check = async () => {
+      if (repoUpdateCheckInFlight.current) {
+        pendingRepoUpdateCheck.current = () => void check();
+        return;
+      }
+      repoUpdateCheckInFlight.current = true;
       try {
         const tracked = (await invoke<Repo[]>("list_repos")).filter(
           (repo) => repo.source_path,
@@ -795,6 +849,7 @@ export function App() {
             }
             attemptedAutomaticUpdates.current.add(attemptKey);
             beginJob();
+            pendingJobLogs.current = [];
             setLogs([]);
             setBusy(true);
             setMessage(
@@ -829,14 +884,23 @@ export function App() {
               );
             }
           } catch (error) {
-            if (!disposed)
+            const message = String(error);
+            if (
+              !disposed &&
+              !/already running|preparing an application update/i.test(message)
+            )
               setMessage(
-                `${repo.owner}/${repo.name}: update check failed: ${String(error)}`,
+                `${repo.owner}/${repo.name}: update check failed: ${message}`,
               );
           }
         }
       } catch (error) {
         if (!disposed) setMessage(`Update checks failed: ${String(error)}`);
+      } finally {
+        repoUpdateCheckInFlight.current = false;
+        const pending = pendingRepoUpdateCheck.current;
+        pendingRepoUpdateCheck.current = null;
+        pending?.();
       }
     };
     check();
@@ -848,7 +912,22 @@ export function App() {
     };
   }, [updateInterval, autoUpdateMode, processMetricsReady, gameRunning]);
   useEffect(() => {
+    const onFocus = () => {
+      gamepadWindowFocused.current = true;
+    };
+    const onBlur = () => {
+      gamepadWindowFocused.current = false;
+    };
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
+  useEffect(() => {
     let previous = new Map<number, boolean>();
+    let lastMapping = controllerMappingRef.current;
     const pages: Array<(typeof nav)[number]["id"] | "game-details"> = [
       ...nav.map((item) => item.id),
       "game-details",
@@ -857,27 +936,32 @@ export function App() {
       const pads = Array.from(navigator.getGamepads?.() || []).filter(
         (pad): pad is Gamepad => !!pad && pad.connected,
       );
-      const pressed = (pad: Gamepad, index: number) =>
-        !!pad.buttons[index]?.pressed;
-      const axis = (pad: Gamepad, index: number, direction: number) =>
-        direction < 0 ? pad.axes[index] < -0.65 : pad.axes[index] > 0.65;
+      const mapping = controllerMappingRef.current;
+      const mappingChanged = mapping !== lastMapping;
+      lastMapping = mapping;
       const edge = (pad: Gamepad, key: number, isDown: boolean) => {
         const id = pad.index * 100 + key;
         const was = previous.get(id) || false;
         previous.set(id, isDown);
         return isDown && !was;
       };
+      const allowNavigation =
+        gamepadWindowFocused.current &&
+        !gamepadGameRunning.current &&
+        !controllerRemapOpenRef.current &&
+        !mappingChanged;
       for (const pad of pads) {
         const directions = [
-          pressed(pad, 12) || axis(pad, 1, -1),
-          pressed(pad, 13) || axis(pad, 1, 1),
-          pressed(pad, 14) || axis(pad, 0, -1),
-          pressed(pad, 15) || axis(pad, 0, 1),
+          mappedControlPressed(pad, mapping.up),
+          mappedControlPressed(pad, mapping.down),
+          mappedControlPressed(pad, mapping.left),
+          mappedControlPressed(pad, mapping.right),
         ];
-        const direction = directions.findIndex((down, index) =>
+        const directionEdges = directions.map((down, index) =>
           edge(pad, index, down),
         );
-        if (direction >= 0) {
+        const direction = directionEdges.findIndex(Boolean);
+        if (allowNavigation && direction >= 0) {
           const active = document.activeElement;
           if (
             active instanceof HTMLElement &&
@@ -914,16 +998,36 @@ export function App() {
             }
           }
         }
-        if (edge(pad, 20, pressed(pad, 0))) {
+        const confirmPressed = edge(
+          pad,
+          20,
+          mappedControlPressed(pad, mapping.confirm),
+        );
+        if (allowNavigation && confirmPressed) {
           const active = document.activeElement;
           if (active instanceof HTMLElement) active.click();
         }
-        if (edge(pad, 21, pressed(pad, 1)))
+        const cancelPressed = edge(
+          pad,
+          21,
+          mappedControlPressed(pad, mapping.cancel),
+        );
+        if (allowNavigation && cancelPressed)
           document.dispatchEvent(
             new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
           );
-        if (edge(pad, 22, pressed(pad, 4)) || edge(pad, 23, pressed(pad, 5))) {
-          const delta = pressed(pad, 4) ? -1 : 1;
+        const previousPagePressed = edge(
+          pad,
+          22,
+          mappedControlPressed(pad, mapping.previousPage),
+        );
+        const nextPagePressed = edge(
+          pad,
+          23,
+          mappedControlPressed(pad, mapping.nextPage),
+        );
+        if (allowNavigation && (previousPagePressed || nextPagePressed)) {
+          const delta = previousPagePressed ? -1 : 1;
           setPage(
             (current) =>
               pages[
@@ -945,9 +1049,17 @@ export function App() {
     setMessage("");
     try {
       await fn();
-      await refresh();
+      await refreshData();
     } catch (error) {
       setMessage(`Action failed: ${String(error)}`);
+    }
+  };
+  const copyToClipboard = async (text: string, label = "Log") => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setMessage(`${label} copied to clipboard`);
+    } catch (error) {
+      setMessage(`Could not copy ${label.toLowerCase()}: ${String(error)}`);
     }
   };
   const refreshStorageReport = async () => {
@@ -1051,24 +1163,21 @@ export function App() {
         (session) => session.game_id === gameId && session.id > previousId,
       );
       if (launched) setLauncherSessionId(launched.id);
-      await refresh();
+      await refreshData();
     } catch (error) {
       setMessage(`Could not refresh launcher session: ${String(error)}`);
     }
   };
   const addGameToSteam = async (game: Game) => {
-    const image = await open({
-      multiple: false,
-      filters: [{ name: "Cover image", extensions: ["png", "jpg", "jpeg"] }],
-    });
-    if (typeof image !== "string") return;
-    await action(async () => {
+    setMessage(`Adding ${game.title} to Steam…`);
+    try {
       const result = await call<string>("add_game_to_steam", {
         gameId: game.id,
-        imagePath: image,
       });
       setMessage(result);
-    });
+    } catch (error) {
+      setMessage(`Could not add ${game.title} to Steam: ${String(error)}`);
+    }
   };
   const importDroppedPaths = async (paths: string[]) => {
     let imported = 0;
@@ -1089,7 +1198,7 @@ export function App() {
         }
       }
     }
-    await refresh();
+    await refreshData();
     setMessage(
       `${imported} game${imported === 1 ? "" : "s"} imported${alreadyRegistered ? `; ${alreadyRegistered} already registered` : ""}${rejected ? `; ${rejected} path${rejected === 1 ? " was" : "s were"} not recognized` : ""}.`,
     );
@@ -1116,26 +1225,40 @@ export function App() {
     return () => unlisten?.();
   }, []);
   const runJob = async (cmd: string, args: Record<string, unknown>) => {
-    if (appUpdateBusy) {
-      setMessage("Wait for the Studio update to finish before starting another job.");
+    if (appUpdateBusy || busy || jobStartInFlight.current) {
+      setMessage("A task is already running. Wait for it to finish before starting another one.");
       return;
     }
+    jobStartInFlight.current = true;
     beginJob();
+    pendingJobLogs.current = [];
     setLogs([]);
     setBusy(true);
     try {
       const jobId = await call<number>(cmd, args);
       activateJob(jobId);
-    } catch {
+    } catch (error) {
       jobEventGate.current.reset();
       setBusy(false);
       setCurrentBuildPhase("Failed");
+      setMessage(`Could not start ${cmd}: ${String(error)}`);
       if (jobStartedAt.current !== null)
         setElapsedSeconds(
           Math.floor((Date.now() - jobStartedAt.current) / 1000),
         );
       jobStartedAt.current = null;
+    } finally {
+      jobStartInFlight.current = false;
     }
+  };
+  const saveControllerMapping = (mapping: ControllerMapping) => {
+    setControllerMapping(mapping);
+    try {
+      localStorage.setItem("studio.ui.controller_mapping", JSON.stringify(mapping));
+    } catch {
+      setMessage("Controller mapping could not be saved in this app profile");
+    }
+    setControllerRemapOpen(false);
   };
   const active = builds.find((b) => b.active);
   const currentGame = games.find((g) => g.id === selectedGame) || games[0];
@@ -1256,7 +1379,7 @@ export function App() {
         .catch(() => {});
   }, [currentGame?.id]);
   useEffect(() => {
-    if (page !== "diagnostics" && page !== "home") return;
+    if (page !== "diagnostics" && !(page === "home" && specsOpen)) return;
     let disposed = false;
     setGraphics(null);
     invoke<GraphicsDiagnostics>("inspect_graphics")
@@ -1270,7 +1393,7 @@ export function App() {
     return () => {
       disposed = true;
     };
-  }, [page]);
+  }, [page, specsOpen]);
   useEffect(() => {
     let disposed = false;
     if (page === "library" && currentGame) {
@@ -1290,13 +1413,17 @@ export function App() {
   }, [currentGame?.id, page]);
   useEffect(() => {
     let disposed = false;
+    let timer = 0;
     if (page === "library" && currentGame) {
       const release = retainGameBackground(currentGame.id);
-      void loadGameBackground(currentGame.id).then((url) => {
-        if (!disposed) setGameBackground(url);
-      });
+      timer = window.setTimeout(() => {
+        void loadGameBackground(currentGame.id).then((url) => {
+          if (!disposed) setGameBackground(url);
+        });
+      }, 250);
       return () => {
         disposed = true;
+        window.clearTimeout(timer);
         release();
       };
     }
@@ -1639,18 +1766,14 @@ export function App() {
             )}
           </div>
           <span
-            className="title-controller"
-            title={
-              system?.controllers.length
-                ? system.controllers.join(", ")
-                : "No controllers detected"
-            }
+            className="title-game-count"
+            aria-label={`${games.length} games in library`}
+            title="Games in library"
           >
-            <Gamepad2 size={15} />
-            {system?.controllers.length ? system.controllers.length : ""}
+            Games ({games.length})
           </span>
           <button
-            onClick={() => refresh()}
+            onClick={() => refreshSystem()}
             className="title-icon refresh-button"
             aria-label="Refresh library and system status"
             title="Refresh"
@@ -2147,8 +2270,9 @@ export function App() {
                   options: { build_type: buildType, jobs, clean: cleanBuild },
                 })
               }
+              onInstallTools={() => runJob("start_install_build_tools", {})}
               onCancel={() => action(() => call("cancel_job"))}
-              onCopyLog={() => action(() => navigator.clipboard.writeText(logs.join("\n")))}
+              onCopyLog={() => void copyToClipboard(logs.join("\n"), "Build log")}
             />
           )}
           {page === "emulators" && (
@@ -2168,7 +2292,7 @@ export function App() {
                 void call<string>("validate_build", { id })
                   .then(setMessage)
                   .catch(() => {})
-                  .finally(() => refresh().catch(() => {}));
+                  .finally(() => refreshData().catch(() => {}));
               }}
               onCheckUpdates={(repoId) =>
                 action(() =>
@@ -2195,11 +2319,11 @@ export function App() {
               onRemoveBuild={(id) =>
                 action(async () => {
                   await call("remove_build", { id });
-                  await refresh();
+                  await refreshData();
                   setMessage("Managed emulator build removed");
                 })
               }
-              onCopyLog={() => action(() => navigator.clipboard.writeText(selectedLog))}
+              onCopyLog={() => void copyToClipboard(selectedLog, "Build log")}
             />
           )}
           {page === "library" && (
@@ -2282,7 +2406,7 @@ export function App() {
                 })
               }
               onExportLog={() => action(exportSelectedLog)}
-              onCopyLog={() => action(() => navigator.clipboard.writeText(selectedLog))}
+              onCopyLog={() => void copyToClipboard(selectedLog)}
             />
           )}
           {page === "game-details" && currentGame && (
@@ -2325,7 +2449,7 @@ export function App() {
                   await call("remove_game_entry", { gameId: currentGame.id });
                   setPage("library");
                   setSelectedGame(null);
-                  await refresh();
+                  await refreshData();
                   setMessage(
                     "Game entry removed; files and session history were kept",
                   );
@@ -2532,7 +2656,7 @@ export function App() {
                   setLauncherDismissed(true);
                 })
               }
-              onCopyLog={() => action(() => navigator.clipboard.writeText(launcherLog))}
+              onCopyLog={() => void copyToClipboard(launcherLog)}
               canSearchCommunityPRs={trackedRepos.some((repo) => repo.source_path)}
               onSearchCommunityPRs={() => {
                 const searchRepo =
@@ -2553,6 +2677,13 @@ export function App() {
                 setLauncherDismissed(true);
                 setPage("community");
               }}
+            />
+          )}
+          {controllerRemappingEnabled && controllerRemapOpen && (
+            <ControllerRemapDialog
+              mapping={controllerMapping}
+              onSave={saveControllerMapping}
+              onClose={() => setControllerRemapOpen(false)}
             />
           )}
         </div>

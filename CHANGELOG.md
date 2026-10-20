@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.2
+
+### Windows and Linux build tools
+
+- Added in-app installation for missing emulator build tools on Windows and Linux, with progress and command output shown inside Studio.
+- Prevented installer, Git, and log actions from opening separate command or PowerShell windows on Windows.
+- Fixed handling of already-installed LLVM packages and improved dependency checks before builds start.
+
+### Repository and community builds
+
+- Improved clone and restore safety, including protection against repeated actions and incomplete checkouts.
+- Fixed submodule initialization and validation before building repository forks.
+- Fixed Windows paths used for isolated Community PR build clones.
+
+### Games, Steam, and responsiveness
+
+- Improved Windows game library loading and navigation responsiveness, including artwork and metadata handling.
+- Added library artwork and corrected launch details when adding games to Steam.
+- Fixed Windows storage reports to account for downloaded files.
+
+### Controller input
+
+- Prevented controller input from navigating Studio while a game is running.
+- Temporarily hid the controller remapping menu while Windows controller detection is being addressed; the implementation remains in the app.
+
 ## 0.4.1
 
 ### Bug fixes

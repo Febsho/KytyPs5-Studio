@@ -10,7 +10,7 @@ import type {
   System,
   OfficialCompatibilityIndex,
 } from "../types/studio";
-import { GameContextMenu, HomeGameTile } from "../components/games/GameLibrary";
+import { GameContextMenu, VirtualHomeGameRow } from "../components/games/GameLibrary";
 import { date, formatBytes, short } from "../utils/format";
 import { trophySummary } from "../utils/trophies";
 import { compatibilityBadgeLabel, officialCompatibilityForGame } from "../utils/compatibility";
@@ -81,8 +81,11 @@ export function HomePage({
   useEffect(() => {
     if (!featuredGame || !inspectGameContent) { setTrophyProgress(null); return; }
     let current = true;
-    void inspectGameContent(featuredGame.id).then((result)=>{ if(current) setTrophyProgress(trophySummary(result)); }).catch(()=>{ if(current) setTrophyProgress(null); });
-    return ()=>{ current=false; };
+    setTrophyProgress(null);
+    const timer = window.setTimeout(() => {
+      void inspectGameContent(featuredGame.id).then((result)=>{ if(current) setTrophyProgress(trophySummary(result)); }).catch(()=>{ if(current) setTrophyProgress(null); });
+    }, 1200);
+    return ()=>{ current=false; window.clearTimeout(timer); };
   }, [featuredGame?.id, inspectGameContent]);
   return (
     <section
@@ -104,20 +107,15 @@ export function HomePage({
           </button>
         </div>
         {games.length ? (
-          <div className="home-game-row">
-            {games.map((game) => (
-              <HomeGameTile
-                key={game.id}
-                game={game}
-                selected={featuredGame?.id === game.id}
-                onSelect={() => setHomeSelection(game.id)}
-                onContextMenu={(selected, event) => {
-                  event.preventDefault();
-                  setContextMenu({ game: selected, x: event.clientX, y: event.clientY });
-                }}
-              />
-            ))}
-          </div>
+          <VirtualHomeGameRow
+            games={games}
+            selectedId={featuredGame?.id}
+            onSelect={setHomeSelection}
+            onContextMenu={(selected, event) => {
+              event.preventDefault();
+              setContextMenu({ game: selected, x: event.clientX, y: event.clientY });
+            }}
+          />
         ) : (
           <div className="home-empty">
             <button

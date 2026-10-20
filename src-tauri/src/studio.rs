@@ -33,7 +33,8 @@ impl ProcessGroupCommandExt for Command {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_SUSPENDED: u32 = 0x0000_0004;
-        self.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED)
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        self.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED | CREATE_NO_WINDOW)
     }
 }
 #[cfg(any(windows, test))]
@@ -1598,11 +1599,11 @@ fn prepare_owned_child(command: &mut Command) {
         use std::os::windows::process::CommandExt;
         const CREATE_SUSPENDED: u32 = 0x0000_0004;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         // `creation_flags` replaces the previously requested custom flags.
-        // Preserve the Windows process-group isolation set by
-        // `ProcessGroupCommandExt::process_group` while ensuring the process
-        // cannot run before Job Object assignment.
-        command.creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP);
+        // Preserve hidden-window and process-group flags while ensuring the
+        // process cannot run before Job Object assignment.
+        command.creation_flags(CREATE_SUSPENDED | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
     #[cfg(not(windows))]
     let _ = command;
@@ -2306,6 +2307,11 @@ fn storage_report(app: tauri::AppHandle) -> Result<StorageReport, String> {
     let incomplete_size = incomplete.iter().map(|path| directory_size(path)).sum();
     let mut categories = vec![
         StorageCategory {
+            name: "Source repositories".into(),
+            path: paths.data.join("sources").display().to_string(),
+            size_bytes: directory_size(&paths.data.join("sources")),
+        },
+        StorageCategory {
             name: "Installed emulator builds".into(),
             path: builds_root.display().to_string(),
             size_bytes: installed_size,
@@ -2778,7 +2784,12 @@ fn host_tool_command(program: &str) -> Command {
         Command::new(program)
     };
     #[cfg(not(target_os = "linux"))]
-    let command = Command::new(program);
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
     #[cfg(target_os = "linux")]
     {
         let mut search_path = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
@@ -2811,6 +2822,25 @@ fn git_command() -> Command {
         command.env_remove("GIT_EXEC_PATH");
     }
     command
+}
+
+fn git_path_arg(path: &Path) -> Result<String, String> {
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        let ordinary = path
+            .strip_prefix(r"\\?\UNC\")
+            .map(|unc| format!(r"\\{unc}"))
+            .or_else(|| path.strip_prefix(r"\\?\").map(str::to_owned))
+            .unwrap_or_else(|| path.into_owned());
+        if ordinary.encode_utf16().count() >= 260 {
+            Err("The Community PR build path is too long for Git on Windows; use a shorter source or Studio data path".into())
+        } else {
+            Ok(ordinary)
+        }
+    }
+    #[cfg(not(windows))]
+    Ok(path.into_owned())
 }
 
 fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
@@ -5211,6 +5241,10 @@ fn start_community_build(
             if !path_starts_with(&work_root, &cache_root) {
                 return Err("Community worktree cache is outside Studio's managed cache".into());
             }
+            // Windows canonicalize adds a verbatim \\?\ prefix that Git for Windows
+            // rejects as a clone destination. Keep the canonical containment check
+            // above, then use an ordinary absolute path for Git and build tools.
+            let work_root = PathBuf::from(git_path_arg(&work_root)?);
             let worktree = work_root.join(format!(
                 "repo-{repository_id}-{}",
                 SystemTime::now()
@@ -5222,8 +5256,8 @@ fn start_community_build(
                 path: worktree.clone(),
                 root: work_root.clone(),
             };
-            let source_text = source.to_string_lossy().to_string();
-            let work_text = worktree.to_string_lossy().to_string();
+            let source_text = git_path_arg(&source)?;
+            let work_text = git_path_arg(&worktree)?;
             emit(
                 &app,
                 "community-build",
@@ -5698,7 +5732,13 @@ fn system_info(app: tauri::AppHandle) -> Result<SystemInfo, String> {
 }
 #[tauri::command]
 #[cfg(windows)]
-fn system_info(app: tauri::AppHandle) -> Result<SystemInfo, String> {
+async fn system_info(app: tauri::AppHandle) -> Result<SystemInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || system_info_sync(app))
+        .await
+        .map_err(|error| format!("System diagnostics task failed: {error}"))?
+}
+#[cfg(windows)]
+fn system_info_sync(app: tauri::AppHandle) -> Result<SystemInfo, String> {
     let paths = state_paths(&app)?;
     let diagnostics = windows_diagnostics::collect()?;
     Ok(SystemInfo {
@@ -5738,7 +5778,11 @@ fn emit(
     let _ = app.emit(
         "studio-job",
         JobEvent {
-            job_id: if kind == "build" || kind == "clone" || kind == "community-build" {
+            job_id: if kind == "build"
+                || kind == "clone"
+                || kind == "community-build"
+                || kind == "install-tools"
+            {
                 ACTIVE_JOB_ID.load(Ordering::SeqCst)
             } else {
                 0
@@ -5958,6 +6002,50 @@ fn ensure_job_not_cancelled(jobs: &Jobs) -> Result<(), String> {
 fn source_dir(p: &Paths, id: i64) -> PathBuf {
     p.data.join("sources").join(id.to_string())
 }
+fn normalize_remote_url(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_ascii_lowercase()
+}
+fn restore_deleted_submodule_files(source: &Path) -> Result<(), String> {
+    let parent_changes = git(
+        Some(source),
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--ignore-submodules=all",
+        ],
+    )?;
+    if !parent_changes.is_empty() {
+        return Err("Existing checkout has local changes outside submodules; preserve or commit them before restoring".into());
+    }
+    let statuses = git(Some(source), &["submodule", "status", "--recursive"])?;
+    for line in statuses.lines() {
+        if line.starts_with('-') || line.starts_with('U') {
+            continue;
+        }
+        let path = line
+            .get(1..)
+            .and_then(|value| value.split_whitespace().nth(1))
+            .ok_or_else(|| format!("Could not parse submodule status: {line}"))?;
+        let module = source.join(path);
+        let changes = git(
+            Some(&module),
+            &["status", "--porcelain", "--untracked-files=normal"],
+        )?;
+        if changes.is_empty() {
+            continue;
+        }
+        if changes.lines().any(|change| change.get(..2) != Some(" D")) {
+            return Err(format!("Submodule {path} contains local edits or untracked files; preserve them before restoring"));
+        }
+        git(Some(&module), &["restore", "--worktree", "--", "."])?;
+    }
+    Ok(())
+}
 #[tauri::command]
 fn start_clone(
     app: tauri::AppHandle,
@@ -5968,30 +6056,55 @@ fn start_clone(
     let r = repo(&c, id)?;
     let p = state_paths(&app)?;
     let target = source_dir(&p, id);
-    if target.exists() {
-        return Err("Source checkout already exists".into());
-    }
+    let restoring = target.exists();
     let jobs = jobs.inner().clone();
     let job_id = begin_job(&jobs, "Another job is running", true, "clone")?;
     thread::spawn(move || {
         let result = (|| -> Result<(), String> {
             fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
-            execute(
-                &app,
-                &jobs,
-                "clone",
-                "Cloning",
-                "git",
-                &[
-                    "clone".into(),
-                    "--recurse-submodules".into(),
-                    r.url.clone(),
-                    target.display().to_string(),
-                ],
-                None,
-                None,
-            )?;
+            if restoring {
+                let actual = git(Some(&target), &["remote", "get-url", "origin"])?;
+                if normalize_remote_url(&actual) != normalize_remote_url(&r.url) {
+                    return Err(format!(
+                        "Existing checkout at {} belongs to a different repository",
+                        target.display()
+                    ));
+                }
+                restore_deleted_submodule_files(&target)?;
+                execute(
+                    &app,
+                    &jobs,
+                    "clone",
+                    "Restoring submodules",
+                    "git",
+                    &[
+                        "submodule".into(),
+                        "update".into(),
+                        "--init".into(),
+                        "--recursive".into(),
+                    ],
+                    Some(&target),
+                    None,
+                )?;
+            } else {
+                execute(
+                    &app,
+                    &jobs,
+                    "clone",
+                    "Cloning",
+                    "git",
+                    &[
+                        "clone".into(),
+                        "--recurse-submodules".into(),
+                        r.url.clone(),
+                        target.display().to_string(),
+                    ],
+                    None,
+                    None,
+                )?;
+            }
             ensure_job_not_cancelled(&jobs)?;
+            ensure_submodules_initialized(&target)?;
             let branch = checked_out_branch(&target)?;
             let adapter = inspect_adapter(&target);
             let c = db(&app)?;
@@ -6002,14 +6115,20 @@ fn start_clone(
             .map_err(|e| e.to_string())?;
             Ok(())
         })();
-        if result.is_err() && target.exists() {
+        if result.is_err() && !restoring && target.exists() {
             let _ = fs::remove_dir_all(&target);
         }
         finish_job(
             &app,
             &jobs,
             "clone",
-            result.map(|()| "Repository ready".into()),
+            result.map(|()| {
+                if restoring {
+                    "Checkout restored".into()
+                } else {
+                    "Repository ready".into()
+                }
+            }),
         );
     });
     Ok(job_id)
@@ -6134,7 +6253,18 @@ struct BuildSourceInfo {
     cmake_arguments: Vec<String>,
 }
 #[tauri::command]
-fn inspect_build_source(
+async fn inspect_build_source(
+    app: tauri::AppHandle,
+    repository_id: i64,
+    build_type: String,
+) -> Result<BuildSourceInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        inspect_build_source_sync(app, repository_id, build_type)
+    })
+    .await
+    .map_err(|error| format!("Build source inspection task failed: {error}"))?
+}
+fn inspect_build_source_sync(
     app: tauri::AppHandle,
     repository_id: i64,
     build_type: String,
@@ -6359,7 +6489,209 @@ fn verify_build_dependencies(app: &tauri::AppHandle, job_kind: &str) -> Result<(
         }
     }
 }
+#[cfg(target_os = "linux")]
+fn linux_build_tool_install_command() -> Result<(String, Vec<String>), String> {
+    let packages = if command_exists("apt-get") {
+        (
+            "apt-get",
+            vec![
+                "build-essential",
+                "clang",
+                "cmake",
+                "ninja-build",
+                "pkg-config",
+                "python3",
+                "glslang-tools",
+                "libvulkan-dev",
+                "libx11-dev",
+                "libwayland-dev",
+                "libpulse-dev",
+                "libudev-dev",
+            ],
+        )
+    } else if command_exists("dnf") {
+        (
+            "dnf",
+            vec![
+                "gcc",
+                "gcc-c++",
+                "clang",
+                "cmake",
+                "ninja-build",
+                "pkgconf-pkg-config",
+                "python3",
+                "glslang",
+                "vulkan-headers",
+                "vulkan-loader-devel",
+                "libX11-devel",
+                "wayland-devel",
+                "pulseaudio-libs-devel",
+                "systemd-devel",
+            ],
+        )
+    } else if command_exists("pacman") {
+        (
+            "pacman",
+            vec![
+                "base-devel",
+                "clang",
+                "cmake",
+                "ninja",
+                "pkgconf",
+                "python",
+                "glslang",
+                "vulkan-headers",
+                "libx11",
+                "wayland",
+                "libpulse",
+                "systemd",
+            ],
+        )
+    } else if command_exists("zypper") {
+        (
+            "zypper",
+            vec![
+                "gcc",
+                "gcc-c++",
+                "clang",
+                "cmake",
+                "ninja",
+                "pkg-config",
+                "python3",
+                "glslang",
+                "vulkan-headers",
+                "vulkan-loader-devel",
+                "libX11-devel",
+                "wayland-devel",
+                "libpulse-devel",
+                "systemd-devel",
+            ],
+        )
+    } else {
+        return Err("Automatic Linux tool installation supports apt, dnf, pacman, and zypper. Install the C++ build tools and Vulkan/X11/Wayland/PulseAudio/libudev development packages with your distribution package manager.".into());
+    };
+    let (manager, packages) = packages;
+    if !command_exists("pkexec") {
+        return Err("A graphical administrator prompt (pkexec) is unavailable. Install polkit, sign in to an administrator account, and try again.".into());
+    }
+    let mut args = vec![manager.to_string()];
+    match manager {
+        "apt-get" => args.extend(["install".into(), "-y".into()]),
+        "dnf" => args.extend(["install".into(), "-y".into()]),
+        "pacman" => args.extend(["-S".into(), "--needed".into(), "--noconfirm".into()]),
+        "zypper" => args.extend(["--non-interactive".into(), "install".into()]),
+        _ => unreachable!(),
+    }
+    args.extend(packages.into_iter().map(str::to_string));
+    Ok(("pkexec".into(), args))
+}
+
+#[tauri::command]
+async fn start_install_build_tools(
+    app: tauri::AppHandle,
+    jobs: tauri::State<'_, Arc<Jobs>>,
+) -> Result<u64, String> {
+    let jobs = jobs.inner().clone();
+    let job_id = begin_job(&jobs, "Another job is running", false, "install-tools")?;
+    thread::spawn(move || {
+        let result = (|| -> Result<String, String> {
+            emit(
+                &app,
+                "install-tools",
+                "Installing tools",
+                "Checking missing tools and preparing the system installer",
+                false,
+                true,
+            );
+            #[cfg(windows)]
+            let commands = windows_build::install_commands()?;
+            #[cfg(target_os = "linux")]
+            let commands = vec![linux_build_tool_install_command()?];
+            #[cfg(not(any(windows, target_os = "linux")))]
+            return Err(
+                "Automatic build tool installation is supported on Windows and Linux only.".into(),
+            );
+            for (index, (program, args)) in commands.iter().enumerate() {
+                emit(
+                    &app,
+                    "install-tools",
+                    "Installing tools",
+                    format!("Installing package set {}/{}", index + 1, commands.len()),
+                    false,
+                    true,
+                );
+                let install_result = execute(
+                    &app,
+                    &jobs,
+                    "install-tools",
+                    "Installing tools",
+                    program,
+                    args,
+                    None,
+                    None,
+                );
+                if let Err(error) = install_result {
+                    #[cfg(windows)]
+                    let already_satisfied = {
+                        let package_id = args
+                            .windows(2)
+                            .find(|pair| pair[0] == "--id")
+                            .map(|pair| pair[1].as_str());
+                        error.to_ascii_lowercase().contains("0x8a15002b")
+                            && package_id
+                                .is_some_and(windows_build::package_requirement_is_satisfied)
+                    };
+                    #[cfg(not(windows))]
+                    let already_satisfied = false;
+                    if already_satisfied {
+                        emit(
+                            &app,
+                            "install-tools",
+                            "Installing tools",
+                            "WinGet reports no applicable update; the required tool is already installed",
+                            false,
+                            true,
+                        );
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+            #[cfg(windows)]
+            let message = "Tool installation finished. Restart KytyPS5 Studio so Windows can refresh PATH and Vulkan SDK settings, then check dependencies again.";
+            #[cfg(target_os = "linux")]
+            let message =
+                "Tool installation finished. Return to Build Studio and check dependencies again.";
+            Ok(message.into())
+        })();
+        finish_job(&app, &jobs, "install-tools", result);
+    });
+    Ok(job_id)
+}
 fn validate_clean_source_checkout(source: &Path) -> Result<(), String> {
+    validate_source_and_submodule_worktrees_clean(source)?;
+    ensure_submodules_initialized(source)?;
+    Ok(())
+}
+fn ensure_submodules_initialized(source: &Path) -> Result<(), String> {
+    let submodules = git(Some(source), &["submodule", "status", "--recursive"])?;
+    if submodules
+        .lines()
+        .any(|line| line.starts_with('-') || line.starts_with('+') || line.starts_with('U'))
+    {
+        return Err("Checkout is incomplete: one or more Git submodules are uninitialized or differ from the recorded commit. Restore the checkout again before building.".into());
+    }
+    Ok(())
+}
+
+// This preflight runs before the build's submodule update. It permits missing
+// or stale submodule checkouts so that the update step can repair them, while
+// still protecting local edits in the main repository and initialized modules.
+fn validate_source_before_submodule_update(source: &Path) -> Result<(), String> {
+    validate_source_and_submodule_worktrees_clean(source)
+}
+
+fn validate_source_and_submodule_worktrees_clean(source: &Path) -> Result<(), String> {
     if !source.is_dir() {
         return Err("The registered source checkout is missing".into());
     }
@@ -6375,13 +6707,6 @@ fn validate_clean_source_checkout(source: &Path) -> Result<(), String> {
     .is_empty()
     {
         return Err("Source checkout has modified or untracked files. Commit or remove them before building so the recorded commit matches the built source.".into());
-    }
-    let submodules = git(Some(source), &["submodule", "status", "--recursive"])?;
-    if submodules
-        .lines()
-        .any(|line| line.starts_with('-') || line.starts_with('+') || line.starts_with('U'))
-    {
-        return Err("One or more Git submodules are uninitialized or differ from the recorded commit. Update them before building.".into());
     }
     let dirty_submodules = git(
         Some(source),
@@ -6683,15 +7008,32 @@ fn start_build(
         return Err("No verified build adapter for this checkout".into());
     }
     let source = PathBuf::from(r.source_path.ok_or("Clone the repository first")?);
-    validate_clean_source_checkout(&source)?;
+    validate_source_before_submodule_update(&source)?;
     let commit = git(Some(&source), &["rev-parse", "HEAD"])?;
     let branch = checked_out_branch(&source)?;
     let jobs = jobs.inner().clone();
     let job_id = begin_job(&jobs, "Another job is running", true, "build")?;
     thread::spawn(move || {
-        let result = build_and_register(
-            &app, &jobs, id, &source, &commit, &options, &compiler, "build", true,
+        let result = execute(
+            &app,
+            &jobs,
+            "build",
+            "Updating submodules",
+            "git",
+            &[
+                "submodule".into(),
+                "update".into(),
+                "--init".into(),
+                "--recursive".into(),
+            ],
+            Some(&source),
+            None,
         )
+        .and_then(|()| {
+            build_and_register(
+                &app, &jobs, id, &source, &commit, &options, &compiler, "build", true,
+            )
+        })
         .and_then(|path| {
             mark_repository_build_commit(&app, id, &commit, &branch)?;
             Ok(path)
@@ -6732,7 +7074,7 @@ fn start_update_build(
                     repository.branch
                 ));
             }
-            validate_clean_source_checkout(&source)?;
+            validate_source_before_submodule_update(&source)?;
             execute(
                 &app,
                 &jobs,
@@ -7598,15 +7940,18 @@ fn game_metadata(path: &Path) -> (String, Option<String>, Option<String>, Option
     (title, title_id, version, icon_path)
 }
 #[tauri::command]
-async fn read_game_icon(app: tauri::AppHandle, game_id: i64) -> Result<Option<Vec<u8>>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+async fn read_game_icon(
+    app: tauri::AppHandle,
+    game_id: i64,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
         let c = db(&app)?;
         let game = game(&c, game_id)?;
         let Some(icon) = game.icon_path else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         let Some(root) = game_artwork_root(Path::new(&game.path)) else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         Ok(read_game_thumbnail(
             Path::new(&icon),
@@ -7615,21 +7960,23 @@ async fn read_game_icon(app: tauri::AppHandle, game_id: i64) -> Result<Option<Ve
             1024,
             1024,
             8 * 1024 * 1024,
-        ))
+        )
+        .unwrap_or_default())
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 #[tauri::command]
 async fn read_game_background(
     app: tauri::AppHandle,
     game_id: i64,
-) -> Result<Option<Vec<u8>>, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
         let c = db(&app)?;
         let game = game(&c, game_id)?;
         let Some(root) = game_artwork_root(Path::new(&game.path)) else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         Ok(read_game_thumbnail(
             &root.join("sce_sys/pic0.png"),
@@ -7638,10 +7985,12 @@ async fn read_game_background(
             1600,
             900,
             8 * 1024 * 1024,
-        ))
+        )
+        .unwrap_or_default())
     })
     .await
-    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 fn game_artwork_root(game_path: &Path) -> Option<PathBuf> {
     if game_path.is_dir() {
@@ -8917,11 +9266,7 @@ fn steam_config_dir() -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-fn add_game_to_steam(
-    app: tauri::AppHandle,
-    game_id: i64,
-    image_path: String,
-) -> Result<String, String> {
+fn add_game_to_steam(app: tauri::AppHandle, game_id: i64) -> Result<String, String> {
     #[cfg(unix)]
     let steam_running = fs::read_dir("/proc")
         .ok()
@@ -8938,16 +9283,22 @@ fn add_game_to_steam(
     if steam_running {
         return Err("Close Steam completely, then add the game again so Steam cannot overwrite its shortcut list.".into());
     }
-    let image = fs::canonicalize(&image_path)
-        .map_err(|error| format!("Could not read selected cover image: {error}"))?;
-    let extension = image
-        .extension()
-        .and_then(|v| v.to_str())
-        .map(str::to_ascii_lowercase)
-        .filter(|v| matches!(v.as_str(), "png" | "jpg" | "jpeg"))
-        .ok_or("Choose a PNG, JPG, or JPEG cover image")?;
     let c = db(&app)?;
     let g = game(&c, game_id)?;
+    let artwork_root = game_artwork_root(Path::new(&g.path))
+        .ok_or("The game folder does not contain its included artwork")?;
+    let artwork_root =
+        fs::canonicalize(artwork_root).map_err(|_| "The game folder is missing or inaccessible")?;
+    let image = fs::canonicalize(
+        g.icon_path
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or(&artwork_root.join("sce_sys/icon0.png")),
+    )
+    .map_err(|_| "The game's included sce_sys/icon0.png cover is missing")?;
+    if !path_starts_with(&image, &artwork_root) || !image.is_file() {
+        return Err("The game's included cover image is outside its game folder".into());
+    }
     let game_profile = profile(&c, game_id)?;
     let build_id = if let Some(id) = g.build_id {
         id
@@ -9048,7 +9399,7 @@ fn add_game_to_steam(
     let launch_id = (u64::from(app_id) << 32) | 0x0200_0000;
     let grid = config.join("grid");
     fs::create_dir_all(&grid).map_err(|e| format!("Could not create Steam artwork folder: {e}"))?;
-    let artwork = grid.join(format!("{launch_id}p.{extension}"));
+    let artwork = grid.join(format!("{launch_id}p.png"));
     fs::copy(&image, &artwork).map_err(|e| format!("Could not copy cover image to Steam: {e}"))?;
     let shortcuts_path = config.join("shortcuts.vdf");
     let mut shortcuts = if shortcuts_path.exists() {
@@ -9103,7 +9454,7 @@ fn add_game_to_steam(
             return Err(format!("Could not update Steam shortcuts: {error}"));
         }
     }
-    Ok(format!("Added {} to Steam with the selected emulator build. Restart Steam to see it in your library.", g.title))
+    Ok(format!("Added {} to Steam with its included cover and selected emulator build. Restart Steam to see it in your library.", g.title))
 }
 
 #[tauri::command]
@@ -10319,6 +10670,7 @@ pub fn run() {
             github_token_status,
             inspect_build_source,
             system_info,
+            start_install_build_tools,
             storage_report,
             clean_incomplete_builds,
             clean_compiler_cache,
@@ -12832,6 +13184,32 @@ mod tests {
             &["-c", "commit.gpgsign=false", "commit", "-m", "submodule"],
         )
         .unwrap();
+        assert!(validate_clean_source_checkout(&source).is_ok());
+        test_git(
+            &source,
+            &["submodule", "deinit", "--force", "vendor/upstream"],
+        )
+        .unwrap();
+        assert!(validate_clean_source_checkout(&source)
+            .unwrap_err()
+            .contains("submodules are uninitialized"));
+        assert!(ensure_submodules_initialized(&source)
+            .unwrap_err()
+            .contains("Checkout is incomplete"));
+        assert!(validate_source_before_submodule_update(&source).is_ok());
+        test_git(
+            &source,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            ],
+        )
+        .unwrap();
+        assert!(ensure_submodules_initialized(&source).is_ok());
         assert!(validate_clean_source_checkout(&source).is_ok());
         fs::write(source.join("vendor/upstream/nested.txt"), "dirty\n").unwrap();
         let error = validate_clean_source_checkout(&source).unwrap_err();

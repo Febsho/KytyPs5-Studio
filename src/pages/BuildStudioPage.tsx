@@ -23,6 +23,7 @@ export type BuildStudioPageProps = {
   onSelectRepo: (id: number) => void;
   onBuild: () => void;
   onBuildLatest: () => void;
+  onInstallTools: () => void;
   onCancel: () => void;
   onCopyLog?: () => void;
 };
@@ -67,6 +68,7 @@ export function BuildStudioPage({
   onSelectRepo,
   onBuild,
   onBuildLatest,
+  onInstallTools,
   onCancel,
   onCopyLog,
 }: BuildStudioPageProps) {
@@ -74,6 +76,23 @@ export function BuildStudioPage({
   const onBuildTypeChange = setBuildType;
   const onJobsChange = setJobs;
   const onCleanBuildChange = setCleanBuild;
+  const linuxBuildToolNames = new Set([
+    "cmake", "ninja", "clang", "clang++", "pkg-config", "python3",
+    "glslangValidator", "vulkan", "x11", "wayland-client", "libpulse", "libudev",
+  ]);
+  const isWindows = system?.os.toLowerCase().includes("windows") ?? false;
+  const isLinux = system?.os.toLowerCase().includes("linux") ?? false;
+  const missingBuildTools = system
+    ? system.dependencies
+        .filter((dependency) =>
+          isWindows
+            ? !dependency.present
+            : isLinux && linuxBuildToolNames.has(dependency.name) && !dependency.present,
+        )
+        .map((dependency) => dependency.name)
+    : [];
+  const buildToolsMissing = missingBuildTools.length > 0;
+  const canCancel = busy && currentBuildPhase.toLowerCase() !== "installing tools";
   return (
     <section className="page build-studio-page">
       <div className="studio-page-heading">
@@ -102,6 +121,14 @@ export function BuildStudioPage({
           </button>
         </div>
       </div>
+      {buildToolsMissing ? (
+        <div className="build-tool-install-notice" role="status">
+          <span>Missing build tools: {missingBuildTools.join(", ")}.</span>
+          <button className="outline" disabled={busy} onClick={onInstallTools}>
+            Install missing tools
+          </button>
+        </div>
+      ) : null}
       <div className="build-summary technical-summary">
         <div>
           <small>Repository</small>
@@ -227,6 +254,7 @@ export function BuildStudioPage({
               className="primary build-main-action"
               disabled={
                 busy ||
+                buildToolsMissing ||
                 !currentRepo?.source_path ||
                 !["official", "kyty-cmake"].includes(currentRepo.adapter)
               }
@@ -271,6 +299,7 @@ export function BuildStudioPage({
                   className="outline"
                   disabled={
                     busy ||
+                    buildToolsMissing ||
                     !currentRepo?.source_path ||
                     !["official", "kyty-cmake"].includes(currentRepo.adapter)
                   }
@@ -280,7 +309,7 @@ export function BuildStudioPage({
                 </button>
                 <button
                   className="outline danger-action"
-                  disabled={!busy}
+                  disabled={!canCancel}
                   onClick={onCancel}
                 >
                   <Square size={13} /> Cancel
@@ -434,6 +463,7 @@ export function BuildStudioPage({
                 className="primary"
                 disabled={
                   busy ||
+                  buildToolsMissing ||
                   !currentRepo?.source_path ||
                   !["official", "kyty-cmake"].includes(currentRepo.adapter)
                 }
@@ -443,7 +473,7 @@ export function BuildStudioPage({
               </button>
               <button
                 className="outline danger-action"
-                disabled={!busy}
+                disabled={!canCancel}
                 onClick={onCancel}
               >
                 <Square size={13} /> Cancel

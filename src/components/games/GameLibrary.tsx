@@ -153,20 +153,43 @@ export function HomeGameTile({
   onSelect: () => void;
   onContextMenu?: (game: Game, event: ReactMouseEvent<HTMLButtonElement>) => void;
 }) {
+  const element = useRef<HTMLButtonElement>(null);
   const [icon, setIcon] = useState<string | null>(null);
   useEffect(() => {
     let disposed = false;
     const release = retainGameIcon(game.id);
-    void loadGameIcon(game.id).then((url) => {
-      if (!disposed) setIcon(url);
-    });
+    const load = () => {
+      void loadGameIcon(game.id).then((url) => {
+        if (!disposed) setIcon(url);
+      });
+    };
+    const target = element.current;
+    if (!target || typeof IntersectionObserver === "undefined") {
+      load();
+      return () => {
+        disposed = true;
+        release();
+      };
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          observer.disconnect();
+          load();
+        }
+      },
+      { root: target.parentElement, rootMargin: "160px" },
+    );
+    observer.observe(target);
     return () => {
       disposed = true;
+      observer.disconnect();
       release();
     };
   }, [game.id]);
   return (
     <button
+      ref={element}
       className={`home-game-tile ${selected ? "selected" : ""}`}
       onClick={onSelect}
       onContextMenu={(event) => onContextMenu?.(game, event)}
@@ -184,6 +207,109 @@ export function HomeGameTile({
     </button>
   );
 }
+
+export function VirtualHomeGameRow({
+  games,
+  selectedId,
+  onSelect,
+  onContextMenu,
+}: {
+  games: Game[];
+  selectedId: number | undefined;
+  onSelect: (id: number) => void;
+  onContextMenu?: (game: Game, event: ReactMouseEvent<HTMLButtonElement>) => void;
+}) {
+  const row = useRef<HTMLDivElement>(null);
+  const [viewport, setViewport] = useState({
+    left: 0,
+    width: 0,
+    stride: 175,
+    tileWidth: 160,
+  });
+
+  useLayoutEffect(() => {
+    const element = row.current;
+    if (!element) return;
+    const measure = () => {
+      const tile = element.querySelector<HTMLElement>(".home-game-tile");
+      const styles = getComputedStyle(element);
+      const gap = Number.parseFloat(styles.columnGap) || 15;
+      const tileWidth = tile?.getBoundingClientRect().width || 160;
+      const next = {
+        left: element.scrollLeft,
+        width: element.clientWidth,
+        stride: tileWidth + gap,
+        tileWidth,
+      };
+      setViewport((current) =>
+        current.left === next.left &&
+        current.width === next.width &&
+        current.stride === next.stride &&
+        current.tileWidth === next.tileWidth
+          ? current
+          : next,
+      );
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    window.addEventListener("resize", measure);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", measure);
+    };
+  }, []);
+
+  const overscan = 3;
+  const start = Math.max(
+    0,
+    Math.floor(viewport.left / viewport.stride) - overscan,
+  );
+  const end = Math.min(
+    games.length,
+    Math.ceil((viewport.left + viewport.width) / viewport.stride) + overscan,
+  );
+  const visible = games.slice(start, Math.max(start + 1, end));
+  const gap = viewport.stride - viewport.tileWidth;
+
+  return (
+    <div
+      ref={row}
+      className="home-game-row"
+      onScroll={(event) =>
+        setViewport((current) => ({
+          ...current,
+          left: event.currentTarget.scrollLeft,
+        }))
+      }
+    >
+      {start > 0 && (
+        <span
+          className="home-game-spacer"
+          aria-hidden="true"
+          style={{ width: Math.max(0, start * viewport.stride - gap) }}
+        />
+      )}
+      {visible.map((game) => (
+        <HomeGameTile
+          key={game.id}
+          game={game}
+          selected={selectedId === game.id}
+          onSelect={() => onSelect(game.id)}
+          onContextMenu={onContextMenu}
+        />
+      ))}
+      {end < games.length && (
+        <span
+          className="home-game-spacer"
+          aria-hidden="true"
+          style={{ width: (games.length - end) * viewport.stride }}
+        />
+      )}
+    </div>
+  );
+}
+
 export function VirtualGameGrid({
   games,
   selectedId,

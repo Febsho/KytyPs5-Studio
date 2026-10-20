@@ -26,7 +26,7 @@ The screenshots show the games home page, installed emulator builds, and the sou
 - Adds games to Steam and shares the current game through Discord Rich Presence when enabled.
 - Shows host and Vulkan diagnostics to help troubleshoot build and launch problems.
 
-See the [0.4.1 release notes](CHANGELOG.md) for this release's changes.
+See the [0.4.2 release notes](CHANGELOG.md) for this release's changes.
 
 Successful compilation or CLI verification does **not** guarantee that a game will run. Compatibility depends on the emulator, game, drivers, and system configuration.
 
@@ -50,8 +50,8 @@ Manual testing on a Windows desktop has not yet been completed. Automated Window
 Download the Linux AppImage from the [GitHub Releases](https://github.com/Febsho/KytyPs5-Studio/releases) page, make it executable, and run it:
 
 ```sh
-chmod +x "KytyPS5.Studio_0.4.1_amd64.AppImage"
-./"KytyPS5.Studio_0.4.1_amd64.AppImage"
+chmod +x "KytyPS5.Studio_0.4.2_amd64.AppImage"
+./"KytyPS5.Studio_0.4.2_amd64.AppImage"
 ```
 
 The AppImage filename may change between releases. Linux application data, cache, and configuration follow XDG user directories. An optional GitHub token is stored in Linux Secret Service.
@@ -85,7 +85,7 @@ For Arch Linux and CachyOS, the repository also includes a package recipe at [`p
 
 ### Windows 10/11 x64
 
-Install Node.js/npm, stable Rust with the `x86_64-pc-windows-msvc` toolchain, Visual Studio 2022 Build Tools with the Desktop development with C++ workload and Windows 10/11 SDK, and the WebView2 runtime. Then run:
+Install Node.js/npm, stable Rust with the `x86_64-pc-windows-msvc` toolchain, Visual Studio 2022 or newer with the Desktop development with C++ workload and Windows 10/11 SDK, and the WebView2 runtime. Then run:
 
 ```powershell
 npm ci
@@ -100,7 +100,7 @@ npm run tauri build -- --bundles nsis
 
 The NSIS installer is written to `src-tauri/target/release/bundle/nsis/`. Version tags (`v*`) also trigger GitHub Actions to build and attach the Windows installer and Linux release artifacts to a GitHub Release.
 
-Git for Windows is required for repository and source management. Building the KytyPS5 emulator from Studio on Windows additionally requires Visual Studio 2022 C++ Build Tools, clang-cl (the Visual Studio C++ Clang tools workload), CMake 3.22.1 or newer, Ninja, glslangValidator, and Python 3. Studio checks these dependencies and reports missing tools before starting the build.
+Git for Windows is required for repository and source management. Building the KytyPS5 emulator from Studio on Windows additionally requires Visual Studio 2022 or newer C++ Build Tools, clang-cl (the Visual Studio C++ Clang tools workload), CMake 3.22.1 or newer, Ninja, glslangValidator, and Python 3. Studio checks these dependencies and reports missing tools before starting the build.
 
 ## Game files and privacy
 

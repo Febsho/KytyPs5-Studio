@@ -5,7 +5,9 @@ import type { StudioCommand } from "./useStudioData";
 const PROCESS_METRICS_REFRESH_EVENT = "studio:refresh-process-metrics";
 
 export function processMetricsPollDelay(active: boolean, visible: boolean) {
-  if (active) return visible ? 1_000 : 5_000;
+  // Process telemetry is fed into the app shell, so each poll can repaint the
+  // whole window. Keep live-session stats useful without forcing a 1 Hz render.
+  if (active) return visible ? 5_000 : 15_000;
   return visible ? 15_000 : 60_000;
 }
 

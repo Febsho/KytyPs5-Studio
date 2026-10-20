@@ -26,25 +26,33 @@ const BUILD_ENVIRONMENT: &[&str] = &[
     "VSCMD_ARG_HOST_ARCH",
     "WindowsLibPath",
 ];
+const MINIMUM_VISUAL_STUDIO_VERSION: &str = "[17.0,)";
 
 fn vswhere_path() -> Result<PathBuf, String> {
-    let program_files = env::var_os("ProgramFiles(x86)")
-        .ok_or("ProgramFiles(x86) is unavailable; install Visual Studio 2022 Build Tools")?;
+    let program_files = env::var_os("ProgramFiles(x86)").ok_or(
+        "ProgramFiles(x86) is unavailable; install Visual Studio 2022 or newer Build Tools",
+    )?;
     let path = PathBuf::from(program_files)
         .join("Microsoft Visual Studio")
         .join("Installer")
         .join("vswhere.exe");
     path.is_file().then_some(path).ok_or_else(|| {
-        "Visual Studio Installer (vswhere.exe) is missing; install Visual Studio 2022 Build Tools with the Desktop development with C++ workload".into()
+        "Visual Studio Installer (vswhere.exe) is missing; install Visual Studio 2022 or newer Build Tools with the Desktop development with C++ workload".into()
     })
 }
 
 fn visual_studio_installation() -> Result<PathBuf, String> {
-    let output = Command::new(vswhere_path()?)
+    let mut command = Command::new(vswhere_path()?);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command
         .args([
             "-latest",
             "-version",
-            "[17.0,18.0)",
+            MINIMUM_VISUAL_STUDIO_VERSION,
             "-products",
             "*",
             "-requires",
@@ -61,7 +69,7 @@ fn visual_studio_installation() -> Result<PathBuf, String> {
     }
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if path.is_empty() {
-        return Err("Visual Studio C++ Build Tools were not found. Install the Desktop development with C++ workload and Windows 10/11 SDK.".into());
+        return Err("Visual Studio C++ Build Tools were not found. Install Visual Studio 2022 or newer with the Desktop development with C++ workload and Windows 10/11 SDK.".into());
     }
     let path = PathBuf::from(path);
     let dev_command = path.join("Common7").join("Tools").join("VsDevCmd.bat");
@@ -90,7 +98,7 @@ fn version_output_matches(stdout: &[u8], stderr: &[u8], expected: &str) -> bool 
 }
 
 fn command_reports(program: &str, args: &[&str], expected: &str) -> bool {
-    Command::new(program)
+    hidden_command(program)
         .args(args)
         .output()
         .ok()
@@ -101,7 +109,7 @@ fn command_reports(program: &str, args: &[&str], expected: &str) -> bool {
 }
 
 fn command_succeeds(program: &std::ffi::OsStr, args: &[&str]) -> bool {
-    Command::new(program)
+    hidden_command(program)
         .args(args)
         .output()
         .ok()
@@ -229,7 +237,17 @@ fn clang_directory(
     if bundled.join("clang-cl.exe").is_file() {
         return Some(bundled);
     }
+    if let Some(llvm) = standalone_llvm_directory() {
+        return Some(llvm);
+    }
     env::split_paths(fallback_path).find(|directory| directory.join("clang-cl.exe").is_file())
+}
+
+fn standalone_llvm_directory() -> Option<PathBuf> {
+    env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .map(|program_files| program_files.join("LLVM").join("bin"))
+        .filter(|directory| directory.join("clang-cl.exe").is_file())
 }
 
 fn append_clang_environment(
@@ -254,7 +272,7 @@ fn append_clang_environment(
 
 fn cmake_available() -> bool {
     path_has_executable("cmake.exe")
-        && Command::new("cmake.exe")
+        && hidden_command("cmake.exe")
             .arg("--version")
             .output()
             .ok()
@@ -263,11 +281,22 @@ fn cmake_available() -> bool {
             .unwrap_or(false)
 }
 
+fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+}
+
 pub fn dependencies() -> Vec<(String, bool)> {
     let visual_studio = visual_studio_installation();
     let llvm = visual_studio
         .as_ref()
         .is_ok_and(|path| path.join("VC/Tools/Llvm/bin/clang-cl.exe").is_file())
+        || standalone_llvm_directory().is_some()
         || path_has_executable("clang-cl.exe");
     vec![
         (
@@ -288,6 +317,105 @@ pub fn dependencies() -> Vec<(String, bool)> {
         ("glslangValidator".into(), glslang_available()),
         ("Python 3".into(), python3_available()),
     ]
+}
+
+pub fn package_requirement_is_satisfied(package_id: &str) -> bool {
+    let available = dependencies()
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    match package_id {
+        "Git.Git" => available.get("Git for Windows").copied().unwrap_or(false),
+        "Kitware.CMake" => available.get("CMake 3.22.1+").copied().unwrap_or(false),
+        "Ninja-build.Ninja" => available.get("Ninja").copied().unwrap_or(false),
+        "Python.Python.3.13" => available.get("Python 3").copied().unwrap_or(false),
+        "LLVM.LLVM" => available.get("clang-cl").copied().unwrap_or(false),
+        "KhronosGroup.VulkanSDK" => available.get("glslangValidator").copied().unwrap_or(false),
+        "Microsoft.VisualStudio.2022.BuildTools" => {
+            available
+                .get("Visual Studio C++ Build Tools")
+                .copied()
+                .unwrap_or(false)
+                && available.get("Windows 10/11 SDK").copied().unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+pub fn install_commands() -> Result<Vec<(String, Vec<String>)>, String> {
+    if !command_reports("winget.exe", &["--version"], "v") {
+        return Err("Windows Package Manager (winget) is unavailable. Install or update App Installer from Microsoft Store, then restart KytyPS5 Studio.".into());
+    }
+    install_commands_for(dependencies())
+}
+
+fn install_commands_for(
+    dependencies: Vec<(String, bool)>,
+) -> Result<Vec<(String, Vec<String>)>, String> {
+    let available = dependencies
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut packages = Vec::new();
+    for (name, id) in [
+        ("Git for Windows", "Git.Git"),
+        ("CMake 3.22.1+", "Kitware.CMake"),
+        ("Ninja", "Ninja-build.Ninja"),
+        ("Python 3", "Python.Python.3.13"),
+    ] {
+        if !available.get(name).copied().unwrap_or(false) {
+            packages.push(id);
+        }
+    }
+    if !available.get("clang-cl").copied().unwrap_or(false) {
+        packages.push("LLVM.LLVM");
+    }
+    if !available.get("glslangValidator").copied().unwrap_or(false) {
+        packages.push("KhronosGroup.VulkanSDK");
+    }
+    let mut commands = packages
+        .into_iter()
+        .map(|id| {
+            (
+                "winget.exe".to_string(),
+                vec![
+                    "install".into(),
+                    "--exact".into(),
+                    "--id".into(),
+                    id.into(),
+                    "--silent".into(),
+                    "--disable-interactivity".into(),
+                    "--accept-package-agreements".into(),
+                    "--accept-source-agreements".into(),
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+    if !available
+        .get("Visual Studio C++ Build Tools")
+        .copied()
+        .unwrap_or(false)
+        || !available.get("Windows 10/11 SDK").copied().unwrap_or(false)
+    {
+        commands.push((
+            "winget.exe".into(),
+            vec![
+                "install".into(),
+                "--exact".into(),
+                "--id".into(),
+                "Microsoft.VisualStudio.2022.BuildTools".into(),
+                "--silent".into(),
+                "--disable-interactivity".into(),
+                "--accept-package-agreements".into(),
+                "--accept-source-agreements".into(),
+                "--override".into(),
+                "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Llvm.Clang --add Microsoft.VisualStudio.Component.Windows11SDK.26100 --includeRecommended".into(),
+            ],
+        ));
+    }
+    if commands.is_empty() {
+        Err("Windows build tools already appear to be installed. Restart the app to refresh its PATH, or refresh system diagnostics and try again.".into())
+    } else {
+        Ok(commands)
+    }
 }
 
 pub fn validate() -> Result<(), String> {
@@ -314,7 +442,7 @@ fn missing_dependency_error(missing: &[String]) -> String {
         )
     }) {
         guidance.push(
-            "Install Visual Studio 2022 Build Tools with the Desktop development with C++ workload and Windows 10/11 SDK.",
+            "Install Visual Studio 2022 or newer with the Desktop development with C++ workload and Windows 10/11 SDK.",
         );
     }
     if missing.iter().any(|name| name == "clang-cl") {
@@ -390,6 +518,7 @@ fn command_environment() -> Result<Vec<(OsString, OsString)>, String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
         // cmd.exe's /c parser does not follow the normal Windows argv quoting
         // rules, so pass its complete command line verbatim.
         command.raw_arg(format!("/d /u /c \"{command_line}\""));
@@ -472,7 +601,7 @@ pub fn apply_environment(command: &mut Command) -> Result<(), String> {
 mod tests {
     use super::{
         cmake_version_at_least_3_22_1, configuration_arguments, missing_dependency_error,
-        windows_sdk_root_available,
+        windows_sdk_root_available, MINIMUM_VISUAL_STUDIO_VERSION,
     };
     use std::{
         ffi::OsString,
@@ -489,6 +618,11 @@ mod tests {
         assert!(!cmake_version_at_least_3_22_1("cmake version 3.22.0"));
         assert!(!cmake_version_at_least_3_22_1("cmake version 3.22.1-rc1"));
         assert!(!cmake_version_at_least_3_22_1("CMake version unknown"));
+    }
+
+    #[test]
+    fn visual_studio_discovery_accepts_2022_and_newer_releases() {
+        assert_eq!(MINIMUM_VISUAL_STUDIO_VERSION, "[17.0,)");
     }
 
     #[test]
@@ -580,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_llvm_accepted_by_preflight_is_added_to_the_build_path() {
+    fn selected_llvm_accepted_by_preflight_is_added_to_the_build_path() {
         let root = std::env::temp_dir().join(format!(
             "kyty-clang-{}-{}",
             std::process::id(),
@@ -596,6 +730,7 @@ mod tests {
         let fallback_path = std::env::join_paths([standalone.clone()]).unwrap();
         let original_path = std::env::join_paths([PathBuf::from("Visual Studio tools")]).unwrap();
         let mut environment = vec![(OsString::from("PATH"), original_path)];
+        let selected = super::clang_directory(&installation, &fallback_path).unwrap();
 
         super::append_clang_environment(&mut environment, &installation, &fallback_path).unwrap();
 
@@ -604,7 +739,7 @@ mod tests {
             .find(|(name, _)| name == "PATH")
             .map(|(_, value)| std::env::split_paths(value).collect::<Vec<_>>())
             .unwrap();
-        assert_eq!(path.first(), Some(&standalone));
+        assert_eq!(path.first(), Some(&selected));
         assert_eq!(path.get(1), Some(&PathBuf::from("Visual Studio tools")));
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -674,9 +809,58 @@ mod tests {
         assert!(!error.contains("Git for Windows"));
     }
 
+    #[test]
+    fn windows_installer_only_requests_missing_packages_and_includes_cpp_workload() {
+        let commands = super::install_commands_for(vec![
+            ("Git for Windows".into(), true),
+            ("CMake 3.22.1+".into(), false),
+            ("Ninja".into(), false),
+            ("Visual Studio C++ Build Tools".into(), false),
+            ("Windows 10/11 SDK".into(), false),
+            ("clang-cl".into(), false),
+            ("glslangValidator".into(), false),
+            ("Python 3".into(), true),
+        ])
+        .unwrap();
+        let ids = commands
+            .iter()
+            .filter_map(|(_, args)| {
+                args.iter()
+                    .position(|arg| arg == "--id")
+                    .map(|index| &args[index + 1])
+            })
+            .collect::<Vec<_>>();
+        assert!(!ids
+            .iter()
+            .any(|id| id.as_str() == "Git.Git" || id.as_str() == "Python.Python.3.13"));
+        assert!(ids.iter().any(|id| id.as_str() == "Kitware.CMake"));
+        assert!(ids.iter().any(|id| id.as_str() == "KhronosGroup.VulkanSDK"));
+        assert!(commands
+            .iter()
+            .all(|(_, args)| args.iter().any(|arg| arg == "--disable-interactivity")));
+        assert!(commands.iter().any(|(_, args)| args
+            .iter()
+            .any(|arg| arg.contains("Microsoft.VisualStudio.Workload.VCTools"))));
+    }
+
+    #[test]
+    fn windows_installer_reports_when_every_requirement_is_present() {
+        let dependencies = super::dependencies()
+            .into_iter()
+            .map(|(name, _)| (name, true))
+            .collect();
+        assert!(super::install_commands_for(dependencies).is_err());
+    }
+
     #[cfg(windows)]
     #[test]
     fn captures_the_installed_visual_studio_x64_environment() {
+        if super::dependencies()
+            .iter()
+            .any(|(_, available)| !available)
+        {
+            return;
+        }
         let environment = match super::command_environment() {
             Ok(environment) => environment,
             Err(error)

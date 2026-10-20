@@ -20,8 +20,8 @@ describe("process telemetry polling", () => {
   it("backs off when idle or hidden and stays responsive for active sessions", () => {
     expect(processMetricsPollDelay(false, true)).toBe(15_000);
     expect(processMetricsPollDelay(false, false)).toBe(60_000);
-    expect(processMetricsPollDelay(true, true)).toBe(1_000);
-    expect(processMetricsPollDelay(true, false)).toBe(5_000);
+    expect(processMetricsPollDelay(true, true)).toBe(5_000);
+    expect(processMetricsPollDelay(true, false)).toBe(15_000);
   });
 
   it("polls promptly after launch and then adapts to the active session state", async () => {
@@ -36,7 +36,7 @@ describe("process telemetry polling", () => {
     });
     expect(call).toHaveBeenCalledTimes(1);
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(999);
+      await vi.advanceTimersByTimeAsync(4_999);
     });
     expect(call).toHaveBeenCalledTimes(1);
     await act(async () => {

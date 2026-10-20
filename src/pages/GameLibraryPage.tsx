@@ -95,8 +95,11 @@ export function GameLibraryPage({
   useEffect(() => {
     if (!currentGame || !inspectGameContent) { setTrophyProgress(null); return; }
     let current = true;
-    void inspectGameContent(currentGame.id).then((content) => { if (current) setTrophyProgress(trophySummary(content)); }).catch(() => { if (current) setTrophyProgress(null); });
-    return () => { current = false; };
+    setTrophyProgress(null);
+    const timer = window.setTimeout(() => {
+      void inspectGameContent(currentGame.id).then((content) => { if (current) setTrophyProgress(trophySummary(content)); }).catch(() => { if (current) setTrophyProgress(null); });
+    }, 800);
+    return () => { current = false; window.clearTimeout(timer); };
   }, [currentGame?.id, inspectGameContent]);
   return (
     <section

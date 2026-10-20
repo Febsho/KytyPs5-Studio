@@ -252,8 +252,9 @@ export function SettingsPage({
       <div className="panel">
         <h3>Storage management</h3>
         <p>
-          Sizes are measured from Studio-managed folders. Source repositories
-          and original game content are not cleanup targets.
+          Sizes include downloaded source repositories and Studio-managed build
+          data. Source repositories and original game content are not cleanup
+          targets here.
         </p>
         {storageReport?.categories.map((category) => (
           <div className="kv" key={category.name}>

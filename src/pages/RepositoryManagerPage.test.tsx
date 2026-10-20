@@ -100,4 +100,14 @@ describe("RepositoryManagerPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Build" }));
     expect(page.onOpenBuildStudio).toHaveBeenCalledOnce();
   });
+
+  it("disables clone and restore while another job is active", () => {
+    render(<RepositoryManagerPage {...props({ busy: true })} />);
+
+    expect(
+      (screen.getByRole("button", {
+        name: "Clone / restore checkout",
+      }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
 });

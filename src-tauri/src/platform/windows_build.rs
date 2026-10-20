@@ -64,7 +64,7 @@ fn visual_studio_installation() -> Result<PathBuf, String> {
         return Err("Visual Studio C++ Build Tools were not found. Install the Desktop development with C++ workload and Windows 10/11 SDK.".into());
     }
     let path = PathBuf::from(path);
-    let dev_command = path.join("Common7/Tools/VsDevCmd.bat");
+    let dev_command = path.join("Common7").join("Tools").join("VsDevCmd.bat");
     if !dev_command.is_file() {
         return Err(format!(
             "Visual Studio developer environment is missing at {}",
@@ -372,7 +372,10 @@ pub fn display_cmake_arguments(build_type: &str) -> Result<Vec<String>, String> 
 
 fn command_environment() -> Result<Vec<(OsString, OsString)>, String> {
     let installation = visual_studio_installation()?;
-    let developer_command = installation.join("Common7/Tools/VsDevCmd.bat");
+    let developer_command = installation
+        .join("Common7")
+        .join("Tools")
+        .join("VsDevCmd.bat");
     let command_line = format!(
         "call \"{}\" -no_logo -arch=x64 -host_arch=x64 && ({} )",
         developer_command.display(),
@@ -384,7 +387,7 @@ fn command_environment() -> Result<Vec<(OsString, OsString)>, String> {
             .join("&")
     );
     let output = Command::new("cmd.exe")
-        .args(["/d", "/u", "/s", "/c", &command_line])
+        .args(["/d", "/u", "/c", &command_line])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

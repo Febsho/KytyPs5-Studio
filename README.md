@@ -41,13 +41,15 @@ This is an independent project and is not affiliated with AnyPS5 Studio.
 
 Download and run the Windows x64 NSIS `.exe` installer from the [GitHub Releases](https://github.com/Febsho/KytyPs5-Studio/releases) page. Follow the installer prompts. Windows application data and cache use LocalAppData, configuration uses Roaming AppData, and an optional GitHub token is stored in Windows Credential Manager.
 
+Manual testing on a Windows desktop has not yet been completed. Automated Windows CI checks run on Windows Server 2022 and 2025, including app startup and installer update smoke checks.
+
 ### Linux
 
 Download the Linux AppImage from the [GitHub Releases](https://github.com/Febsho/KytyPs5-Studio/releases) page, make it executable, and run it:
 
 ```sh
-chmod +x "KytyPS5 Studio_0.4.1_amd64.AppImage"
-./"KytyPS5 Studio_0.4.1_amd64.AppImage"
+chmod +x "KytyPS5.Studio_0.4.1_amd64.AppImage"
+./"KytyPS5.Studio_0.4.1_amd64.AppImage"
 ```
 
 The AppImage filename may change between releases. Linux application data, cache, and configuration follow XDG user directories. An optional GitHub token is stored in Linux Secret Service.

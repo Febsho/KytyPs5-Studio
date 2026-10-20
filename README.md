@@ -24,7 +24,7 @@ The screenshots show the games home page, installed emulator builds, and the sou
 - Adds games to Steam and shares the current game through Discord Rich Presence when enabled.
 - Shows host and Vulkan diagnostics to help troubleshoot build and launch problems.
 
-See the [0.4.0 release notes](CHANGELOG.md) for this release's changes.
+See the [0.4.1 release notes](CHANGELOG.md) for this release's changes.
 
 Successful compilation or CLI verification does **not** guarantee that a game will run. Compatibility depends on the emulator, game, drivers, and system configuration.
 
@@ -41,15 +41,15 @@ This is an independent project and is not affiliated with AnyPS5 Studio.
 
 Download and run the Windows x64 NSIS `.exe` installer from the [GitHub Releases](https://github.com/Febsho/KytyPs5-Studio/releases) page. Follow the installer prompts. Windows application data and cache use LocalAppData, configuration uses Roaming AppData, and an optional GitHub token is stored in Windows Credential Manager.
 
-Windows has not yet been manually tested on a Windows desktop. Automated CI checks run on Windows Server 2022 and 2025, including app startup and installer update smoke checks.
+Manual testing on a Windows desktop has not yet been completed. Automated Windows CI checks run on Windows Server 2022 and 2025, including app startup and installer update smoke checks.
 
 ### Linux
 
 Download the Linux AppImage from the [GitHub Releases](https://github.com/Febsho/KytyPs5-Studio/releases) page, make it executable, and run it:
 
 ```sh
-chmod +x "KytyPS5 Studio_0.4.0_amd64.AppImage"
-./"KytyPS5 Studio_0.4.0_amd64.AppImage"
+chmod +x "KytyPS5.Studio_0.4.1_amd64.AppImage"
+./"KytyPS5.Studio_0.4.1_amd64.AppImage"
 ```
 
 The AppImage filename may change between releases. Linux application data, cache, and configuration follow XDG user directories. An optional GitHub token is stored in Linux Secret Service.

@@ -109,7 +109,6 @@ export function HomePage({
               <HomeGameTile
                 key={game.id}
                 game={game}
-                compatibilityIndex={officialCompatibilityIndex}
                 selected={featuredGame?.id === game.id}
                 onSelect={() => setHomeSelection(game.id)}
                 onContextMenu={(selected, event) => {

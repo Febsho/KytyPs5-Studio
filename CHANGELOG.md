@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1
+
+### Bug fixes
+
+- Require absolute storage locations from XDG and Windows AppData environment variables, falling back to the standard user directories when a value is invalid.
+- Remove compatibility labels from game covers while keeping compatibility details available elsewhere in the app.
+
 ## 0.4.0
 
 ### Windows support

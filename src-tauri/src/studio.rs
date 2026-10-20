@@ -58,6 +58,12 @@ fn now() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
+fn absolute_env_path(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
 #[cfg(not(windows))]
 fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     fs::rename(source, destination)
@@ -194,9 +200,7 @@ impl Paths {
         let h = home()?;
         #[cfg(unix)]
         let path = |key: &str, fallback: &str| {
-            env::var_os(key)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
+            absolute_env_path(env::var_os(key))
                 .unwrap_or_else(|| h.join(fallback))
                 .join("kytyps5-studio")
         };
@@ -208,13 +212,9 @@ impl Paths {
         };
         #[cfg(windows)]
         let p = Self::from_windows_roots(
-            env::var_os("LOCALAPPDATA")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
+            absolute_env_path(env::var_os("LOCALAPPDATA"))
                 .unwrap_or_else(|| h.join("AppData").join("Local")),
-            env::var_os("APPDATA")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
+            absolute_env_path(env::var_os("APPDATA"))
                 .unwrap_or_else(|| h.join("AppData").join("Roaming")),
         );
         for d in [&p.data, &p.cache, &p.config] {
@@ -10487,6 +10487,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn configured_storage_roots_must_be_absolute_paths() {
+        assert_eq!(
+            absolute_env_path(Some(std::ffi::OsString::from("relative/data"))),
+            None
+        );
+        let absolute = std::env::temp_dir().join("kyty-storage-root");
+        assert_eq!(
+            absolute_env_path(Some(absolute.as_os_str().to_os_string())),
+            Some(absolute)
+        );
+        assert_eq!(absolute_env_path(None), None);
+    }
     #[cfg(windows)]
     fn windows_test_command(program: &str, args: &[&str]) -> Command {
         let mut command = Command::new(program);

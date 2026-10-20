@@ -21,9 +21,10 @@ use windows_sys::Win32::{
         },
         ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         Threading::{
-            GetProcessTimes, OpenProcess, OpenThread, QueryFullProcessImageNameW, ResumeThread,
-            WaitForSingleObject, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_SET_QUOTA, PROCESS_TERMINATE, PROCESS_VM_READ, THREAD_SUSPEND_RESUME,
+            GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenThread,
+            QueryFullProcessImageNameW, ResumeThread, WaitForSingleObject,
+            PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+            PROCESS_TERMINATE, PROCESS_VM_READ, THREAD_SUSPEND_RESUME,
         },
     },
     UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE},
@@ -31,7 +32,6 @@ use windows_sys::Win32::{
 
 const PROCESS_JOB_WAIT_MS: u32 = 3_000;
 const MAX_RECOVERED_JOB_PROCESSES: usize = 4_096;
-const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
 
 struct Handle(HANDLE);
 
@@ -93,9 +93,7 @@ fn create_job() -> Result<Handle, String> {
 }
 
 fn open_process(pid: u32, rights: u32) -> Result<Handle, String> {
-    // `process_is_running` waits on the process handle, which requires
-    // SYNCHRONIZE in addition to the query rights used by its callers.
-    let handle = unsafe { OpenProcess(rights | PROCESS_SYNCHRONIZE, 0, pid) };
+    let handle = unsafe { OpenProcess(rights, 0, pid) };
     if handle.is_null() {
         Err(win_error("Could not open the registered process"))
     } else {
@@ -310,11 +308,11 @@ fn process_tree_entries() -> Result<Vec<(u32, u32)>, String> {
 }
 
 fn process_is_running(process: &Handle) -> Result<bool, String> {
-    match unsafe { WaitForSingleObject(process.0, 0) } {
-        WAIT_OBJECT_0 => Ok(false),
-        WAIT_TIMEOUT => Ok(true),
-        _ => Err(win_error("Could not confirm the Windows process state")),
+    let mut exit_code = 0;
+    if unsafe { GetExitCodeProcess(process.0, &mut exit_code) } == 0 {
+        return Err(win_error("Could not confirm the Windows process state"));
     }
+    Ok(exit_code == 259) // STILL_ACTIVE
 }
 
 /// A process assigned to a job does not bring its already-running children
@@ -640,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn process_wait_failures_are_not_reported_as_exited() {
+    fn process_exit_query_failures_are_not_reported_as_exited() {
         let invalid_process = super::Handle(std::ptr::null_mut());
         assert!(super::process_is_running(&invalid_process)
             .unwrap_err()

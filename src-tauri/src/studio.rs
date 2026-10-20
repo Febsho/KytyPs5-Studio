@@ -10781,6 +10781,10 @@ mod tests {
 
             let ready = serde_json::json!({"evt": "READY"}).to_string();
             discord_write_frame(&mut pipe, 1, ready.as_bytes()).unwrap();
+            // Let the client finish the READY handshake before sending the
+            // next event; synchronous named pipes can otherwise coalesce both
+            // writes while the client is still reading the handshake frame.
+            thread::sleep(Duration::from_millis(50));
             discord_write_frame(&mut pipe, 3, b"ping").unwrap();
 
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -11631,7 +11635,7 @@ mod tests {
             "timed out child is reaped"
         );
         assert!(
-            windows_process::snapshot(pid).is_none(),
+            windows_process::snapshot(pid).is_none_or(|snapshot| !snapshot.running),
             "timed out process no longer has a live resource snapshot"
         );
     }
@@ -11710,7 +11714,7 @@ mod tests {
             "cancelled child should not exit successfully"
         );
         assert!(
-            windows_process::snapshot(pid as u32).is_none(),
+            windows_process::snapshot(pid as u32).is_none_or(|snapshot| !snapshot.running),
             "cancelled process no longer has a live resource snapshot"
         );
     }

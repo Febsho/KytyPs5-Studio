@@ -4,6 +4,8 @@ KytyPS5 Studio is a desktop app for Linux and Windows 10/11 x64 that manages Kyt
 
 > **This project is not affiliated with or endorsed by the KytyPS5 developers.** The emulator source is maintained in the [official KytyPS5 repository](https://github.com/KytyPS5/KytyPS5). Studio can clone and build that source, as well as compatible forks. It does not include an emulator binary, games, or firmware.
 
+AI tools were used to help develop and document this project. The project owner directs the work and is responsible for reviewing changes and releases. This statement does not imply that the KytyPS5 emulator itself was made with AI.
+
 ## Screenshots
 
 | Games | Emulator builds | Build Studio |
@@ -105,10 +107,6 @@ Git for Windows is required for repository and source management. Building the K
 Game files stay at their existing paths; Studio keeps their paths and metadata in its local library. Linux application data follows XDG (normally `~/.local/share/kytyps5-studio`); Windows uses LocalAppData for data/cache and Roaming AppData for configuration. GitHub access works anonymously within GitHub’s rate limits; optional tokens use Linux Secret Service or Windows Credential Manager.
 
 Only add games and other content that you are authorized to use. This project does not provide games, firmware, decryption keys, or copyrighted content.
-
-## AI assistance
-
-AI tools were used to help develop and document this project. The project owner directs the work and is responsible for reviewing changes and releases. This statement does not imply that the KytyPS5 emulator itself was made with AI.
 
 ## License
 

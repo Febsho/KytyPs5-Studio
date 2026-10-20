@@ -437,7 +437,7 @@ fn decode_command_output(bytes: &[u8]) -> Result<String, String> {
         return Err("Windows command output has an incomplete UTF-16 code unit".into());
     }
     let units = bytes
-        .chunks_exact(2)
+        .chunks(2)
         .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
         .collect::<Vec<_>>();
     String::from_utf16(&units)

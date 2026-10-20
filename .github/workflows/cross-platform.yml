@@ -410,7 +410,7 @@ jobs:
               chown -R builder:builder /workspace
               su - builder -s /bin/bash -c "cd /workspace && ./packaging/arch/test-flags.sh && ./packaging/arch/build-package.sh"
               mkdir -p /workspace/artifacts
-              package=$(find /workspace/packaging/arch -maxdepth 1 -name "kytyps5-studio-*.pkg.tar.zst" -print -quit)
+              package=$(find /workspace/packaging/arch -maxdepth 1 -name "kytyps5-studio-*.pkg.tar.zst" ! -name "kytyps5-studio-debug-*.pkg.tar.zst" -print -quit)
               test -n "$package"
               bsdtar -tf "$package" | grep -Fx "usr/bin/kytyps5-studio"
               bsdtar -tf "$package" | grep -Fx "usr/share/applications/kytyps5-studio.desktop"

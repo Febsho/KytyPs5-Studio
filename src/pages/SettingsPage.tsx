@@ -7,6 +7,7 @@ import {
   cliOptionInfo,
 } from "../components/settings/ProfileOptionFields";
 import { formatBytes } from "../utils/format";
+import { currentCompatibilityOS } from "../utils/compatibility";
 
 export type SettingsPageProps = {
   globalProfileCapabilities: ProfileCapabilities | null;
@@ -15,6 +16,7 @@ export type SettingsPageProps = {
   globalUnsupported: boolean;
   gpuDevices: { index: number; name: string }[];
   githubTokenAvailable: boolean;
+  githubTokenError?: string | null;
   githubTokenInput: string;
   setGithubTokenInput: Dispatch<SetStateAction<string>>;
   updateInterval: string;
@@ -38,6 +40,7 @@ export type SettingsPageProps = {
   onClearCommunityWorktrees: () => void | Promise<void>;
   onClearSessionLogs: () => void | Promise<void>;
   onCheckAppUpdate?: () => void;
+  onInstallAppUpdate?: () => void;
 };
 
 export function SettingsPage({
@@ -47,6 +50,7 @@ export function SettingsPage({
   globalUnsupported,
   gpuDevices,
   githubTokenAvailable,
+  githubTokenError,
   githubTokenInput,
   setGithubTokenInput,
   updateInterval,
@@ -70,7 +74,19 @@ export function SettingsPage({
   onClearCommunityWorktrees,
   onClearSessionLogs,
   onCheckAppUpdate,
+  onInstallAppUpdate,
 }: SettingsPageProps) {
+  const hostOS = currentCompatibilityOS();
+  const storageDescription = hostOS === "windows"
+    ? "Application data and cache use LocalAppData; configuration uses Roaming AppData."
+    : hostOS === "linux"
+      ? "Application-managed files follow XDG user directories."
+      : "Application-managed files use the host operating system’s user directories.";
+  const credentialStore = hostOS === "windows"
+    ? "Windows Credential Manager"
+    : hostOS === "linux"
+      ? "Linux Secret Service"
+      : "the host credential store";
   const [storageTask, setStorageTask] = useState<string | null>(null);
   const [installedVersion, setInstalledVersion] = useState("Loading…");
   const storageTaskActive = useRef(false);
@@ -153,7 +169,7 @@ export function SettingsPage({
       <div className="sectionhead">
         <div>
           <h3>Settings & storage</h3>
-          <p>Application-managed files follow XDG user directories.</p>
+          <p>{storageDescription}</p>
         </div>
         <Settings />
       </div>
@@ -161,16 +177,19 @@ export function SettingsPage({
         <h3>GitHub access</h3>
         <p>
           Anonymous access works within GitHub rate limits. A personal access
-          token is stored in Linux Secret Service, never in Studio's database.
+          token is stored in {credentialStore}, never in Studio's database.
         </p>
         <div className="kv">
           <span>Credential status</span>
           <strong>
-            {githubTokenAvailable
+            {githubTokenError
+              ? "Credential store unavailable"
+              : githubTokenAvailable
               ? "Secure token available"
               : "Anonymous API access"}
           </strong>
         </div>
+        {githubTokenError && <p role="alert">{githubTokenError}</p>}
         <label>Personal access token</label>
         <input
           type="password"
@@ -375,7 +394,9 @@ export function SettingsPage({
           <p className="hint">
             Version {appUpdate.latest_version} is available
             {appUpdate.asset_name ? ` · ${appUpdate.asset_name}` : ""}.
-            {appUpdate.running_appimage
+            {appUpdate.asset_name?.toLowerCase().endsWith(".exe")
+              ? " The verified NSIS installer opens only after you choose to install it."
+              : appUpdate.running_appimage
               ? " The verified AppImage will replace this one after download. Restart Studio to use it."
               : " In-place installation is available when Studio runs from an AppImage."}
           </p>
@@ -383,10 +404,22 @@ export function SettingsPage({
         <button className="outline" disabled={appUpdateBusy} onClick={() => onCheckAppUpdate?.()}>
           {appUpdateBusy ? "Checking / updating…" : "Check for App Update"}
         </button>
+        {appUpdate?.update_available && appUpdate.asset_name?.toLowerCase().endsWith(".exe") && (
+          <button
+            className="primary"
+            disabled={appUpdateBusy || activeSessions || busy}
+            onClick={() => onInstallAppUpdate?.()}
+          >
+            Install Verified Update
+          </button>
+        )}
+        {(activeSessions || busy) && appUpdate?.asset_name?.toLowerCase().endsWith(".exe") && (
+          <p className="hint">Finish active builds and close emulator sessions before installing the Studio update.</p>
+        )}
       </div>
       <div className="panel">
         <h3>About</h3>
-        <p>KytyPS5 Studio {installedVersion} · Linux foundation</p>
+        <p>KytyPS5 Studio {installedVersion} · Cross-platform desktop</p>
         <p>
           Emulator source and games are supplied separately by the user. KytyPS5
           is GPL-2.0 licensed. Studio does not include firmware or games.

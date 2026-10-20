@@ -57,6 +57,7 @@ import {
 } from "../services/gameArtwork";
 import { formatBytes, short } from "../utils/format";
 import { createJobEventGate } from "../utils/jobEventGate";
+import { currentCompatibilityOS } from "../utils/compatibility";
 
 import { HomePage } from "../pages/HomePage";
 import { DiagnosticsPage } from "../pages/DiagnosticsPage";
@@ -249,6 +250,7 @@ export function App() {
   const [communityDetails, setCommunityDetails] =
     useState<CommunityPRDetails | null>(null);
   const [githubTokenAvailable, setGithubTokenAvailable] = useState(false);
+  const [githubTokenError, setGithubTokenError] = useState<string | null>(null);
   const [githubTokenInput, setGithubTokenInput] = useState("");
   const [communityHistory, setCommunityHistory] = useState<
     CommunityBuildHistoryEntry[]
@@ -600,8 +602,14 @@ export function App() {
   }, [page, busy]);
   useEffect(() => {
     invoke<boolean>("github_token_status")
-      .then(setGithubTokenAvailable)
-      .catch(() => setGithubTokenAvailable(false));
+      .then((available) => {
+        setGithubTokenAvailable(available);
+        setGithubTokenError(null);
+      })
+      .catch((error) => {
+        setGithubTokenAvailable(false);
+        setGithubTokenError(String(error));
+      });
   }, []);
   const reviewCommunitySelection = async () => {
     if (!selectedRepo || !selectedPrs.length) return;
@@ -974,7 +982,9 @@ export function App() {
       if (!info.update_available) {
         setAppUpdateStatus(`KytyPS5 Studio ${info.current_version} is up to date.`);
       } else if (!info.asset_name) {
-        setAppUpdateStatus(`Version ${info.latest_version} is available, but no AppImage was published for this architecture.`);
+        setAppUpdateStatus(`Version ${info.latest_version} is available, but no installer was published for this platform and architecture.`);
+      } else if (info.asset_name.toLowerCase().endsWith(".exe")) {
+        setAppUpdateStatus(`Version ${info.latest_version} is available. Choose Install Verified Update to download and verify the NSIS installer.`);
       } else if (!info.running_appimage) {
         setAppUpdateStatus(`Version ${info.latest_version} is available. In-place updates require launching Studio from its AppImage.`);
       } else {
@@ -990,10 +1000,38 @@ export function App() {
       setAppUpdateBusy(false);
     }
   };
+  const installWindowsAppUpdate = async () => {
+    if (!appUpdateInfo?.update_available || !appUpdateInfo.asset_name?.toLowerCase().endsWith(".exe")) return;
+    if (gameRunning || busy) {
+      setAppUpdateStatus("Finish active builds and close emulator sessions before installing a Studio update.");
+      return;
+    }
+    if (appUpdateInFlight.current) return;
+    appUpdateInFlight.current = true;
+    setAppUpdateBusy(true);
+    setAppUpdateStatus("Downloading and verifying the NSIS installer…");
+    let installerStarted = false;
+    try {
+      const result = await invoke<string>("install_app_update");
+      setAppUpdateStatus(result);
+      installerStarted = true;
+    } catch (error) {
+      setAppUpdateStatus(`App update failed: ${String(error)}`);
+    } finally {
+      if (!installerStarted) {
+        appUpdateInFlight.current = false;
+        setAppUpdateBusy(false);
+      }
+    }
+  };
   useEffect(() => {
     void checkAppUpdate();
   }, []);
   const launchGame = async (gameId: number) => {
+    if (appUpdateBusy) {
+      setMessage("Wait for the Studio update to finish before launching a game.");
+      return;
+    }
     const previousId = sessions.reduce(
       (latest, session) => Math.max(latest, session.id),
       0,
@@ -1078,6 +1116,10 @@ export function App() {
     return () => unlisten?.();
   }, []);
   const runJob = async (cmd: string, args: Record<string, unknown>) => {
+    if (appUpdateBusy) {
+      setMessage("Wait for the Studio update to finish before starting another job.");
+      return;
+    }
     beginJob();
     setLogs([]);
     setBusy(true);
@@ -2363,6 +2405,7 @@ export function App() {
               globalUnsupported={globalUnsupported}
               gpuDevices={vulkanGpus}
               githubTokenAvailable={githubTokenAvailable}
+              githubTokenError={githubTokenError}
               githubTokenInput={githubTokenInput}
               setGithubTokenInput={setGithubTokenInput}
               updateInterval={updateInterval}
@@ -2375,6 +2418,7 @@ export function App() {
               busy={busy}
               activeSessions={gameRunning}
               onCheckAppUpdate={checkAppUpdate}
+              onInstallAppUpdate={installWindowsAppUpdate}
               onSaveGlobalDefaults={() =>
                 action(async () => {
                   await call("set_global_profile_options", {
@@ -2388,13 +2432,19 @@ export function App() {
                   await call("save_github_token", { token });
                   setGithubTokenInput("");
                   setGithubTokenAvailable(true);
-                  setMessage("GitHub token stored in Secret Service");
+                  setGithubTokenError(null);
+                  setMessage(`GitHub token stored in ${
+                    currentCompatibilityOS() === "windows"
+                      ? "Windows Credential Manager"
+                      : "the system credential store"
+                  }`);
                 })
               }
               onDeleteGithubToken={() =>
                 action(async () => {
                   await call("delete_github_token");
                   setGithubTokenAvailable(false);
+                  setGithubTokenError(null);
                   setMessage("Stored GitHub token removed");
                 })
               }

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0
+
+### Windows support
+
+- Added a native Windows 10/11 x64 build and NSIS installer, including first-run storage under LocalAppData and Roaming AppData.
+- Added Windows emulator discovery and native source builds, with actionable checks for the Visual Studio, LLVM, CMake, Ninja, Git, Python, and Vulkan SDK requirements.
+- Added Windows process-tree ownership, safe recovery and termination of emulator sessions, Windows Credential Manager storage, host diagnostics, Discord IPC, Steam shortcuts, notifications, and directory opening.
+- Preserved Linux XDG paths, existing SQLite data, Linux process behavior, and case-sensitive filesystem matching.
+
+### Release and verification
+
+- Added Linux and Windows CI, native emulator build checks, Windows install/update smoke checks, and release artifacts for AppImage, Arch Linux, and Windows x64.
+- Added cross-platform path and process handling, including Unicode, spaces, drive-letter, and UNC path coverage.
+
 ## 0.3.0
 
 ### Compatibility and recommendations

@@ -42,6 +42,7 @@ function props(
     onOpenBuildStudio: vi.fn(),
     onAddFork: vi.fn(),
     onRemoveRepository: vi.fn(),
+    onUpdateNow: vi.fn(),
     ...overrides,
   };
 }
@@ -108,6 +109,30 @@ describe("RepositoryManagerPage", () => {
       (screen.getByRole("button", {
         name: "Clone / restore checkout",
       }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("shows installed and available commits and starts the selected repository update", async () => {
+    const page = props({
+      onCheckRepositoryUpdates: vi
+        .fn()
+        .mockResolvedValue("Update available: abc123456789 → def987654321"),
+    });
+    render(<RepositoryManagerPage {...page} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
+    expect(await screen.findByText("A newer build is available")).toBeTruthy();
+    expect(screen.getAllByText("abc123456789").length).toBeGreaterThan(0);
+    expect(screen.getByText("def987654321")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Fetch latest and build" }));
+    expect(page.onUpdateNow).toHaveBeenCalledWith(repo.id);
+  });
+
+  it("disables update checks while another task is running", () => {
+    render(<RepositoryManagerPage {...props({ busy: true })} />);
+    expect(
+      (screen.getByRole("button", { name: "Check updates" }) as HTMLButtonElement)
+        .disabled,
     ).toBe(true);
   });
 });

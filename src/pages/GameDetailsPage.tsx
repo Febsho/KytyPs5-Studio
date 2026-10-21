@@ -50,7 +50,7 @@ export type GameDetailsPageProps = {
   onInspectContent?: (gameId:number) => Promise<GameContent>;
   onFetchOnlineCheats?: (gameId:number) => Promise<RemoteCheatFile[]>;
   onDownloadOnlineCheat?: (gameId:number, filename:string) => Promise<string>;
-  onImportCustomPatch?: (gameId:number) => Promise<string | null>;
+  onImportCustomPatch?: (gameId:number) => Promise<{path:string;content:string} | null>;
   onSaveCustomPatch?: (gameId:number, content:string) => Promise<string>;
   onSelectCustomPatch?: (path:string) => void;
 };
@@ -134,10 +134,11 @@ export function GameDetailsPage({
     setCustomPatchBusy(true);
     setCustomPatchError("");
     try {
-      const path = await onImportCustomPatch(currentGame.id);
-      if (!path) return;
-      setCustomPatchPath(path);
-      onSelectCustomPatch?.(path);
+      const imported = await onImportCustomPatch(currentGame.id);
+      if (!imported) return;
+      setCustomPatchPath(imported.path);
+      setCustomPatchDraft(imported.content);
+      onSelectCustomPatch?.(imported.path);
     } catch (error) {
       setCustomPatchError(String(error));
     } finally {
@@ -334,7 +335,7 @@ export function GameDetailsPage({
           </> : content && <p>No readable trophy definitions were found in the game's <code>sce_sys/trophy2</code> or <code>sce_sys/trophy</code> packages.</p>}
         </> : <>
           <h2>Cheats</h2>
-          <p>Search local mods and matching PS5 cheat files. Downloading saves a file to Studio’s data directory; it does not enable or apply the cheats.</p>
+          <p>Choose a matching patch file and use it for this game. Save the game profile in Settings to apply it on the next launch.</p>
           <label className="cheat-search">Search cheats<input value={cheatQuery} onChange={(e)=>setCheatQuery(e.target.value)} placeholder="Search by cheat name" /></label>
           {contentError && <p className="error-note">{contentError}</p>}
           {content?.cheat_error && <p className="error-note">{content.cheat_error}</p>}
@@ -349,7 +350,7 @@ export function GameDetailsPage({
               </button>
             </div>
             <p className="hint">
-              Import a GoldHEN-style JSON file or edit a patch below. The title ID must match this game. ZIP archives are not applied directly.
+              Import validates, copies, and selects a GoldHEN-style JSON file. The editor below saves a separate custom patch. The patch title ID must match this game; ZIP archives are not applied directly.
             </p>
             <label className="cheat-search">
               Patch JSON
@@ -368,7 +369,8 @@ export function GameDetailsPage({
           <p className="hint">Source: TeeKay87/HEN-Cheats-Collection · files are matched by title ID and ordered with the closest game version first.</p>
           {remoteCheatError && <p className="error-note">{remoteCheatError}</p>}
           {!remoteCheats && !remoteCheatError && <p>Searching repository…</p>}
-          {remoteCheats?.length === 0 && <p>No matching PS5 cheat file was found for this title ID.</p>}
+          {!currentGame.title_id && <p className="hint">No game title ID is available. Refresh game metadata to search for matching cheats.</p>}
+          {remoteCheats?.length === 0 && currentGame.title_id && <p>No matching PS5 cheat file was found for title ID {currentGame.title_id}.</p>}
           {remoteCheats?.map((file) => {
             const matchingMods = file.mods.filter((mod) => mod.name.toLowerCase().includes(cheatQuery.trim().toLowerCase()));
             if (cheatQuery.trim() && !matchingMods.length) return null;
@@ -376,13 +378,21 @@ export function GameDetailsPage({
               <div className="remote-cheat-heading"><div><strong>{file.title}</strong><small>{file.filename} · version {file.version || "unknown"} · {file.mods.length} cheats</small></div><button className="outline" disabled={!onDownloadOnlineCheat || downloadingCheat === file.filename} onClick={() => {
                 if (!onDownloadOnlineCheat) return;
                 setDownloadingCheat(file.filename);
-                void onDownloadOnlineCheat(currentGame.id, file.filename).then(setDownloadedCheatPath).catch((error) => setRemoteCheatError(String(error))).finally(() => setDownloadingCheat(""));
-              }}>{downloadingCheat === file.filename ? "Downloading…" : "Download file"}</button></div>
+                void onDownloadOnlineCheat(currentGame.id, file.filename).then(async (path) => {
+                  setDownloadedCheatPath(path);
+                  setCustomPatchPath(path);
+                  onSelectCustomPatch?.(path);
+                  if (onInspectContent) {
+                    try { setContent(await onInspectContent(currentGame.id)); setContentError(""); }
+                    catch (error) { setContentError(String(error)); }
+                  }
+                }).catch((error) => setRemoteCheatError(String(error))).finally(() => setDownloadingCheat(""));
+              }}>{downloadingCheat === file.filename ? "Downloading…" : "Download & use"}</button></div>
               {matchingMods.map((mod, index) => <div className="kv cheat-row" key={`${mod.name}-${index}`}><strong>{mod.name}</strong><span>{mod.type}</span></div>)}
               <a href={file.source} target="_blank" rel="noreferrer">View source file</a>
             </article>;
           })}
-          {downloadedCheatPath && <p className="hint">Saved locally: <code>{downloadedCheatPath}</code>. Select it in this game’s Settings under Game patch file to use it.</p>}
+          {downloadedCheatPath && <p className="hint">Patch selected for this game: <code>{downloadedCheatPath}</code>. Open Settings and save the game profile to apply it on the next launch.</p>}
         </>}
       </div>}
       {gameDetailsTab === "Compatibility" && (

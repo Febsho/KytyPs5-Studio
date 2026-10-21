@@ -111,6 +111,7 @@ export function HomePage({
             games={games}
             selectedId={featuredGame?.id}
             onSelect={setHomeSelection}
+            onActivate={(gameId) => void launchGame(gameId)}
             onContextMenu={(selected, event) => {
               event.preventDefault();
               setContextMenu({ game: selected, x: event.clientX, y: event.clientY });

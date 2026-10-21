@@ -4086,7 +4086,15 @@ main {
 .repo-update-status { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 14px; padding: 12px 14px; border: 1px solid var(--studio-border); border-radius: 8px; background: var(--studio-surface); }
 .repo-update-status > div { display: grid; gap: 4px; min-width: 0; }
 .repo-update-status small { color: var(--studio-muted); overflow-wrap: anywhere; }
-.repo-update-status.available { border-color: color-mix(in srgb, var(--studio-accent) 55%, var(--studio-border)); }
+.repo-update-status.available { border-color: color-mix(in srgb, var(--studio-accent) 55%, var(--studio-border)); border-left: 3px solid var(--studio-accent-soft); }
+.repo-update-status.available strong { color: var(--studio-accent-soft); }
+.repo-update-status.current { border-left: 3px solid var(--studio-good); }
+.repo-update-status.current strong { color: var(--studio-good); }
+.repo-update-status.failed { border-color: color-mix(in srgb, var(--studio-danger) 55%, var(--studio-border)); border-left: 3px solid var(--studio-danger); }
+.repo-update-status.failed strong { color: var(--studio-danger); }
+.repo-update-status.checking { border-left: 3px solid var(--studio-warn); }
+.repo-update-commits { display: flex; flex-wrap: wrap; gap: 8px 16px; color: var(--studio-muted); font-size: var(--studio-font-sm); }
+.repo-update-commits code { margin-left: 4px; color: var(--studio-text); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .main-content { min-height: calc(100dvh - 56px); }
 .home-page { min-height: calc(100dvh - 56px); gap: clamp(20px, 3vh, 36px); }
 .home-game-tile, .home-game-art { width: 160px; min-width: 160px; }
@@ -4120,6 +4128,37 @@ main {
   background: #000b;
   backdrop-filter: blur(5px);
 }
+.steam-shortcut-dialog {
+  position: fixed;
+  z-index: 1200;
+  inset: 50% auto auto 50%;
+  transform: translate(-50%, -50%);
+  width: min(620px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  padding: 24px;
+  border: 1px solid var(--studio-border);
+  border-radius: 16px;
+  background: var(--studio-surface);
+  box-shadow: 0 24px 80px #0009;
+}
+.steam-shortcut-header, .steam-shortcut-dialog footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.steam-shortcut-header h2 { margin: 0; }
+.steam-shortcut-header p { margin: 6px 0 0; color: var(--studio-muted); }
+.steam-shortcut-dialog footer { justify-content: flex-end; margin-top: 22px; }
+.steam-shortcut-preview { display: flex; align-items: center; gap: 16px; margin: 20px 0; padding: 14px; border: 1px solid var(--studio-border); border-radius: 12px; background: var(--studio-surface-raised); }
+.steam-shortcut-preview img, .steam-art-placeholder { width: 84px; height: 84px; flex: 0 0 84px; border-radius: 10px; object-fit: cover; background: var(--studio-surface-soft); }
+.steam-art-placeholder { display: grid; place-items: center; font-size: 32px; color: var(--studio-muted); }
+.steam-shortcut-preview strong, .steam-shortcut-preview small { display: block; }
+.steam-shortcut-preview small { margin-top: 6px; color: var(--studio-muted); overflow-wrap: anywhere; }
+.steam-build-select { display: grid; gap: 8px; }
+.steam-build-select select { width: 100%; min-width: 0; }
+.steam-launch-metadata { display: grid; gap: 10px; margin-top: 16px; padding: 14px; border-radius: 10px; background: var(--studio-surface-raised); }
+.steam-launch-metadata span, .steam-launch-metadata b { display: block; }
+.steam-launch-metadata b { margin-bottom: 4px; color: var(--studio-muted); font-size: 11px; text-transform: uppercase; }
+.steam-launch-metadata span { overflow-wrap: anywhere; }
+.modal-backdrop { position: fixed; z-index: 1199; inset: 0; background: #05070bd9; backdrop-filter: blur(5px); }
+
 .controller-remap-dialog {
   display: flex;
   width: min(1420px, 98vw);

@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.0
+
+### Build Studio and forks
+
+- Clone and restore workflows now initialize Git submodules automatically, and Build Studio handles submodules as part of each build.
+- Added clearer update status and a direct action to fetch the latest fork source and build it.
+- Improved build performance by reusing an already verified build for the same fork commit and using Git's local object hardlinks for Community PR builds.
+- Reduced default Ninja parallelism on memory-limited systems to avoid excessive resource use during Windows and Linux builds.
+- Added clearer build dependency checks and in-app installation support for missing Linux and Windows build tools.
+
+### Games and Steam
+
+- Improved game-library scanning and loading performance, including more reliable game detection on Windows.
+- Added controller navigation, scrolling, and game launching from the Home game row.
+- Added **Open game folder** to the game right-click menu.
+- Reworked **Add to Steam** to select an installed fork/build and preview the game artwork and launch details. Steam shortcuts now use the selected emulator build and saved game options.
+
+### Game cheats
+
+- Improved online cheat lookup by normalizing title IDs and allowing valid results when individual repository files are unavailable.
+- JSON imports now validate and select the patch for the game and load the imported JSON into the editor.
+- Downloaded cheat files can be selected for the game with **Download & use**.
+
+### Repository management
+
+- Improved update-check feedback and display of installed and available commits, with a direct build action when an update is available.
+- Clarified that Build Studio manages submodules during builds.
+
 ## 0.4.2
 
 ### Windows and Linux build tools

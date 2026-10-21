@@ -2548,6 +2548,13 @@ fn command_exists(name: &str) -> bool {
         })
         .unwrap_or(false)
 }
+#[cfg(any(not(windows), test))]
+fn any_command_available<F>(names: &[&str], mut available: F) -> bool
+where
+    F: FnMut(&str) -> bool,
+{
+    names.iter().any(|name| available(name))
+}
 fn graphics_diagnostics() -> GraphicsDiagnostics {
     let mut drivers = Vec::new();
     let mut monitors = Vec::new();
@@ -3481,12 +3488,31 @@ fn list_builds(app: tauri::AppHandle) -> Result<Vec<Build>, String> {
 fn list_games(app: tauri::AppHandle) -> Result<Vec<Game>, String> {
     let c = db(&app)?;
     let mut s = c
-        .prepare("SELECT id FROM games WHERE hidden=0 ORDER BY favorite DESC, title COLLATE NOCASE")
+        .prepare("SELECT id,path,title,favorite,build_id,play_seconds,last_played,title_id,game_version,icon_path,install_size FROM games WHERE hidden=0 ORDER BY favorite DESC, title COLLATE NOCASE")
         .map_err(|e| e.to_string())?;
-    let rows = s.query_map([], |r| r.get(0)).map_err(|e| e.to_string())?;
+    let rows = s
+        .query_map([], |r| {
+            let path: String = r.get(1)?;
+            Ok(Game {
+                id: r.get(0)?,
+                file_status: game_file_status(Path::new(&path)).into(),
+                path,
+                title: r.get(2)?,
+                favorite: r.get::<_, i64>(3)? != 0,
+                build_id: r.get(4)?,
+                play_seconds: r.get(5)?,
+                last_played: r.get(6)?,
+                title_id: r.get(7)?,
+                game_version: r.get(8)?,
+                icon_path: r.get(9)?,
+                install_size: r.get(10)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
     let result: Vec<Game> = rows
-        .map(|id| game(&c, id.map_err(|e| e.to_string())?))
+        .map(|row| row.map_err(|e| e.to_string()))
         .collect::<Result<_, _>>()?;
+    drop(s);
     let pending = result
         .iter()
         .filter(|entry| entry.install_size.is_none() && entry.file_status == "Available")
@@ -4938,7 +4964,7 @@ fn list_community_pull_requests(
     let start = ((page - 1) as usize).saturating_mul(100);
     let items = cached
         .drain(start.min(total_cached)..)
-        .take(100)
+        .take(40)
         .collect::<Vec<_>>();
     let has_more = start.saturating_add(items.len()) < total_cached;
     Ok(CommunityPrPage {
@@ -5272,7 +5298,6 @@ fn start_community_build(
                 None,
                 &[
                     "clone",
-                    "--no-hardlinks",
                     "--no-checkout",
                     &source_text,
                     &work_text,
@@ -5698,7 +5723,11 @@ fn system_info(app: tauri::AppHandle) -> Result<SystemInfo, String> {
     .into_iter()
     .map(|n| Dependency {
         name: n.into(),
-        present: command_exists(n),
+        present: if n == "glslangValidator" {
+            any_command_available(&["glslangValidator", "glslang"], command_exists)
+        } else {
+            command_exists(n)
+        },
     })
     .collect();
     for name in ["vulkan", "x11", "wayland-client", "libpulse", "libudev"] {
@@ -6396,6 +6425,7 @@ fn displayed_cmake_arguments(build_type: &str) -> Result<Vec<String>, String> {
 }
 #[cfg(any(not(windows), test))]
 const BUILD_DEPENDENCIES: &[&str] = &[
+    "git",
     "cmake",
     "ninja",
     "clang",
@@ -6456,7 +6486,7 @@ fn verify_build_dependencies(app: &tauri::AppHandle, job_kind: &str) -> Result<(
     #[cfg(not(windows))]
     {
         let mut missing = missing_build_dependencies(command_exists);
-        if !command_exists("glslangValidator") && !command_exists("glslang") {
+        if !any_command_available(&["glslangValidator", "glslang"], command_exists) {
             missing.push("glslangValidator or glslang");
         }
         let missing_packages = if command_exists("pkg-config") {
@@ -6495,6 +6525,7 @@ fn linux_build_tool_install_command() -> Result<(String, Vec<String>), String> {
         (
             "apt-get",
             vec![
+                "git",
                 "build-essential",
                 "clang",
                 "cmake",
@@ -6513,6 +6544,7 @@ fn linux_build_tool_install_command() -> Result<(String, Vec<String>), String> {
         (
             "dnf",
             vec![
+                "git",
                 "gcc",
                 "gcc-c++",
                 "clang",
@@ -6533,6 +6565,7 @@ fn linux_build_tool_install_command() -> Result<(String, Vec<String>), String> {
         (
             "pacman",
             vec![
+                "git",
                 "base-devel",
                 "clang",
                 "cmake",
@@ -6551,6 +6584,7 @@ fn linux_build_tool_install_command() -> Result<(String, Vec<String>), String> {
         (
             "zypper",
             vec![
+                "git-core",
                 "gcc",
                 "gcc-c++",
                 "clang",
@@ -7000,6 +7034,7 @@ fn start_build(
     jobs: tauri::State<'_, Arc<Jobs>>,
     id: i64,
     options: BuildOptions,
+    activate_after_build: Option<bool>,
 ) -> Result<u64, String> {
     let compiler = validate_build_options(&options)?;
     let c = db(&app)?;
@@ -7011,38 +7046,82 @@ fn start_build(
     validate_source_before_submodule_update(&source)?;
     let commit = git(Some(&source), &["rev-parse", "HEAD"])?;
     let branch = checked_out_branch(&source)?;
+    let activate_after_build = activate_after_build.unwrap_or(false);
     let jobs = jobs.inner().clone();
     let job_id = begin_job(&jobs, "Another job is running", true, "build")?;
     thread::spawn(move || {
-        let result = execute(
-            &app,
-            &jobs,
-            "build",
-            "Updating submodules",
-            "git",
-            &[
-                "submodule".into(),
-                "update".into(),
-                "--init".into(),
-                "--recursive".into(),
-            ],
-            Some(&source),
-            None,
-        )
-        .and_then(|()| {
-            build_and_register(
+        let result = (|| -> Result<String, String> {
+            if !options.clean {
+                let connection = db(&app)?;
+                let existing: Option<(i64, String)> = connection
+                    .query_row(
+                        "SELECT builds.id,builds.path FROM builds WHERE builds.repo_id=? AND builds.commit_sha=? AND builds.build_type=? AND builds.validation_status='verified' AND NOT EXISTS(SELECT 1 FROM community_build_results WHERE community_build_results.build_id=builds.id) ORDER BY builds.active DESC,builds.created_at DESC,builds.id DESC LIMIT 1",
+                        params![id, commit, options.build_type],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(|error| error.to_string())?;
+                if let Some((existing_id, existing_path)) = existing {
+                    if verify_emulator(&Path::new(&existing_path).join(emulator_binary_name()))
+                        .is_ok()
+                    {
+                        mark_repository_build_commit(&app, id, &commit, &branch)?;
+                        if activate_after_build {
+                            activate_build(app.clone(), existing_id)?;
+                        }
+                        return Ok(format!(
+                            "Commit {} is already installed and verified; reused the existing build{}",
+                            &commit[..commit.len().min(12)],
+                            if activate_after_build { " and activated it" } else { "" }
+                        ));
+                    }
+                }
+            }
+            execute(
+                &app,
+                &jobs,
+                "build",
+                "Updating submodules",
+                "git",
+                &[
+                    "submodule".into(),
+                    "update".into(),
+                    "--init".into(),
+                    "--recursive".into(),
+                ],
+                Some(&source),
+                None,
+            )?;
+            let path = build_and_register(
                 &app, &jobs, id, &source, &commit, &options, &compiler, "build", true,
-            )
-        })
-        .and_then(|path| {
+            )?;
             mark_repository_build_commit(&app, id, &commit, &branch)?;
-            Ok(path)
-        });
+            if activate_after_build {
+                let connection = db(&app)?;
+                let build_id: i64 = connection
+                    .query_row(
+                        "SELECT id FROM builds WHERE path=?",
+                        [path.display().to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                activate_build(app.clone(), build_id)?;
+            }
+            Ok(format!(
+                "Build verified and registered at {}{}",
+                path.display(),
+                if activate_after_build {
+                    "; now active for game launches"
+                } else {
+                    ""
+                }
+            ))
+        })();
         finish_job(
             &app,
             &jobs,
             "build",
-            result.map(|path| format!("Build verified and registered at {}", path.display())),
+            result,
         );
     });
     Ok(job_id)
@@ -8148,7 +8227,33 @@ fn resize_png(bytes: &[u8], maximum_width: u32, maximum_height: u32) -> Option<V
     }
     Some(output)
 }
-fn has_game_ancestor(path: &Path, scan_root: &Path) -> bool {
+fn directory_contains_game_eboot(directory: &Path, windows: bool) -> bool {
+    let conventional = directory.join("eboot.bin");
+    if conventional.is_file() && is_elf_file(&conventional) {
+        return true;
+    }
+    if !windows {
+        return false;
+    }
+    // Windows installations can preserve the upstream EBOOT.BIN spelling,
+    // including in case-sensitive directories. Find that entry once per
+    // directory instead of reopening it for every file below the directory.
+    fs::read_dir(directory)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|entry| {
+            is_eboot_filename_for(&entry.file_name(), true) && is_elf_file(&entry.path())
+        })
+}
+
+fn has_game_ancestor_cached(
+    path: &Path,
+    scan_root: &Path,
+    eboot_cache: &mut HashMap<PathBuf, bool>,
+    windows: bool,
+) -> bool {
     let Some(mut directory) = path.parent() else {
         return false;
     };
@@ -8156,7 +8261,10 @@ fn has_game_ancestor(path: &Path, scan_root: &Path) -> bool {
         if !path_starts_with(directory, scan_root) {
             return false;
         }
-        if is_elf_file(&directory.join("eboot.bin")) {
+        let contains_eboot = *eboot_cache
+            .entry(directory.to_path_buf())
+            .or_insert_with(|| directory_contains_game_eboot(directory, windows));
+        if contains_eboot {
             return true;
         }
         if directory == scan_root {
@@ -8199,6 +8307,7 @@ fn scan_games_sync(app: tauri::AppHandle, path: String) -> Result<GameScanResult
     let mut already_registered = 0_usize;
     let mut rejected = 0_usize;
     let mut candidates = HashSet::new();
+    let mut eboot_cache = HashMap::new();
     let mut entries_seen = 0_u64;
     let mut games_for_size = Vec::new();
     for entry in walkdir::WalkDir::new(&root) {
@@ -8216,7 +8325,7 @@ fn scan_games_sync(app: tauri::AppHandle, path: String) -> Result<GameScanResult
             continue;
         }
         let is_eboot = is_eboot_filename(entry.file_name()) && p.is_file();
-        if !is_eboot && has_game_ancestor(p, &root) {
+        if !is_eboot && has_game_ancestor_cached(p, &root, &mut eboot_cache, cfg!(windows)) {
             continue;
         }
         let archive_extension = p
@@ -8571,11 +8680,18 @@ fn read_remote_text(url: &str, max_bytes: usize) -> Result<String, String> {
         .map_err(|error| format!("Cheat repository returned invalid UTF-8: {error}"))
 }
 fn valid_cheat_filename(filename: &str) -> bool {
-    filename.ends_with(".json")
+    filename.to_ascii_lowercase().ends_with(".json")
         && filename.len() <= 180
         && filename
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+fn normalize_cheat_title_id(value: &str) -> Option<String> {
+    let id = value.trim().split('_').next().unwrap_or_default();
+    if id.len() < 8 || id.len() > 16 || !id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(id.to_ascii_uppercase())
 }
 fn remote_cheat_entry(
     filename: &str,
@@ -8585,7 +8701,13 @@ fn remote_cheat_entry(
     let source = read_remote_text(&format!("{PS5_CHEAT_FILE_BASE}{filename}"), 8 * 1024 * 1024)?;
     let document: serde_json::Value = serde_json::from_str(&source)
         .map_err(|error| format!("Cheat file {filename} is invalid JSON: {error}"))?;
-    if document.get("id").and_then(|value| value.as_str()) != Some(title_id) {
+    if document
+        .get("id")
+        .and_then(|value| value.as_str())
+        .and_then(normalize_cheat_title_id)
+        .as_deref()
+        != normalize_cheat_title_id(title_id).as_deref()
+    {
         return Err(format!(
             "Cheat file {filename} does not match game ID {title_id}"
         ));
@@ -8622,25 +8744,25 @@ fn fetch_game_cheats(
 ) -> Result<Vec<serde_json::Value>, String> {
     let connection = db(&app)?;
     let selected = game(&connection, game_id)?;
-    let Some(title_id) = selected.title_id.as_deref() else {
+    let Some(title_id) = selected.title_id.as_deref().and_then(normalize_cheat_title_id) else {
         return Ok(Vec::new());
     };
-    if title_id.is_empty()
-        || !title_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        return Err("Game title ID is not valid for cheat lookup".into());
-    }
     let index = read_remote_text(PS5_CHEAT_INDEX, 4 * 1024 * 1024)?;
     let mut filenames = index
         .lines()
-        .filter_map(|line| line.split_once('='))
+        .filter_map(|line| line.trim().split_once('='))
         .filter(|(filename, _)| {
-            valid_cheat_filename(filename) && filename.split('_').next() == Some(title_id)
+            valid_cheat_filename(filename.trim())
+                && filename
+                    .trim()
+                    .split('_')
+                    .next()
+                    .and_then(normalize_cheat_title_id)
+                    .as_deref()
+                    == Some(title_id.as_str())
         })
-        .map(|(filename, title)| (filename.to_owned(), title.to_owned()))
-        .take(40)
+        .map(|(filename, title)| (filename.trim().to_owned(), title.trim().to_owned()))
+        .take(100)
         .collect::<Vec<_>>();
     filenames.sort_by_key(|(filename, _)| {
         let version = filename.split('_').nth(1).unwrap_or("");
@@ -8649,10 +8771,18 @@ fn fetch_game_cheats(
             version.to_owned(),
         )
     });
-    filenames
-        .iter()
-        .map(|(filename, title)| remote_cheat_entry(filename, title, title_id))
-        .collect()
+    let mut entries = Vec::new();
+    let mut failures = Vec::new();
+    for (filename, title) in &filenames {
+        match remote_cheat_entry(filename, title, &title_id) {
+            Ok(entry) => entries.push(entry),
+            Err(error) => failures.push(error),
+        }
+    }
+    if entries.is_empty() && !failures.is_empty() {
+        return Err(format!("Found {} matching cheat file(s), but none could be read: {}", failures.len(), failures[0]));
+    }
+    Ok(entries)
 }
 #[tauri::command]
 fn download_game_cheat(
@@ -8665,14 +8795,29 @@ fn download_game_cheat(
     }
     let connection = db(&app)?;
     let selected = game(&connection, game_id)?;
-    let title_id = selected.title_id.as_deref().ok_or("Game has no title ID")?;
-    if !filename.starts_with(&format!("{title_id}_")) {
+    let title_id = selected
+        .title_id
+        .as_deref()
+        .and_then(normalize_cheat_title_id)
+        .ok_or("Game has no valid title ID")?;
+    if filename
+        .split('_')
+        .next()
+        .and_then(normalize_cheat_title_id)
+        .as_deref()
+        != Some(title_id.as_str())
+    {
         return Err("Cheat file does not belong to this game".into());
     }
     let source = read_remote_text(&format!("{PS5_CHEAT_FILE_BASE}{filename}"), 8 * 1024 * 1024)?;
     let document: serde_json::Value = serde_json::from_str(&source)
         .map_err(|error| format!("Cheat file is invalid JSON: {error}"))?;
-    if document.get("id").and_then(|value| value.as_str()) != Some(title_id)
+    if document
+        .get("id")
+        .and_then(|value| value.as_str())
+        .and_then(normalize_cheat_title_id)
+        .as_deref()
+        != Some(title_id.as_str())
         || document
             .get("mods")
             .and_then(|value| value.as_array())
@@ -8701,11 +8846,17 @@ fn store_custom_game_patch(
     let title_id = selected
         .title_id
         .as_deref()
-        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        .and_then(normalize_cheat_title_id)
         .ok_or("This game needs a recognized title ID before a patch can be added")?;
     let document: serde_json::Value = serde_json::from_slice(content)
         .map_err(|error| format!("Patch is not valid JSON: {error}"))?;
-    if document.get("id").and_then(|value| value.as_str()) != Some(title_id) {
+    if document
+        .get("id")
+        .and_then(|value| value.as_str())
+        .and_then(normalize_cheat_title_id)
+        .as_deref()
+        != Some(title_id.as_str())
+    {
         return Err(format!("Patch title ID must match this game ({title_id})"));
     }
     let mods = document
@@ -8723,7 +8874,7 @@ fn store_custom_game_patch(
                 .into(),
         );
     }
-    let directory = state_paths(app)?.data.join("cheats").join(title_id);
+    let directory = state_paths(app)?.data.join("cheats").join(&title_id);
     fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let destination = directory.join(format!("custom-{}-{}.json", now(), std::process::id()));
     fs::write(&destination, content).map_err(|error| error.to_string())?;
@@ -8731,7 +8882,11 @@ fn store_custom_game_patch(
 }
 
 #[tauri::command]
-fn import_game_patch(app: tauri::AppHandle, game_id: i64, path: String) -> Result<String, String> {
+fn import_game_patch(
+    app: tauri::AppHandle,
+    game_id: i64,
+    path: String,
+) -> Result<serde_json::Value, String> {
     let source =
         fs::canonicalize(path).map_err(|error| format!("Could not open patch file: {error}"))?;
     if source
@@ -8746,7 +8901,10 @@ fn import_game_patch(app: tauri::AppHandle, game_id: i64, path: String) -> Resul
         return Err("Patch file must be a regular file no larger than 8 MiB".into());
     }
     let content = fs::read(source).map_err(|error| error.to_string())?;
-    store_custom_game_patch(&app, game_id, &content)
+    let saved_path = store_custom_game_patch(&app, game_id, &content)?;
+    let content = String::from_utf8(content)
+        .map_err(|_| "Patch JSON must be encoded as UTF-8".to_string())?;
+    Ok(serde_json::json!({"path": saved_path, "content": content}))
 }
 
 #[tauri::command]
@@ -9266,7 +9424,7 @@ fn steam_config_dir() -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-fn add_game_to_steam(app: tauri::AppHandle, game_id: i64) -> Result<String, String> {
+fn add_game_to_steam(app: tauri::AppHandle, game_id: i64, build_id: i64) -> Result<String, String> {
     #[cfg(unix)]
     let steam_running = fs::read_dir("/proc")
         .ok()
@@ -9300,14 +9458,6 @@ fn add_game_to_steam(app: tauri::AppHandle, game_id: i64) -> Result<String, Stri
         return Err("The game's included cover image is outside its game folder".into());
     }
     let game_profile = profile(&c, game_id)?;
-    let build_id = if let Some(id) = g.build_id {
-        id
-    } else {
-        c.query_row("SELECT id FROM builds WHERE active=1 LIMIT 1", [], |r| {
-            r.get(0)
-        })
-        .map_err(|_| "Select an active emulator build".to_string())?
-    };
     let b = build(&c, build_id)?;
     let capabilities = capabilities_for_build(&b)?;
     let mut options = effective_profile_options(
@@ -9374,7 +9524,7 @@ fn add_game_to_steam(app: tauri::AppHandle, game_id: i64) -> Result<String, Stri
         fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))
             .map_err(|e| e.to_string())?;
         let exe_field = format!("\"{}\"", launcher.display());
-        (exe_field, format!("\"{}\"", b.path), String::new())
+        (exe_field, format!("\"{}\"", launcher_dir.display()), String::new())
     };
     #[cfg(windows)]
     let (exe_field, start_dir, launch_options) = {
@@ -9396,10 +9546,9 @@ fn add_game_to_steam(app: tauri::AppHandle, game_id: i64) -> Result<String, Stri
 
     let app_name = format!("{} · KytyPS5 Studio", g.title);
     let app_id = steam_crc32(format!("{exe_field}{app_name}").as_bytes()) | 0x8000_0000;
-    let launch_id = (u64::from(app_id) << 32) | 0x0200_0000;
     let grid = config.join("grid");
     fs::create_dir_all(&grid).map_err(|e| format!("Could not create Steam artwork folder: {e}"))?;
-    let artwork = grid.join(format!("{launch_id}p.png"));
+    let artwork = grid.join(format!("{app_id}p.png"));
     fs::copy(&image, &artwork).map_err(|e| format!("Could not copy cover image to Steam: {e}"))?;
     let shortcuts_path = config.join("shortcuts.vdf");
     let mut shortcuts = if shortcuts_path.exists() {
@@ -13219,6 +13368,14 @@ mod tests {
     #[test]
     fn build_dependency_preflight_reports_only_missing_tools() {
         assert!(missing_build_dependencies(|_| true).is_empty());
+        assert!(any_command_available(
+            &["glslangValidator", "glslang"],
+            |name| name == "glslang"
+        ));
+        assert_eq!(
+            missing_build_dependencies(|name| name != "git"),
+            vec!["git"]
+        );
         assert_eq!(
             missing_build_dependencies(|name| name != "ninja" && name != "python3"),
             vec!["ninja", "python3"]
@@ -13395,9 +13552,46 @@ mod tests {
         fs::write(game.join("bonus.elf"), b"\x7fELF\x02\x01").unwrap();
         fs::write(game.join("extra.zar"), b"\x7fZAR\0\0\0\0").unwrap();
         let nested = game.join("sce_sys/param.sfo");
-        assert!(has_game_ancestor(&nested, &dir));
-        assert!(has_game_ancestor(&game.join("bonus.elf"), &dir));
-        assert!(!has_game_ancestor(&dir.join("standalone.elf"), &dir));
+        let mut eboot_cache = HashMap::new();
+        assert!(has_game_ancestor_cached(
+            &nested,
+            &dir,
+            &mut eboot_cache,
+            false,
+        ));
+        assert!(has_game_ancestor_cached(
+            &game.join("bonus.elf"),
+            &dir,
+            &mut eboot_cache,
+            false,
+        ));
+        assert!(!has_game_ancestor_cached(
+            &dir.join("standalone.elf"),
+            &dir,
+            &mut eboot_cache,
+            false,
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn windows_scan_treats_case_variant_eboot_as_a_game_ancestor() {
+        let dir = env::temp_dir().join(format!(
+            "kyty-windows-game-scan-case-{}-{}",
+            std::process::id(),
+            now()
+        ));
+        let game = dir.join("collection/title");
+        fs::create_dir_all(game.join("sce_sys")).unwrap();
+        fs::write(game.join("EBOOT.BIN"), b"\x7fELF\x02\x01").unwrap();
+        fs::write(game.join("bonus.elf"), b"\x7fELF\x02\x01").unwrap();
+
+        assert!(directory_contains_game_eboot(&game, true));
+        assert!(has_game_ancestor_cached(
+            &game.join("bonus.elf"),
+            &dir,
+            &mut HashMap::new(),
+            true,
+        ));
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

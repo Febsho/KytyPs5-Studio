@@ -65,6 +65,7 @@ import { GameDetailsPage } from "../pages/GameDetailsPage";
 import { BuildStudioPage } from "../pages/BuildStudioPage";
 import { EmulatorManagerPage } from "../pages/EmulatorManagerPage";
 import { GameLibraryPage } from "../pages/GameLibraryPage";
+import { SteamShortcutDialog } from "../components/games/SteamShortcutDialog";
 import { SettingsPage } from "../pages/SettingsPage";
 import { LauncherSessionModal } from "../components/emulator/LauncherSessionModal";
 import { RepositoryManagerPage } from "../pages/RepositoryManagerPage";
@@ -129,6 +130,9 @@ export function App() {
     },
   );
   const [dragActive, setDragActive] = useState(false);
+  const [steamGame, setSteamGame] = useState<Game | null>(null);
+  const [steamBuildId, setSteamBuildId] = useState<number | null>(null);
+  const [steamBusy, setSteamBusy] = useState(false);
   const [controllerRemapOpen, setControllerRemapOpen] = useState(false);
   const controllerRemappingEnabled = false;
   const controllerRemapOpenRef = useRef(false);
@@ -194,6 +198,7 @@ export function App() {
   );
   const [buildType, setBuildType] = useState("Release");
   const [cleanBuild, setCleanBuild] = useState(false);
+  const [activateAfterBuild, setActivateAfterBuild] = useState(true);
   const [jobs, setJobs] = useState(
     Math.max(1, Math.min(128, (navigator.hardwareConcurrency || 4) - 1)),
   );
@@ -332,6 +337,14 @@ export function App() {
     refreshBuilds,
   } = useStudioData(call);
   useEffect(() => {
+    if (!system?.memory_total_bytes) return;
+    const cpuLimit = Math.max(1, (navigator.hardwareConcurrency || 4) - 1);
+    const memoryGiB = system.memory_total_bytes / (1024 ** 3);
+    const memoryLimit = Math.max(1, Math.floor(memoryGiB / 3));
+    const recommended = Math.min(cpuLimit, memoryLimit);
+    setJobs((current) => Math.min(current, recommended));
+  }, [system?.memory_total_bytes]);
+  useEffect(() => {
     let disposed = false;
     const refreshCompatibilityIndex = () => {
       void invoke<OfficialCompatibilityIndex>("official_compatibility_index")
@@ -381,7 +394,7 @@ export function App() {
       filters: [{ name: "GoldHEN JSON patch", extensions: ["json"] }],
     });
     if (typeof selected !== "string") return null;
-    return call<string>("import_game_patch", { gameId, path: selected });
+    return call<{ path: string; content: string }>("import_game_patch", { gameId, path: selected });
   }, [call]);
   const saveCustomGamePatch = useCallback(
     (gameId: number, content: string) =>
@@ -511,13 +524,13 @@ export function App() {
       j.kind === "community-build" ||
       j.kind === "install-tools";
     if (isJob) queueJobLog(`[${j.channel} · ${j.phase}] ${j.line}`);
-    if ((j.kind === "build" || j.kind === "community-build" || j.kind === "install-tools") && !j.done)
+    if ((j.kind === "build" || j.kind === "clone" || j.kind === "community-build" || j.kind === "install-tools") && !j.done)
       setCurrentBuildPhase(j.phase);
     if (j.done) {
       if (isJob) {
         setBusy(false);
         jobEventGate.current.complete(j.job_id);
-        if (j.kind === "build" || j.kind === "community-build" || j.kind === "install-tools")
+        if (j.kind === "build" || j.kind === "clone" || j.kind === "community-build" || j.kind === "install-tools")
           setCurrentBuildPhase(
             j.phase === "Cancelled"
               ? "Cancelled"
@@ -965,6 +978,21 @@ export function App() {
           const active = document.activeElement;
           if (
             active instanceof HTMLElement &&
+            active.matches(".home-game-row .home-game-tile") &&
+            (direction === 2 || direction === 3)
+          ) {
+            const name = ["up", "down", "left", "right"][direction];
+            window.dispatchEvent(
+              new CustomEvent("studio:gamepad-move", {
+                detail: {
+                  direction: name,
+                  gameId: Number(active.dataset.gameId),
+                  surface: "home",
+                },
+              }),
+            );
+          } else if (
+            active instanceof HTMLElement &&
             active.matches(".game-grid .game-card")
           ) {
             const name = ["up", "down", "left", "right"][direction];
@@ -973,6 +1001,7 @@ export function App() {
                 detail: {
                   direction: name,
                   gameId: Number(active.dataset.gameId),
+                  surface: "library",
                 },
               }),
             );
@@ -1005,7 +1034,14 @@ export function App() {
         );
         if (allowNavigation && confirmPressed) {
           const active = document.activeElement;
-          if (active instanceof HTMLElement) active.click();
+          if (active instanceof HTMLElement && active.matches(".home-game-row .home-game-tile")) {
+            active.dispatchEvent(
+              new CustomEvent("studio:gamepad-activate", {
+                bubbles: true,
+                detail: { gameId: Number(active.dataset.gameId) },
+              }),
+            );
+          } else if (active instanceof HTMLElement) active.click();
         }
         const cancelPressed = edge(
           pad,
@@ -1169,14 +1205,25 @@ export function App() {
     }
   };
   const addGameToSteam = async (game: Game) => {
-    setMessage(`Adding ${game.title} to Steam…`);
+    const preferredBuild = game.build_id ?? builds.find((build) => build.active)?.id ?? builds[0]?.id ?? null;
+    setSteamBuildId(preferredBuild);
+    setSteamGame(game);
+  };
+  const confirmAddGameToSteam = async () => {
+    if (!steamGame || steamBuildId === null) return;
+    setSteamBusy(true);
+    setMessage(`Adding ${steamGame.title} to Steam…`);
     try {
       const result = await call<string>("add_game_to_steam", {
-        gameId: game.id,
+        gameId: steamGame.id,
+        buildId: steamBuildId,
       });
       setMessage(result);
     } catch (error) {
-      setMessage(`Could not add ${game.title} to Steam: ${String(error)}`);
+      setMessage(`Could not add ${steamGame.title} to Steam: ${String(error)}`);
+    } finally {
+      setSteamBusy(false);
+      setSteamGame(null);
     }
   };
   const importDroppedPaths = async (paths: string[]) => {
@@ -2240,7 +2287,7 @@ export function App() {
           )}
           {page === "build" && (
             <BuildStudioPage
-                repos={trackedRepos}
+              repos={trackedRepos}
               currentRepo={currentRepo}
               buildSourceInfo={buildSourceInfo}
               system={system}
@@ -2252,21 +2299,35 @@ export function App() {
               setJobs={setJobs}
               cleanBuild={cleanBuild}
               setCleanBuild={setCleanBuild}
+              activateAfterBuild={activateAfterBuild}
+              setActivateAfterBuild={setActivateAfterBuild}
               busy={busy}
               currentBuildPhase={currentBuildPhase}
               elapsedSeconds={elapsedSeconds}
               logs={logs}
               onSelectRepo={setSelectedRepo}
+              onAddOfficialRepository={() =>
+                action(async () => {
+                  const repo = await call<Repo>("add_repository", {
+                    url: "https://github.com/KytyPS5/KytyPS5",
+                    branch: "",
+                  });
+                  setSelectedRepo(repo.id);
+                  setMessage(`${repo.owner}/${repo.name} selected. Clone its source to continue.`);
+                })
+              }
+              onCloneRepository={(id) => runJob("start_clone", { id })}
               onBuild={() =>
                 runJob("start_build", {
                   id: currentRepo!.id,
+                  activateAfterBuild,
                   options: { build_type: buildType, jobs, clean: cleanBuild },
                 })
               }
               onBuildLatest={() =>
                 runJob("start_update_build", {
                   id: currentRepo!.id,
-                  activateAfterBuild: false,
+                  activateAfterBuild,
                   options: { build_type: buildType, jobs, clean: cleanBuild },
                 })
               }
@@ -2366,6 +2427,9 @@ export function App() {
                 action(() =>
                   call("open_game_folder", { gameId: currentGame!.id }),
                 )
+              }
+              onOpenFolderForGame={(game) =>
+                action(() => call("open_game_folder", { gameId: game.id }))
               }
               onOpenLatestSessionLog={() =>
                 action(async () => {
@@ -2684,6 +2748,18 @@ export function App() {
               mapping={controllerMapping}
               onSave={saveControllerMapping}
               onClose={() => setControllerRemapOpen(false)}
+            />
+          )}
+          {steamGame && (
+            <SteamShortcutDialog
+              game={steamGame}
+              builds={builds}
+              repos={repos}
+              selectedBuildId={steamBuildId}
+              busy={steamBusy}
+              onSelectBuild={setSteamBuildId}
+              onAdd={() => void confirmAddGameToSteam()}
+              onClose={() => { if (!steamBusy) setSteamGame(null); }}
             />
           )}
         </div>

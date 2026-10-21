@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
-import { Gamepad2, Trash2, ExternalLink } from "lucide-react";
+import { Gamepad2, Trash2, ExternalLink, FolderOpen } from "lucide-react";
 import type { Game } from "../../types/studio";
 import { getGridColumnCount, getVirtualWindow } from "./virtualWindow";
 import { date, formatBytes } from "../../utils/format";
@@ -13,6 +13,7 @@ export function GameContextMenu({
   onClose,
   onDetails,
   onAddToSteam,
+  onOpenFolder,
   onRemove,
 }: {
   game: Game;
@@ -21,6 +22,7 @@ export function GameContextMenu({
   onClose: () => void;
   onDetails: (game: Game) => void;
   onAddToSteam?: (game: Game) => void;
+  onOpenFolder?: (game: Game) => void;
   onRemove?: (game: Game) => void;
 }) {
   const menu = useRef<HTMLDivElement>(null);
@@ -44,7 +46,7 @@ export function GameContextMenu({
       className="game-context-menu"
       role="menu"
       aria-label={`${game.title} actions`}
-      style={{ left: Math.min(x, window.innerWidth - 216), top: Math.min(y, window.innerHeight - 160) }}
+      style={{ left: Math.min(x, window.innerWidth - 216), top: Math.min(y, window.innerHeight - 180) }}
     >
       <button role="menuitem" onClick={() => onDetails(game)}>
         Game details
@@ -52,6 +54,11 @@ export function GameContextMenu({
       {onAddToSteam && (
         <button role="menuitem" onClick={() => onAddToSteam(game)}>
           <ExternalLink size={14} /> Add to Steam
+        </button>
+      )}
+      {onOpenFolder && (
+        <button role="menuitem" onClick={() => onOpenFolder(game)}>
+          <FolderOpen size={14} /> Open game folder
         </button>
       )}
       {onRemove && (
@@ -191,6 +198,7 @@ export function HomeGameTile({
     <button
       ref={element}
       className={`home-game-tile ${selected ? "selected" : ""}`}
+      data-game-id={game.id}
       onClick={onSelect}
       onContextMenu={(event) => onContextMenu?.(game, event)}
       aria-pressed={selected}
@@ -212,11 +220,13 @@ export function VirtualHomeGameRow({
   games,
   selectedId,
   onSelect,
+  onActivate,
   onContextMenu,
 }: {
   games: Game[];
   selectedId: number | undefined;
   onSelect: (id: number) => void;
+  onActivate?: (id: number) => void;
   onContextMenu?: (game: Game, event: ReactMouseEvent<HTMLButtonElement>) => void;
 }) {
   const row = useRef<HTMLDivElement>(null);
@@ -226,6 +236,7 @@ export function VirtualHomeGameRow({
     stride: 175,
     tileWidth: 160,
   });
+  const gamepadFocus = useRef<number | null>(null);
 
   useLayoutEffect(() => {
     const element = row.current;
@@ -259,6 +270,41 @@ export function VirtualHomeGameRow({
       window.removeEventListener("resize", measure);
     };
   }, []);
+
+  useEffect(() => {
+    const move = (event: Event) => {
+      const { direction, gameId, surface } = (event as CustomEvent<{direction:string;gameId:number;surface?:string}>).detail ?? {};
+      if (surface !== "home") return;
+      if (direction !== "left" && direction !== "right") return;
+      const current = games.findIndex((game) => game.id === gameId);
+      const next = current < 0 ? 0 : current + (direction === "left" ? -1 : 1);
+      if (next < 0 || next >= games.length) return;
+      const target = games[next];
+      gamepadFocus.current = target.id;
+      onSelect(target.id);
+      row.current?.scrollTo({ left: Math.max(0, next * viewport.stride), behavior: "smooth" });
+    };
+    const activate = (event: Event) => {
+      const gameId = (event as CustomEvent<{gameId:number}>).detail?.gameId;
+      if (gameId && games.some((game) => game.id === gameId)) onActivate?.(gameId);
+    };
+    window.addEventListener("studio:gamepad-move", move);
+    window.addEventListener("studio:gamepad-activate", activate);
+    return () => {
+      window.removeEventListener("studio:gamepad-move", move);
+      window.removeEventListener("studio:gamepad-activate", activate);
+    };
+  }, [games, onActivate, onSelect, viewport.stride]);
+
+  useEffect(() => {
+    const gameId = gamepadFocus.current;
+    if (gameId === null) return;
+    const target = row.current?.querySelector<HTMLButtonElement>(`[data-game-id="${gameId}"]`);
+    if (target) {
+      target.focus({ preventScroll: true });
+      gamepadFocus.current = null;
+    }
+  }, [viewport.left, viewport.width, games, selectedId]);
 
   const overscan = 3;
   const start = Math.max(
@@ -408,8 +454,9 @@ export function VirtualGameGrid({
   useEffect(() => {
     const move = (event: Event) => {
       const detail = (
-        event as CustomEvent<{ direction: string; gameId: number }>
+        event as CustomEvent<{ direction: string; gameId: number; surface?: string }>
       ).detail;
+      if (detail?.surface === "home") return;
       const direction = detail?.direction;
       if (!["left", "right", "up", "down"].includes(direction)) return;
       const selectedIndex = games.findIndex(

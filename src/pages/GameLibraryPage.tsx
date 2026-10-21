@@ -50,6 +50,7 @@ export type GameLibraryPageProps = {
   onSelectGame: (id: number) => boolean | void;
   onOpenDetails: () => void;
   onOpenGameFolder: () => void;
+  onOpenFolderForGame?: (game: Game) => void;
   onOpenLatestSessionLog: () => void;
   onLaunch: (id: number) => void;
   onToggleFavorite: (id: number) => void;
@@ -83,6 +84,7 @@ export function GameLibraryPage({
   onSelectGame,
   onOpenDetails,
   onOpenGameFolder,
+  onOpenFolderForGame,
   onOpenLatestSessionLog,
   onLaunch,
   onToggleFavorite,
@@ -386,6 +388,10 @@ export function GameLibraryPage({
             setContextMenu(null);
             onAddToSteam?.(game);
           }}
+          onOpenFolder={onOpenFolderForGame ? (game) => {
+            setContextMenu(null);
+            onOpenFolderForGame(game);
+          } : undefined}
           onRemove={onRemoveGame ? (game) => {
             setContextMenu(null);
             onRemoveGame(game.id);

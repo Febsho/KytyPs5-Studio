@@ -1,5 +1,5 @@
 import type { Dispatch, SetStateAction } from "react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowDownToLine, ChevronRight, GitBranch, Search, Trash2 } from "lucide-react";
 import type { Fork, GithubDetails, Repo } from "../types/studio";
 import { short } from "../utils/format";
@@ -25,7 +25,7 @@ export type RepositoryManagerPageProps = {
   onOpenBuildStudio: () => void;
   onAddFork: (fork: Fork) => void;
   onRemoveRepository?: (id:number) => void;
-  onUpdateNow?: (id:number) => void;
+  onUpdateNow: (id: number) => void;
 };
 
 export function RepositoryManagerPage({
@@ -51,8 +51,12 @@ export function RepositoryManagerPage({
   onRemoveRepository,
   onUpdateNow,
 }: RepositoryManagerPageProps) {
-  const [updateStatus, setUpdateStatus] = useState("");
+  const [updateStatus, setUpdateStatus] = useState<{
+    repositoryId: number;
+    message: string;
+  } | null>(null);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const updateCheckRequest = useRef(0);
   const trackedRepos = repos.filter((repo) => !repo.removed);
   const visibleRepos = trackedRepos.filter(
     (repo) => !(repo.owner.toLowerCase() === "kytyps5" && repo.name.toLowerCase() === "kytyps5"),
@@ -61,12 +65,70 @@ export function RepositoryManagerPage({
   const officialRepository = trackedRepos.find(
     (repo) => repo.owner.toLowerCase() === "kytyps5" && repo.name.toLowerCase() === "kytyps5",
   );
+  useEffect(() => {
+    updateCheckRequest.current += 1;
+    setUpdateStatus(null);
+    setCheckingUpdates(false);
+  }, [selectedRepository?.id]);
+
+  const checkSelectedRepositoryUpdates = async () => {
+    if (!selectedRepository) return;
+    const repositoryId = selectedRepository.id;
+    const request = ++updateCheckRequest.current;
+    setCheckingUpdates(true);
+    setUpdateStatus(null);
+    try {
+      const message = await onCheckRepositoryUpdates(repositoryId);
+      if (request === updateCheckRequest.current) {
+        setUpdateStatus({ repositoryId, message });
+      }
+    } catch (error) {
+      if (request === updateCheckRequest.current) {
+        setUpdateStatus({
+          repositoryId,
+          message: `Check failed: ${String(error)}`,
+        });
+      }
+    } finally {
+      if (request === updateCheckRequest.current) setCheckingUpdates(false);
+    }
+  };
+
+  const selectedUpdateStatus =
+    updateStatus &&
+    selectedRepository &&
+    updateStatus.repositoryId === selectedRepository.id
+      ? updateStatus.message
+      : null;
+  const updateAvailable = selectedUpdateStatus?.startsWith("Update available:") ?? false;
+  const updateStatusTitle = !selectedUpdateStatus
+    ? ""
+    : updateAvailable
+      ? "A newer build is available"
+      : selectedUpdateStatus.startsWith("Check failed:")
+        ? "Update check failed"
+        : selectedUpdateStatus.startsWith("Installed build is current")
+          ? "Installed build is current"
+          : "Your build is up to date";
+  const updateComparison = updateAvailable
+    ? selectedUpdateStatus!.slice("Update available:".length).split(";")[0].trim()
+    : "";
+  const [installedCommit, availableCommit] = updateComparison
+    .split("→")
+    .map((commit) => commit.trim());
+  const updateNote = updateAvailable
+    ? selectedUpdateStatus!.slice("Update available:".length).split(";").slice(1).join(";").trim()
+    : selectedUpdateStatus?.startsWith("Check failed:")
+      ? selectedUpdateStatus.slice("Check failed:".length).trim()
+      : selectedUpdateStatus?.startsWith("Installed build is current;")
+        ? selectedUpdateStatus.slice("Installed build is current;".length).trim()
+        : "";
   return (
     <section className="page">
       <div className="sectionhead">
         <div>
           <h3>Repositories</h3>
-          <p>Manage independent KytyPS5 source checkouts.</p>
+          <p>Manage KytyPS5 forks and source checkouts. Build Studio handles submodules when building.</p>
         </div>
         <button className="outline" onClick={onDiscoverForks}>
           <Search size={17} /> Discover forks
@@ -98,7 +160,7 @@ export function RepositoryManagerPage({
           <article
             className={"card " + (selectedRepo === r.id ? "selected" : "")}
             key={r.id}
-            onClick={() => { setUpdateStatus(""); onSelectRepository(r.id); }}
+            onClick={() => onSelectRepository(r.id)}
           >
             <div className="cardtop">
               <GitBranch />
@@ -159,13 +221,8 @@ export function RepositoryManagerPage({
             </button>
             <button
               className="outline"
-              disabled={checkingUpdates || !selectedRepository.source_path}
-              onClick={async () => {
-                setCheckingUpdates(true); setUpdateStatus("");
-                try { setUpdateStatus(await onCheckRepositoryUpdates(selectedRepository.id)); }
-                catch (error) { setUpdateStatus(`Check failed: ${String(error)}`); }
-                finally { setCheckingUpdates(false); }
-              }}
+              disabled={checkingUpdates || busy || !selectedRepository.source_path}
+              onClick={() => void checkSelectedRepositoryUpdates()}
             >
               {checkingUpdates ? "Checking…" : "Check updates"}
             </button>
@@ -179,10 +236,44 @@ export function RepositoryManagerPage({
               Build <ChevronRight size={15} />
             </button>
           </div>
-          {updateStatus && <div className={`repo-update-status ${updateStatus.startsWith("Update available:") ? "available" : ""}`}>
-            <div><strong>{updateStatus.startsWith("Update available:") ? "Update available" : updateStatus.startsWith("Check failed:") ? "Update check failed" : updateStatus}</strong><small>{updateStatus.startsWith("Update available:") ? updateStatus.slice("Update available:".length).trim() : ""}</small></div>
-            {updateStatus.startsWith("Update available:") && <button className="primary" disabled={busy} onClick={()=>onUpdateNow?.(selectedRepository.id)}>Update Now</button>}
-          </div>}
+          {checkingUpdates && (
+            <div className="repo-update-status checking" role="status">
+              <div>
+                <strong>Checking for updates…</strong>
+                <small>Fetching the selected repository’s tracked branch from GitHub.</small>
+              </div>
+            </div>
+          )}
+          {selectedUpdateStatus && (
+            <div
+              className={`repo-update-status ${updateAvailable ? "available" : selectedUpdateStatus.startsWith("Check failed:") ? "failed" : "current"}`}
+              role="status"
+              aria-live="polite"
+            >
+              <div>
+                <strong>{updateStatusTitle}</strong>
+                {updateAvailable ? (
+                  <div className="repo-update-commits">
+                    <span>Installed <code>{installedCommit || "Unknown"}</code></span>
+                    <span>Available <code>{availableCommit || "Unknown"}</code></span>
+                  </div>
+                ) : null}
+                {updateNote ? <small>{updateNote}</small> : null}
+                {updateAvailable && !["official", "kyty-cmake"].includes(selectedRepository.adapter) ? (
+                  <small>Building this repository is unavailable until its KytyPS5 CMake adapter is verified.</small>
+                ) : null}
+              </div>
+              {updateAvailable ? (
+                <button
+                  className="primary"
+                  disabled={busy || !["official", "kyty-cmake"].includes(selectedRepository.adapter)}
+                  onClick={() => onUpdateNow(selectedRepository.id)}
+                >
+                  Fetch latest and build
+                </button>
+              ) : null}
+            </div>
+          )}
           {githubDetails && (
             <div className="github-details">
               <div className="game-meta">

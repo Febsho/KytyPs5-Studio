@@ -16,11 +16,15 @@ export type BuildStudioPageProps = {
   setJobs: Dispatch<SetStateAction<number>>;
   cleanBuild: boolean;
   setCleanBuild: Dispatch<SetStateAction<boolean>>;
+  activateAfterBuild: boolean;
+  setActivateAfterBuild: Dispatch<SetStateAction<boolean>>;
   busy: boolean;
   currentBuildPhase: string;
   elapsedSeconds: number;
   logs: string[];
   onSelectRepo: (id: number) => void;
+  onAddOfficialRepository: () => void;
+  onCloneRepository: (id: number) => void;
   onBuild: () => void;
   onBuildLatest: () => void;
   onInstallTools: () => void;
@@ -31,7 +35,7 @@ export type BuildStudioPageProps = {
 function buildStageIndex(phase: string) {
   const value = phase.toLowerCase();
   if (/complete|succeeded|verified/.test(value)) return 7;
-  if (/fetch|preparing repository/.test(value)) return 0;
+  if (/clone|fetch|preparing repository/.test(value)) return 0;
   if (/submodule|updating source/.test(value)) return 1;
   if (/dependenc/.test(value)) return 2;
   if (/configur/.test(value)) return 3;
@@ -61,11 +65,15 @@ export function BuildStudioPage({
   setJobs,
   cleanBuild,
   setCleanBuild,
+  activateAfterBuild,
+  setActivateAfterBuild,
   busy,
   currentBuildPhase,
   elapsedSeconds,
   logs,
   onSelectRepo,
+  onAddOfficialRepository,
+  onCloneRepository,
   onBuild,
   onBuildLatest,
   onInstallTools,
@@ -77,20 +85,20 @@ export function BuildStudioPage({
   const onJobsChange = setJobs;
   const onCleanBuildChange = setCleanBuild;
   const linuxBuildToolNames = new Set([
-    "cmake", "ninja", "clang", "clang++", "pkg-config", "python3",
+    "git", "cmake", "ninja", "clang", "clang++", "pkg-config", "python3",
     "glslangValidator", "vulkan", "x11", "wayland-client", "libpulse", "libudev",
   ]);
   const isWindows = system?.os.toLowerCase().includes("windows") ?? false;
   const isLinux = system?.os.toLowerCase().includes("linux") ?? false;
-  const missingBuildTools = system
-    ? system.dependencies
-        .filter((dependency) =>
-          isWindows
-            ? !dependency.present
-            : isLinux && linuxBuildToolNames.has(dependency.name) && !dependency.present,
-        )
-        .map((dependency) => dependency.name)
+  const checkedBuildTools = system
+    ? system.dependencies.filter(
+        (dependency) =>
+          isWindows || (isLinux && linuxBuildToolNames.has(dependency.name)),
+      )
     : [];
+  const missingBuildTools = checkedBuildTools
+    .filter((dependency) => !dependency.present)
+    .map((dependency) => dependency.name);
   const buildToolsMissing = missingBuildTools.length > 0;
   const canCancel = busy && currentBuildPhase.toLowerCase() !== "installing tools";
   return (
@@ -165,6 +173,7 @@ export function BuildStudioPage({
             <label>Emulator repository</label>
             <select
               value={currentRepo?.id ?? ""}
+              disabled={!repos.length}
               onChange={(e) => onSelectRepo(Number(e.target.value))}
             >
               {repos.map((repo) => (
@@ -173,6 +182,9 @@ export function BuildStudioPage({
                 </option>
               ))}
             </select>
+            <button className="outline" disabled={busy} onClick={onAddOfficialRepository}>
+              Add / select official KytyPS5 source
+            </button>
             <div className="build-source-row">
               <div className="build-source-mark">
                 {currentRepo?.name.slice(0, 1).toUpperCase() || "K"}
@@ -213,6 +225,21 @@ export function BuildStudioPage({
                   : "Unsupported / unverified"}
               </strong>
             </div>
+            {currentRepo && !currentRepo.source_path ? (
+              <button
+                className="outline"
+                disabled={busy}
+                onClick={() => onCloneRepository(currentRepo.id)}
+              >
+                Clone source and submodules
+              </button>
+            ) : null}
+            {currentRepo?.source_path ? (
+              <div className="technical-row">
+                <span>Submodules</span>
+                <strong>Updated recursively before every build</strong>
+              </div>
+            ) : null}
             <div className="formgrid">
               <div>
                 <label>Configuration</label>
@@ -247,9 +274,18 @@ export function BuildStudioPage({
                 className={`statusdot ${currentRepo?.source_path ? "" : "muted"}`}
               />
               {currentRepo?.source_path
-                ? `${system ? `${system.dependencies.filter((dependency) => dependency.present).length} / ${system.dependencies.length} checked tools found` : "Checking system dependencies…"}`
+              ? `${system ? `${checkedBuildTools.filter((dependency) => dependency.present).length} / ${checkedBuildTools.length} required build tools found` : "Checking system dependencies…"}`
                 : "Select and clone a source repository"}
             </div>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={activateAfterBuild}
+                disabled={busy}
+                onChange={(event) => setActivateAfterBuild(event.target.checked)}
+              />
+              Activate this build when it succeeds
+            </label>
             <button
               className="primary build-main-action"
               disabled={
@@ -324,6 +360,7 @@ export function BuildStudioPage({
             <label>Repository</label>
             <select
               value={currentRepo?.id ?? ""}
+              disabled={!repos.length}
               onChange={(e) => onSelectRepo(Number(e.target.value))}
             >
               {repos.map((repo) => (
@@ -332,6 +369,18 @@ export function BuildStudioPage({
                 </option>
               ))}
             </select>
+            <button className="outline" disabled={busy} onClick={onAddOfficialRepository}>
+              Add / select official KytyPS5 source
+            </button>
+            {currentRepo && !currentRepo.source_path ? (
+              <button
+                className="outline"
+                disabled={busy}
+                onClick={() => onCloneRepository(currentRepo.id)}
+              >
+                Clone source and submodules
+              </button>
+            ) : null}
             <div className="technical-row">
               <span>Source directory</span>
               <strong>{currentRepo?.source_path || "Not cloned"}</strong>
@@ -442,6 +491,15 @@ export function BuildStudioPage({
                 onChange={(e) => onCleanBuildChange(e.target.checked)}
               />
               Clean CMake output
+            </label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={activateAfterBuild}
+                disabled={busy}
+                onChange={(event) => setActivateAfterBuild(event.target.checked)}
+              />
+              Activate this build when it succeeds
             </label>
             <div className="technical-row">
               <span>Verbose output</span>

@@ -32,11 +32,15 @@ function props(
     setJobs: vi.fn(),
     cleanBuild: false,
     setCleanBuild: vi.fn(),
+    activateAfterBuild: true,
+    setActivateAfterBuild: vi.fn(),
     busy: false,
     currentBuildPhase: "Idle",
     elapsedSeconds: 0,
     logs: [],
     onSelectRepo: vi.fn(),
+    onAddOfficialRepository: vi.fn(),
+    onCloneRepository: vi.fn(),
     onBuild: vi.fn(),
     onBuildLatest: vi.fn(),
     onInstallTools: vi.fn(),
@@ -69,6 +73,29 @@ describe("BuildStudioPage", () => {
     ).toContain("Configuring CMake");
   });
 
+  it("can add and clone the emulator source from Build Studio", () => {
+    const addSource = props({ repos: [], currentRepo: undefined });
+    const { rerender } = render(<BuildStudioPage {...addSource} />);
+    fireEvent.click(screen.getByRole("button", { name: "Add / select official KytyPS5 source" }));
+    expect(addSource.onAddOfficialRepository).toHaveBeenCalledOnce();
+
+    const cloneSource = props({ currentRepo: { ...repo, source_path: null } });
+    rerender(<BuildStudioPage {...cloneSource} />);
+    fireEvent.click(screen.getByRole("button", { name: "Clone source and submodules" }));
+    expect(cloneSource.onCloneRepository).toHaveBeenCalledWith(repo.id);
+  });
+
+  it("lets users choose whether a completed build becomes active", () => {
+    const page = props();
+    render(<BuildStudioPage {...page} />);
+    const activate = screen.getByRole("checkbox", {
+      name: "Activate this build when it succeeds",
+    });
+    expect((activate as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(activate);
+    expect(page.setActivateAfterBuild).toHaveBeenCalledWith(false);
+  });
+
   it("offers a tool installer and blocks builds when Linux build requirements are missing", () => {
     const page = props({
       system: {
@@ -81,6 +108,7 @@ describe("BuildStudioPage", () => {
         session: "wayland",
         gpu: "GPU",
         dependencies: [
+          { name: "git", present: false },
           { name: "cmake", present: true },
           { name: "clang", present: false },
           { name: "vulkaninfo", present: false },
@@ -90,7 +118,7 @@ describe("BuildStudioPage", () => {
     });
     const { container } = render(<BuildStudioPage {...page} />);
 
-    expect(screen.getByText(/Missing build tools: clang/)).toBeTruthy();
+    expect(screen.getByText(/Missing build tools: git, clang/)).toBeTruthy();
     expect(screen.queryByText(/vulkaninfo/)).toBeNull();
     expect((container.querySelector(".build-main-action") as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: "Install missing tools" }));

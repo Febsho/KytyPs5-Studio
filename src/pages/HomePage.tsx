@@ -29,6 +29,7 @@ export type HomePageProps = {
   games: Game[];
   officialCompatibilityIndex?: OfficialCompatibilityIndex | null;
   featuredGame: Game | null;
+  featuredLogo?: string | null;
   featuredBackground: string | null;
   active?: Build;
   repos: Repo[];
@@ -56,6 +57,7 @@ export function HomePage({
   games,
   officialCompatibilityIndex,
   featuredGame,
+  featuredLogo,
   featuredBackground,
   active,
   repos,
@@ -144,7 +146,14 @@ export function HomePage({
           )}
           {trophyProgress && trophyProgress.total > 0 && <span>{trophyProgress.earned === null ? `${trophyProgress.total} TROPHIES` : `${trophyProgress.earned}/${trophyProgress.total} TROPHIES EARNED`}</span>}
         </div>
-        <h2>{featuredGame?.title || "KytyPS5 Studio"}</h2>
+        {featuredLogo ? (
+          <>
+            <h2 className="sr-only">{featuredGame?.title || "KytyPS5 Studio"}</h2>
+            <img className="home-feature-logo" src={featuredLogo} alt="" />
+          </>
+        ) : (
+          <h2>{featuredGame?.title || "KytyPS5 Studio"}</h2>
+        )}
         <p>
           {featuredGame
             ? featuredGame.last_played

@@ -8054,6 +8054,39 @@ async fn read_game_icon(
     Ok(tauri::ipc::Response::new(bytes))
 }
 #[tauri::command]
+async fn read_game_logo(
+    app: tauri::AppHandle,
+    game_id: i64,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<u8>, String> {
+        let connection = db(&app)?;
+        let game = game(&connection, game_id)?;
+        let Some(root) = game_artwork_root(Path::new(&game.path)) else {
+            return Ok(Vec::new());
+        };
+        let paths = state_paths(&app)?;
+        let cache_dir = paths.cache.join("game-artwork");
+        fs::create_dir_all(&cache_dir)
+            .map_err(|error| format!("Could not create game artwork cache: {error}"))?;
+        let cache_root = fs::canonicalize(&cache_dir)
+            .map_err(|error| format!("Could not access game artwork cache: {error}"))?;
+        let managed_cache = fs::canonicalize(&paths.cache)
+            .map_err(|error| format!("Could not access app cache: {error}"))?;
+        if !path_starts_with(&cache_root, &managed_cache)
+            || fs::symlink_metadata(&cache_dir)
+                .map_err(|error| error.to_string())?
+                .file_type()
+                .is_symlink()
+        {
+            return Err("Game artwork cache is outside the managed app cache".into());
+        }
+        Ok(read_game_logo(&root, &cache_root, game_id).unwrap_or_default())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+#[tauri::command]
 async fn read_game_background(
     app: tauri::AppHandle,
     game_id: i64,
@@ -8125,6 +8158,159 @@ fn read_game_thumbnail(
     let bytes = read_game_png(path, game_root, maximum_source_size)?;
     let thumbnail = resize_png(&bytes, maximum_width, maximum_height)?;
     (thumbnail.len() <= maximum_output_size).then_some(thumbnail)
+}
+const MAX_LOGO_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_LOGO_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+fn read_game_artwork_source(path: &Path, game_root: &Path) -> Option<Vec<u8>> {
+    let root = fs::canonicalize(game_root).ok()?;
+    let path = fs::canonicalize(path).ok()?;
+    if !path_starts_with(&path, &root) || !path.is_file() {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_LOGO_SOURCE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_LOGO_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_LOGO_SOURCE_BYTES).then_some(bytes)
+}
+fn transparent_logo_alpha(alpha_values: impl Iterator<Item = u8>, pixel_count: usize) -> bool {
+    let minimum = (pixel_count / 1000).max(1);
+    let (transparent, visible) = alpha_values.fold((0, 0), |(transparent, visible), alpha| {
+        (
+            transparent + usize::from(alpha <= 16),
+            visible + usize::from(alpha >= 64),
+        )
+    });
+    transparent >= minimum && visible >= minimum
+}
+fn png_has_transparent_logo(bytes: &[u8]) -> bool {
+    let limits = png::Limits {
+        bytes: MAX_ARTWORK_DECODED_BYTES,
+    };
+    let mut decoder = png::Decoder::new_with_limits(BufReader::new(Cursor::new(bytes)), limits);
+    let (width, height) = match decoder.read_header_info() {
+        Ok(header) => (header.width, header.height),
+        Err(_) => return false,
+    };
+    let Some(pixel_count) = (width as usize).checked_mul(height as usize) else {
+        return false;
+    };
+    if width == 0 || height == 0 || pixel_count > MAX_ARTWORK_PIXELS {
+        return false;
+    }
+    decoder.set_transformations(
+        png::Transformations::normalize_to_color8() | png::Transformations::ALPHA,
+    );
+    let Ok(mut reader) = decoder.read_info() else {
+        return false;
+    };
+    let Some(decoded_size) = reader.output_buffer_size() else {
+        return false;
+    };
+    if decoded_size > MAX_ARTWORK_DECODED_BYTES {
+        return false;
+    }
+    let mut decoded = vec![0; decoded_size];
+    let Ok(frame) = reader.next_frame(&mut decoded) else {
+        return false;
+    };
+    let pixels = &decoded[..frame.buffer_size()];
+    match frame.color_type {
+        png::ColorType::Rgba => {
+            transparent_logo_alpha(pixels.chunks_exact(4).map(|pixel| pixel[3]), pixel_count)
+        }
+        png::ColorType::GrayscaleAlpha => {
+            transparent_logo_alpha(pixels.chunks_exact(2).map(|pixel| pixel[1]), pixel_count)
+        }
+        _ => false,
+    }
+}
+fn encode_rgba_png(width: u32, height: u32, pixels: &[u8]) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut bytes, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(pixels).ok()?;
+    drop(writer);
+    Some(bytes)
+}
+fn decode_dds_logo(bytes: &[u8]) -> Option<Vec<u8>> {
+    let dds = image_dds::ddsfile::Dds::read(Cursor::new(bytes)).ok()?;
+    let (width, height) = (dds.get_width(), dds.get_height());
+    let pixel_count = (width as usize).checked_mul(height as usize)?;
+    if width == 0
+        || height == 0
+        || pixel_count > MAX_ARTWORK_PIXELS
+        || dds.get_depth() != 1
+        || dds.get_num_array_layers() != 1
+    {
+        return None;
+    }
+    let surface = image_dds::SurfaceRgba8::decode_layers_mipmaps_dds(&dds, 0..1, 0..1).ok()?;
+    let image = surface.get_image(0, 0, 0)?;
+    if !transparent_logo_alpha(
+        image.as_raw().chunks_exact(4).map(|pixel| pixel[3]),
+        pixel_count,
+    ) {
+        return None;
+    }
+    let png = encode_rgba_png(width, height, image.as_raw())?;
+    let thumbnail = resize_png(&png, 1200, 500)?;
+    (thumbnail.len() <= MAX_LOGO_OUTPUT_BYTES).then_some(thumbnail)
+}
+fn cache_game_logo(cache_root: &Path, game_id: i64, source: &[u8], logo: &[u8]) {
+    let digest = format!("{:x}", Sha256::digest(source));
+    let path = cache_root.join(format!("game-{game_id}-{digest}.png"));
+    let temporary = cache_root.join(format!(".game-{game_id}-{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    let result = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(logo)?;
+        file.sync_all()?;
+        replace_file(&temporary, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+}
+fn read_game_logo(game_root: &Path, cache_root: &Path, game_id: i64) -> Option<Vec<u8>> {
+    let system = game_root.join("sce_sys");
+    for (name, is_dds) in [("pic2.dds", true), ("pic2.png", false)] {
+        let path = system.join(name);
+        let Some(source) = read_game_artwork_source(&path, game_root) else {
+            continue;
+        };
+        let digest = format!("{:x}", Sha256::digest(&source));
+        let cached_path = cache_root.join(format!("game-{game_id}-{digest}.png"));
+        if let Some(cached) = read_game_png(&cached_path, cache_root, MAX_LOGO_OUTPUT_BYTES as u64)
+        {
+            if png_has_transparent_logo(&cached) {
+                return Some(cached);
+            }
+        }
+        let logo = if is_dds {
+            decode_dds_logo(&source)
+        } else if png_has_transparent_logo(&source) {
+            resize_png(&source, 1200, 500)
+                .filter(|thumbnail| thumbnail.len() <= MAX_LOGO_OUTPUT_BYTES)
+        } else {
+            None
+        };
+        let Some(logo) = logo else {
+            continue;
+        };
+        cache_game_logo(cache_root, game_id, &source, &logo);
+        return Some(logo);
+    }
+    None
 }
 fn resize_png(bytes: &[u8], maximum_width: u32, maximum_height: u32) -> Option<Vec<u8>> {
     if maximum_width == 0 || maximum_height == 0 {
@@ -10856,6 +11042,7 @@ pub fn run() {
             refresh_game_metadata,
             open_game_folder,
             read_game_icon,
+            read_game_logo,
             read_game_background,
             scan_games,
             set_game_build,

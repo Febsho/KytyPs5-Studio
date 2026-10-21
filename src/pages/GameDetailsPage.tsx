@@ -20,6 +20,8 @@ import { compatibilityOsLabel, compatibilityStatusLabel, currentCompatibilityOS,
 type Tab = "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Cheats";
 export type GameDetailsPageProps = {
   game: Game;
+  gameLogo?: string | null;
+  gameBackground?: string | null;
   tab: Tab;
   setTab: Dispatch<SetStateAction<Tab>>;
   profileDirty: boolean;
@@ -57,6 +59,8 @@ export type GameDetailsPageProps = {
 
 export function GameDetailsPage({
   game: currentGame,
+  gameLogo = null,
+  gameBackground = null,
   tab: gameDetailsTab,
   setTab: setGameDetailsTab,
   profileDirty,
@@ -172,12 +176,20 @@ export function GameDetailsPage({
   return (
     <section className="page game-details-page">
       <div className="game-details-header">
+        {gameBackground && <img className="game-details-background" src={gameBackground} alt="" />}
         <button className="outline" onClick={onBack}>
           ← Library
         </button>
-        <div>
+        <div className="game-details-title">
           <p className="eyebrow">GAME DETAILS</p>
-          <h1>{currentGame.title}</h1>
+          {gameLogo ? (
+            <>
+              <h1 className="sr-only">{currentGame.title}</h1>
+              <img className="game-details-logo" src={gameLogo} alt="" />
+            </>
+          ) : (
+            <h1>{currentGame.title}</h1>
+          )}
           <p className="path">{currentGame.path}</p>
         </div>
         <div className="buttonrow">

@@ -51,8 +51,10 @@ import type {
 } from "../types/studio";
 import {
   loadGameIcon,
+  loadGameLogo,
   loadGameBackground,
   retainGameIcon,
+  retainGameLogo,
   retainGameBackground,
 } from "../services/gameArtwork";
 import { formatBytes, short } from "../utils/format";
@@ -250,7 +252,9 @@ export function App() {
   const [globalProfileCapabilities, setGlobalProfileCapabilities] =
     useState<ProfileCapabilities | null>(null);
   const [gameIcon, setGameIcon] = useState<string | null>(null);
+  const [gameLogo, setGameLogo] = useState<string | null>(null);
   const [gameBackground, setGameBackground] = useState<string | null>(null);
+  const [featuredLogo, setFeaturedLogo] = useState<string | null>(null);
   const [featuredBackground, setFeaturedBackground] = useState<string | null>(
     null,
   );
@@ -1462,7 +1466,8 @@ export function App() {
   useEffect(() => {
     let disposed = false;
     let timer = 0;
-    if (page === "library" && currentGame) {
+    if ((page === "library" || page === "game-details") && currentGame) {
+      setGameBackground(null);
       const release = retainGameBackground(currentGame.id);
       timer = window.setTimeout(() => {
         void loadGameBackground(currentGame.id).then((url) => {
@@ -1482,6 +1487,26 @@ export function App() {
   }, [currentGame?.id, page]);
   useEffect(() => {
     let disposed = false;
+    if (page === "game-details" && currentGame) {
+      setGameLogo(null);
+      const release = retainGameLogo(currentGame.id);
+      void loadGameLogo(currentGame.id).then((url) => {
+        if (!disposed) setGameLogo(url);
+      }).catch(() => {
+        if (!disposed) setGameLogo(null);
+      });
+      return () => {
+        disposed = true;
+        release();
+      };
+    }
+    setGameLogo(null);
+    return () => {
+      disposed = true;
+    };
+  }, [currentGame?.id, page]);
+  useEffect(() => {
+    let disposed = false;
     if (page === "home" && featuredGame) {
       const release = retainGameBackground(featuredGame.id);
       void loadGameBackground(featuredGame.id).then((url) => {
@@ -1493,6 +1518,26 @@ export function App() {
       };
     }
     setFeaturedBackground(null);
+    return () => {
+      disposed = true;
+    };
+  }, [featuredGame?.id, page]);
+  useEffect(() => {
+    let disposed = false;
+    if (page === "home" && featuredGame) {
+      setFeaturedLogo(null);
+      const release = retainGameLogo(featuredGame.id);
+      void loadGameLogo(featuredGame.id).then((url) => {
+        if (!disposed) setFeaturedLogo(url);
+      }).catch(() => {
+        if (!disposed) setFeaturedLogo(null);
+      });
+      return () => {
+        disposed = true;
+        release();
+      };
+    }
+    setFeaturedLogo(null);
     return () => {
       disposed = true;
     };
@@ -1883,6 +1928,7 @@ export function App() {
               games={publicGames}
               officialCompatibilityIndex={officialCompatibilityIndex}
               featuredGame={featuredGame}
+              featuredLogo={featuredLogo}
               featuredBackground={featuredBackground}
               active={active}
               repos={repos}
@@ -2477,6 +2523,8 @@ export function App() {
           {page === "game-details" && currentGame && (
             <GameDetailsPage
               game={currentGame}
+              gameLogo={gameLogo}
+              gameBackground={gameBackground}
               tab={gameDetailsTab}
               setTab={setGameDetailsTab}
               profileDirty={profileDirty}

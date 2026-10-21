@@ -8080,7 +8080,7 @@ async fn read_game_logo(
         {
             return Err("Game artwork cache is outside the managed app cache".into());
         }
-        Ok(read_game_logo(&root, &cache_root, game_id).unwrap_or_default())
+        Ok(load_cached_game_logo(&root, &cache_root, game_id).unwrap_or_default())
     })
     .await
     .map_err(|error| error.to_string())??;
@@ -8181,8 +8181,8 @@ fn transparent_logo_alpha(alpha_values: impl Iterator<Item = u8>, pixel_count: u
     let minimum = (pixel_count / 1000).max(1);
     let (transparent, visible) = alpha_values.fold((0, 0), |(transparent, visible), alpha| {
         (
-            transparent + usize::from(alpha <= 16),
-            visible + usize::from(alpha >= 64),
+            transparent + (alpha <= 16) as usize,
+            visible + (alpha >= 64) as usize,
         )
     });
     transparent >= minimum && visible >= minimum
@@ -8281,7 +8281,7 @@ fn cache_game_logo(cache_root: &Path, game_id: i64, source: &[u8], logo: &[u8]) 
         let _ = fs::remove_file(temporary);
     }
 }
-fn read_game_logo(game_root: &Path, cache_root: &Path, game_id: i64) -> Option<Vec<u8>> {
+fn load_cached_game_logo(game_root: &Path, cache_root: &Path, game_id: i64) -> Option<Vec<u8>> {
     let system = game_root.join("sce_sys");
     for (name, is_dds) in [("pic2.dds", true), ("pic2.png", false)] {
         let path = system.join(name);

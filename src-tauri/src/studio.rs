@@ -12434,7 +12434,9 @@ mod tests {
     fn migration_removes_only_the_legacy_sqlite_github_token() {
         let mut db = Connection::open_in_memory().unwrap();
         db.execute_batch(
-            "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            "CREATE TABLE builds(id INTEGER PRIMARY KEY, active INTEGER NOT NULL DEFAULT 0);
+             CREATE TABLE global_profile_defaults(id INTEGER PRIMARY KEY, options_json TEXT NOT NULL);
+             CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO settings VALUES('github_token','legacy-secret'),('theme','dark');
              PRAGMA user_version=9;",
         )

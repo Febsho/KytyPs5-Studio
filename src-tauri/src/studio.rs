@@ -8181,8 +8181,8 @@ fn transparent_logo_alpha(alpha_values: impl Iterator<Item = u8>, pixel_count: u
     let minimum = (pixel_count / 1000).max(1);
     let (transparent, visible) = alpha_values.fold((0, 0), |(transparent, visible), alpha| {
         (
-            transparent + (alpha <= 16) as usize,
-            visible + (alpha >= 64) as usize,
+            transparent + usize::from(alpha <= 16),
+            visible + usize::from(alpha >= 64),
         )
     });
     transparent >= minimum && visible >= minimum

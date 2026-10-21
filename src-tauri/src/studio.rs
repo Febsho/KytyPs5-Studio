@@ -5296,12 +5296,7 @@ fn start_community_build(
                 &app,
                 &jobs,
                 None,
-                &[
-                    "clone",
-                    "--no-checkout",
-                    &source_text,
-                    &work_text,
-                ],
+                &["clone", "--no-checkout", &source_text, &work_text],
             )?;
             git_cancellable(
                 &app,
@@ -7117,12 +7112,7 @@ fn start_build(
                 }
             ))
         })();
-        finish_job(
-            &app,
-            &jobs,
-            "build",
-            result,
-        );
+        finish_job(&app, &jobs, "build", result);
     });
     Ok(job_id)
 }
@@ -8243,9 +8233,7 @@ fn directory_contains_game_eboot(directory: &Path, windows: bool) -> bool {
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
-        .any(|entry| {
-            is_eboot_filename_for(&entry.file_name(), true) && is_elf_file(&entry.path())
-        })
+        .any(|entry| is_eboot_filename_for(&entry.file_name(), true) && is_elf_file(&entry.path()))
 }
 
 fn has_game_ancestor_cached(
@@ -8744,7 +8732,11 @@ fn fetch_game_cheats(
 ) -> Result<Vec<serde_json::Value>, String> {
     let connection = db(&app)?;
     let selected = game(&connection, game_id)?;
-    let Some(title_id) = selected.title_id.as_deref().and_then(normalize_cheat_title_id) else {
+    let Some(title_id) = selected
+        .title_id
+        .as_deref()
+        .and_then(normalize_cheat_title_id)
+    else {
         return Ok(Vec::new());
     };
     let index = read_remote_text(PS5_CHEAT_INDEX, 4 * 1024 * 1024)?;
@@ -8780,7 +8772,11 @@ fn fetch_game_cheats(
         }
     }
     if entries.is_empty() && !failures.is_empty() {
-        return Err(format!("Found {} matching cheat file(s), but none could be read: {}", failures.len(), failures[0]));
+        return Err(format!(
+            "Found {} matching cheat file(s), but none could be read: {}",
+            failures.len(),
+            failures[0]
+        ));
     }
     Ok(entries)
 }
@@ -9524,7 +9520,11 @@ fn add_game_to_steam(app: tauri::AppHandle, game_id: i64, build_id: i64) -> Resu
         fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))
             .map_err(|e| e.to_string())?;
         let exe_field = format!("\"{}\"", launcher.display());
-        (exe_field, format!("\"{}\"", launcher_dir.display()), String::new())
+        (
+            exe_field,
+            format!("\"{}\"", launcher_dir.display()),
+            String::new(),
+        )
     };
     #[cfg(windows)]
     let (exe_field, start_dir, launch_options) = {

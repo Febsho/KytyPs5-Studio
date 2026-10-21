@@ -1,15 +1,25 @@
 import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { Settings } from "lucide-react";
-import type { AppUpdateInfo, ProfileCapabilities, StorageReport } from "../types/studio";
-import {
-  ProfileOptionFields,
-  cliOptionInfo,
-} from "../components/settings/ProfileOptionFields";
+import type { AppUpdateInfo, Build, ProfileCapabilities, Repo, StorageReport } from "../types/studio";
+import { ProfileOptionFields } from "../components/settings/ProfileOptionFields";
 import { formatBytes } from "../utils/format";
 import { currentCompatibilityOS } from "../utils/compatibility";
 
+const primaryEmulatorFlags = [
+  "--screen-width",
+  "--screen-height",
+  "--fullscreen",
+  "--gpu",
+  "--present-mode",
+  "--perf-overlay",
+];
+
 export type SettingsPageProps = {
+  builds: Build[];
+  repos: Repo[];
+  selectedBuildId: number | null;
+  onSelectedBuildChange: (buildId: number | null) => void;
   globalProfileCapabilities: ProfileCapabilities | null;
   globalProfileOptions: Record<string, string>;
   setGlobalProfileOptions: Dispatch<SetStateAction<Record<string, string>>>;
@@ -44,6 +54,10 @@ export type SettingsPageProps = {
 };
 
 export function SettingsPage({
+  builds,
+  repos,
+  selectedBuildId,
+  onSelectedBuildChange,
   globalProfileCapabilities,
   globalProfileOptions,
   setGlobalProfileOptions,
@@ -76,6 +90,17 @@ export function SettingsPage({
   onCheckAppUpdate,
   onInstallAppUpdate,
 }: SettingsPageProps) {
+  const selectedBuild = builds.find((build) => build.id === selectedBuildId) ?? null;
+  const selectedRepo = selectedBuild
+    ? repos.find((repo) => repo.id === selectedBuild.repo_id)
+    : null;
+  const reportedOptions = globalProfileCapabilities?.options ?? [];
+  const primaryOptions = reportedOptions.filter((flag) =>
+    primaryEmulatorFlags.includes(flag),
+  );
+  const additionalOptions = reportedOptions.filter(
+    (flag) => !primaryEmulatorFlags.includes(flag),
+  );
   const hostOS = currentCompatibilityOS();
   const storageDescription = hostOS === "windows"
     ? "Application data and cache use LocalAppData; configuration uses Roaming AppData."
@@ -117,22 +142,57 @@ export function SettingsPage({
   };
   return (
     <section className="page settings-page">
-      <div className="panel">
-        <h3>Global KytyPS5 defaults</h3>
-        <p>
-          These supported options apply to games that do not override them.
-          Leave an option out to use the emulator’s own default. Availability
-          follows the active emulator build.
-        </p>
-        <small className="hint">
-          Supported by active build:{" "}
-          {globalProfileCapabilities?.options
-            .map((flag) => cliOptionInfo[flag]?.label || flag)
-            .join(" · ") || "No active build or no additional options detected"}
-        </small>
+      <div className="panel settings-emulator-panel">
+        <div className="settings-emulator-heading">
+          <div>
+            <h3>Emulator settings</h3>
+            <p>Choose an installed build. Defaults apply to games assigned to that build.</p>
+          </div>
+          <label>
+            Emulator
+            <select
+              aria-label="Emulator settings build"
+              value={selectedBuildId ?? ""}
+              onChange={(event) =>
+                onSelectedBuildChange(
+                  event.target.value ? Number(event.target.value) : null,
+                )
+              }
+            >
+              <option value="" disabled>
+                {builds.length ? "Select an emulator build" : "No installed emulator builds"}
+              </option>
+              {builds.map((build) => {
+                const repo = repos.find((item) => item.id === build.repo_id);
+                const repository = repo ? `${repo.owner}/${repo.name}` : "Unknown repository";
+                return (
+                  <option value={build.id} key={build.id}>
+                    {repository} · {build.build_type} · {build.commit_sha.slice(0, 8)}
+                    {build.active ? " · Active" : ""}
+                  </option>
+                );
+              })}
+            </select>
+          </label>
+        </div>
+        {selectedBuild && (
+          <div className="settings-emulator-summary">
+            <strong>{selectedRepo ? `${selectedRepo.owner}/${selectedRepo.name}` : "Selected emulator"}</strong>
+            <span>
+              {selectedBuild.build_type} build · {selectedBuild.commit_sha.slice(0, 8)}
+              {selectedBuild.active ? " · currently active" : ""}
+            </span>
+          </div>
+        )}
+        {selectedBuild && globalProfileCapabilities && (
+          <div className="settings-build-caption">
+            <span>{globalProfileCapabilities.options.length} CLI options reported by this build</span>
+            <span>Only reported options are available below</span>
+          </div>
+        )}
         {globalUnsupported && (
           <div className="diagnosis-note">
-            Some saved defaults are not supported by the active build. They will
+            Some saved defaults are not supported by the selected build. They will
             apply again when a compatible build is selected.{" "}
             <button
               className="text-button"
@@ -150,21 +210,51 @@ export function SettingsPage({
             </button>
           </div>
         )}
-        <ProfileOptionFields
-          available={globalProfileCapabilities?.options || []}
-          options={globalProfileOptions}
-          switchOptions={globalProfileCapabilities?.switch_options || []}
-          previewTitle="Global default arguments"
-          onChange={setGlobalProfileOptions}
-          gpuDevices={gpuDevices}
-        />
-        <button
-          className="primary"
-          disabled={!globalProfileCapabilities}
-          onClick={onSaveGlobalDefaults}
-        >
-          Save global defaults
-        </button>
+        {globalProfileCapabilities && primaryOptions.length > 0 && (
+          <div className="settings-primary-options">
+            <h4>Common settings</h4>
+            <ProfileOptionFields
+              available={primaryOptions}
+              options={globalProfileOptions}
+              switchOptions={globalProfileCapabilities.switch_options || []}
+              previewTitle="Emulator launch arguments"
+              onChange={setGlobalProfileOptions}
+              gpuDevices={gpuDevices}
+              showUnavailable={false}
+            />
+          </div>
+        )}
+        {globalProfileCapabilities && additionalOptions.length > 0 && (
+          <details className="settings-additional-options">
+            <summary>More options reported by this build ({additionalOptions.length})</summary>
+            <p className="hint">These options come from the selected emulator’s command-line help.</p>
+            <ProfileOptionFields
+              available={additionalOptions}
+              options={globalProfileOptions}
+              switchOptions={globalProfileCapabilities.switch_options || []}
+              previewTitle="Emulator launch arguments"
+              onChange={setGlobalProfileOptions}
+              gpuDevices={gpuDevices}
+              showUnavailable={false}
+            />
+          </details>
+        )}
+        {globalProfileCapabilities && reportedOptions.length === 0 && (
+          <div className="settings-empty-options">
+            <strong>No configurable options reported</strong>
+            <span>This build does not advertise any settings Studio can edit.</span>
+          </div>
+        )}
+        <div className="settings-save-row">
+          <span>{selectedBuild ? "Changes apply to games assigned to this build." : "Select an installed build to edit its settings."}</span>
+          <button
+            className="primary"
+            disabled={!globalProfileCapabilities || !selectedBuildId || busy}
+            onClick={onSaveGlobalDefaults}
+          >
+            {busy ? "Saving…" : "Save settings"}
+          </button>
+        </div>
       </div>
       <div className="sectionhead">
         <div>

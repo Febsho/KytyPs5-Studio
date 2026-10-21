@@ -7,6 +7,7 @@ import type {
   System,
 } from "../types/studio";
 import { date } from "../utils/format";
+import { analyzeEmulatorLog, buildCrashReport } from "../utils/crashAnalyzer";
 
 export type DiagnosticsPageProps = {
   system: System | null;
@@ -21,18 +22,9 @@ export type DiagnosticsPageProps = {
   >;
   onSelectSessionLog: (session: Session) => void;
   onExportLog: () => void;
+  onExportCrashReport: (report: string) => void;
   onCopyLog?: () => void;
 };
-
-function logDiagnosis(log: string) {
-  if (/Unhandled host exception/i.test(log))
-    return "The emulator exited after an unhandled host exception. The log contains guest fault context; it does not establish whether the game is playable or identify one definitive cause.";
-  if (/Unresolved import stub called/i.test(log))
-    return "The emulator reported unresolved import stubs. Their role in this session outcome is unknown.";
-  if (/error while loading shared libraries|undefined symbol/i.test(log))
-    return "The emulator reported a host library loading or symbol error. Review the technical log below.";
-  return null;
-}
 
 function logLineLevel(line: string): "Info" | "Warning" | "Error" | "Debug" {
   if (/\b(debug|trace)\b/i.test(line)) return "Debug";
@@ -53,8 +45,18 @@ export function DiagnosticsPage({
   setLogFilter,
   onSelectSessionLog,
   onExportLog,
+  onExportCrashReport,
   onCopyLog,
 }: DiagnosticsPageProps) {
+  const selectedSession = sessions.find((session) => session.log_path === selectedLogPath);
+  const findings = selectedLog ? analyzeEmulatorLog(selectedLog) : [];
+  const crashReport = selectedSession
+    ? buildCrashReport(selectedLog, {
+        game: selectedSession.title,
+        build: `${selectedSession.build_type} · ${selectedSession.commit_sha}`,
+        startedAt: date(selectedSession.started_at),
+      })
+    : "";
   return (
     <section className="page">
       <div className="sectionhead">
@@ -215,7 +217,37 @@ export function DiagnosticsPage({
                   <option>All</option><option>Info</option><option>Warning</option><option>Error</option><option>Debug</option>
                 </select>
               </div>
-              {logDiagnosis(selectedLog) && <p className="diagnosis-note">{logDiagnosis(selectedLog)}</p>}
+              <div className="crash-analyzer">
+                <div className="crash-analyzer-heading">
+                  <div>
+                    <h4>Smart Crash Analyzer</h4>
+                    <p>Log signatures are grouped as investigation hints; they do not confirm a root cause.</p>
+                  </div>
+                  <button
+                    className="outline"
+                    disabled={!crashReport}
+                    onClick={() => onExportCrashReport(crashReport)}
+                  >
+                    Export GitHub report
+                  </button>
+                </div>
+                {findings.length ? (
+                  <div className="crash-finding-list">
+                    {findings.map((finding) => (
+                      <article className="crash-finding" key={finding.id}>
+                        <strong>{finding.title}</strong>
+                        <p>{finding.summary}</p>
+                        <small>{finding.nextStep}</small>
+                        <ul>
+                          {finding.evidence.map((line, index) => <li key={`${finding.id}-${index}`}><code>{line}</code></li>)}
+                        </ul>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="hint">No known failure signature matched this log. The cause is undetermined.</p>
+                )}
+              </div>
               <pre>{selectedLog.split("\n").filter((line) => logFilter === "All" || logLineLevel(line) === logFilter).join("\n") || `No ${logFilter.toLowerCase()} lines in this log.`}</pre>
             </div>}
             </div>

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0
+
+### Build comparison and sessions
+
+- Added a per-game build comparison based on recorded emulator sessions, including launch outcome, exit code, duration, and log access. FPS, frame times, and game phase are shown only when actually recorded.
+- Added an A/B launch flow that runs the same game with two installed builds and shared settings, and stops when the builds cannot accept the same options.
+- Improved session history and made it easier to inspect the logs associated with a build run.
+
+### Crash diagnostics
+
+- Added Smart Crash Analyzer log grouping for common import, Vulkan, shader, memory, and configuration errors.
+- Added actionable diagnostic hints and export of a Markdown report for GitHub issues.
+
+### Emulator settings
+
+- Settings now target a selected installed emulator build and show only options reported by that build.
+- Put common graphics options first and collapsed the remaining reported options by default.
+- Removed Studio-created resolution presets and fixed option selectors so they do not offer values the emulator has not reported.
+
 ## 0.6.0
 
 ### Games and Steam

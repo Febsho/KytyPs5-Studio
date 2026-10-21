@@ -45,7 +45,7 @@ export function EmulatorManagerPage({
   const toggleComparison = (id: number) => {
     setCompareIds((selected) => {
       if (selected.includes(id)) return selected.filter((value) => value !== id);
-      return selected.length < 2 ? [...selected, id] : [selected[1], id];
+      return selected.length < 4 ? [...selected, id] : [...selected.slice(1), id];
     });
   };
   const details = [
@@ -211,11 +211,11 @@ export function EmulatorManagerPage({
           <div className="sectionhead">
             <div>
               <h3>Build comparison</h3>
-              <p>{comparison.length === 1 ? "Choose another build to compare its source, configuration, and validation." : "Build metadata and recorded configuration."}</p>
+              <p>{comparison.length === 1 ? "Choose up to three more builds to compare their source, configuration, and validation." : "Build metadata and recorded configuration for the selected builds."}</p>
             </div>
             <button className="outline" onClick={() => setCompareIds([])}>Clear comparison</button>
           </div>
-          {comparison.length === 2 && (
+          {comparison.length >= 2 && (
             <div className="table-wrap">
               <table>
                 <thead>

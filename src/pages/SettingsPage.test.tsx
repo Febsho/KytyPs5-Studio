@@ -25,6 +25,10 @@ const capabilities: ProfileCapabilities = {
 
 function props(overrides: Partial<SettingsPageProps> = {}): SettingsPageProps {
   return {
+    builds: [],
+    repos: [],
+    selectedBuildId: null,
+    onSelectedBuildChange: vi.fn(),
     globalProfileCapabilities: capabilities,
     globalProfileOptions: { "--screen-width": "1920", "--hdr": "true" },
     setGlobalProfileOptions: vi.fn(),

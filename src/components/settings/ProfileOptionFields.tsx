@@ -273,6 +273,7 @@ type Props = {
   inheritedOptions?: Record<string, string>;
   switchOptions?: string[];
   previewTitle?: string;
+  showUnavailable?: boolean;
 };
 
 export function ProfileOptionFields({
@@ -283,6 +284,7 @@ export function ProfileOptionFields({
   inheritedOptions = {},
   switchOptions = [],
   previewTitle = "CLI argument preview",
+  showUnavailable = true,
 }: Props) {
   const update = (flag: string, value: string) => {
     const next = { ...options };
@@ -298,58 +300,8 @@ export function ProfileOptionFields({
             (flag) => (cliOptionInfo[flag]?.group ?? "Advanced") === group,
           );
           if (!fields.length) return null;
-          const width =
-            options["--screen-width"] ??
-            inheritedOptions["--screen-width"] ??
-            "";
-          const height =
-            options["--screen-height"] ??
-            inheritedOptions["--screen-height"] ??
-            "";
-          const presets: Record<string, [string, string]> = {
-            "1280×720": ["1280", "720"],
-            "1600×900": ["1600", "900"],
-            "1920×1080": ["1920", "1080"],
-            "2560×1440": ["2560", "1440"],
-          };
-          const selectedPreset =
-            Object.entries(presets).find(
-              ([, size]) => size[0] === width && size[1] === height,
-            )?.[0] ?? (width || height ? "custom" : "");
           const body = (
             <>
-              {group === "Graphics" &&
-                fields.some(
-                  (flag) =>
-                    flag === "--screen-width" || flag === "--screen-height",
-                ) && (
-                  <div className="formgrid">
-                    <div className="wide">
-                      <label>Resolution preset</label>
-                      <select
-                        aria-label="Resolution preset"
-                        value={selectedPreset}
-                        onChange={(event) => {
-                          const size = presets[event.target.value];
-                          const next = { ...options };
-                          if (size && available.includes("--screen-width"))
-                            next["--screen-width"] = size[0];
-                          else delete next["--screen-width"];
-                          if (size && available.includes("--screen-height"))
-                            next["--screen-height"] = size[1];
-                          else delete next["--screen-height"];
-                          onChange(next);
-                        }}
-                      >
-                        <option value="">Emulator default</option>
-                        {Object.keys(presets).map((preset) => (
-                          <option key={preset}>{preset}</option>
-                        ))}
-                        <option value="custom">Custom resolution</option>
-                      </select>
-                    </div>
-                  </div>
-                )}
               <div className="formgrid">
                 {fields.map((flag) => {
                   const info =
@@ -383,16 +335,6 @@ export function ProfileOptionFields({
                           />
                           Enabled
                         </label>
-                      ) : info.kind === "enum" ? (
-                        <select
-                          value={value}
-                          onChange={(event) => set(event.target.value)}
-                        >
-                          <option value="">Emulator default</option>
-                          {info.choices?.map((choice) => (
-                            <option key={choice}>{choice}</option>
-                          ))}
-                        </select>
                       ) : info.kind === "color" ? (
                         <input
                           type="color"
@@ -500,6 +442,7 @@ export function ProfileOptionFields({
                       ) : (
                         <div className="buttonrow">
                           <input
+                            aria-label={info.label}
                             type={info.kind === "number" ? "number" : "text"}
                             min={
                               flag === "--user-id"
@@ -583,7 +526,7 @@ export function ProfileOptionFields({
           );
         },
       )}
-      {Object.entries(cliOptionInfo).some(([flag]) => !available.includes(flag)) && (
+      {showUnavailable && Object.entries(cliOptionInfo).some(([flag]) => !available.includes(flag)) && (
         <details className="unsupported-profile-options">
           <summary>
             Unavailable options ({Object.keys(cliOptionInfo).filter((flag) => !available.includes(flag)).length})

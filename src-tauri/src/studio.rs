@@ -669,6 +669,22 @@ fn migrate(db: &mut Connection) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
     }
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version < 19 {
+        let tx = db.transaction().map_err(|e| e.to_string())?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS build_profile_defaults(build_id INTEGER PRIMARY KEY REFERENCES builds(id) ON DELETE CASCADE, options_json TEXT NOT NULL DEFAULT '{}');
+             INSERT OR IGNORE INTO build_profile_defaults(build_id, options_json)
+             SELECT id, (SELECT options_json FROM global_profile_defaults WHERE id=1)
+             FROM builds WHERE active=1 AND EXISTS(SELECT 1 FROM global_profile_defaults WHERE id=1);",
+        )
+        .map_err(|e| e.to_string())?;
+        tx.pragma_update(None, "user_version", 19)
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 #[derive(Serialize)]
@@ -1093,6 +1109,22 @@ fn global_profile_options(c: &Connection) -> Result<BTreeMap<String, String>, St
         )
         .map_err(|e| e.to_string())?;
     Ok(serde_json::from_str(&json).unwrap_or_default())
+}
+fn build_profile_options(
+    c: &Connection,
+    build_id: i64,
+) -> Result<BTreeMap<String, String>, String> {
+    let json = c
+        .query_row(
+            "SELECT options_json FROM build_profile_defaults WHERE build_id=?",
+            [build_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    Ok(json
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default())
 }
 fn validate_extra_profile_options(
     options: &BTreeMap<String, String>,
@@ -3814,7 +3846,7 @@ fn patch_configuration_for_game(
     game_id: i64,
     build: &Build,
 ) -> Result<String, String> {
-    let mut options = global_profile_options(c)?;
+    let mut options = build_profile_options(c, build.id)?;
     for (flag, value) in profile(c, game_id)?.options {
         options.insert(flag, value);
     }
@@ -8640,7 +8672,11 @@ fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_jso
     let selected = game(&c, game_id)?;
     let selected_build = build_for_game(&c, game_id).ok();
     let game_options = profile(&c, game_id)?.options;
-    let global_options = global_profile_options(&c)?;
+    let global_options = selected_build
+        .as_ref()
+        .map(|build| build_profile_options(&c, build.id))
+        .transpose()?
+        .unwrap_or_default();
     let user_id = game_options
         .get("--user-id")
         .or_else(|| global_options.get("--user-id"))
@@ -9143,6 +9179,23 @@ fn get_active_profile_capabilities(app: tauri::AppHandle) -> Result<ProfileCapab
     capabilities_for_build(&build(&c, id)?)
 }
 #[tauri::command]
+fn get_build_profile_capabilities(
+    app: tauri::AppHandle,
+    build_id: i64,
+) -> Result<ProfileCapabilities, String> {
+    let c = db(&app)?;
+    capabilities_for_build(&build(&c, build_id)?)
+}
+#[tauri::command]
+fn get_build_profile_options(
+    app: tauri::AppHandle,
+    build_id: i64,
+) -> Result<BTreeMap<String, String>, String> {
+    let c = db(&app)?;
+    build(&c, build_id)?;
+    build_profile_options(&c, build_id)
+}
+#[tauri::command]
 fn set_global_profile_options(
     app: tauri::AppHandle,
     mut options: BTreeMap<String, String>,
@@ -9172,6 +9225,37 @@ fn set_global_profile_options(
     }
     let json = serde_json::to_string(&options).map_err(|e| e.to_string())?;
     c.execute("INSERT INTO global_profile_defaults(id,options_json) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET options_json=excluded.options_json", [json]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+#[tauri::command]
+fn set_build_profile_options(
+    app: tauri::AppHandle,
+    build_id: i64,
+    mut options: BTreeMap<String, String>,
+) -> Result<(), String> {
+    let c = db(&app)?;
+    let selected_build = build(&c, build_id)?;
+    let capabilities = capabilities_for_build(&selected_build)?;
+    validate_extra_profile_options(&options, &capabilities)?;
+    for (flag, value) in &mut options {
+        if [
+            "--game-patch",
+            "--printf-output-file",
+            "--addcont-dir",
+            "--shader-log-folder",
+            "--command-buffer-dump-folder",
+        ]
+        .contains(&flag.as_str())
+        {
+            *value = canonicalize_option_path(flag, value)?;
+        }
+    }
+    let json = serde_json::to_string(&options).map_err(|error| error.to_string())?;
+    c.execute(
+        "INSERT INTO build_profile_defaults(build_id,options_json) VALUES(?,?) ON CONFLICT(build_id) DO UPDATE SET options_json=excluded.options_json",
+        params![build_id, json],
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 fn validate_profile_values(profile: &Profile) -> Result<(), String> {
@@ -9442,6 +9526,23 @@ fn add_game_to_steam(app: tauri::AppHandle, game_id: i64, build_id: i64) -> Resu
 
 #[tauri::command]
 fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
+    launch_game_impl(app, game_id, None, None)
+}
+#[tauri::command]
+fn launch_game_ab(
+    app: tauri::AppHandle,
+    game_id: i64,
+    build_id: i64,
+    settings_build_id: i64,
+) -> Result<(), String> {
+    launch_game_impl(app, game_id, Some(build_id), Some(settings_build_id))
+}
+fn launch_game_impl(
+    app: tauri::AppHandle,
+    game_id: i64,
+    requested_build_id: Option<i64>,
+    settings_build_id: Option<i64>,
+) -> Result<(), String> {
     let _session_lifecycle = SESSION_LIFECYCLE_LOCK
         .lock()
         .map_err(|error| error.to_string())?;
@@ -9451,7 +9552,9 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
     let mut c = db(&app)?;
     let g = game(&c, game_id)?;
     let game_profile = profile(&c, game_id)?;
-    let build_id = if let Some(id) = g.build_id {
+    let build_id = if let Some(id) = requested_build_id {
+        id
+    } else if let Some(id) = g.build_id {
         id
     } else {
         c.query_row("SELECT id FROM builds WHERE active=1 LIMIT 1", [], |r| {
@@ -9461,11 +9564,30 @@ fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
     };
     let b = build(&c, build_id)?;
     let capabilities = capabilities_for_build(&b)?;
-    let mut effective_options = effective_profile_options(
-        &global_profile_options(&c)?,
-        &game_profile.options,
-        &capabilities,
-    )?;
+    let settings_build_id = settings_build_id.unwrap_or(build_id);
+    let settings_defaults = build_profile_options(&c, settings_build_id)?;
+    let mut effective_options = if settings_build_id == build_id {
+        effective_profile_options(&settings_defaults, &game_profile.options, &capabilities)?
+    } else {
+        let settings_capabilities = capabilities_for_build(&build(&c, settings_build_id)?)?;
+        let shared = effective_profile_options(
+            &settings_defaults,
+            &game_profile.options,
+            &settings_capabilities,
+        )?;
+        if let Some(unsupported) = shared.keys().find(|flag| {
+            !capabilities
+                .options
+                .iter()
+                .any(|supported| supported == *flag)
+        }) {
+            return Err(format!(
+                "A/B test stopped: the target build does not support {unsupported}, so both builds cannot use identical settings"
+            ));
+        }
+        validate_extra_profile_options(&shared, &capabilities)?;
+        shared
+    };
     for (flag, value) in &mut effective_options {
         if [
             "--game-patch",
@@ -9942,6 +10064,34 @@ fn recent_sessions(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, Stri
     rows.map(|r| r.map_err(|e| e.to_string())).collect()
 }
 #[tauri::command]
+fn game_sessions(app: tauri::AppHandle, game_id: i64) -> Result<Vec<serde_json::Value>, String> {
+    let c = db(&app)?;
+    game(&c, game_id)?;
+    let mut statement = c
+        .prepare("SELECT sessions.id,sessions.game_id,sessions.build_id,games.title,sessions.started_at,sessions.ended_at,sessions.exit_code,sessions.outcome,sessions.log_path,builds.commit_sha,builds.build_type,sessions.process_pid FROM sessions JOIN games ON games.id=sessions.game_id JOIN builds ON builds.id=sessions.build_id WHERE sessions.game_id=? ORDER BY sessions.id DESC LIMIT 1000")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([game_id], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, i64>(0)?,
+                "game_id": row.get::<_, i64>(1)?,
+                "build_id": row.get::<_, i64>(2)?,
+                "title": row.get::<_, String>(3)?,
+                "started_at": row.get::<_, i64>(4)?,
+                "ended_at": row.get::<_, Option<i64>>(5)?,
+                "exit_code": row.get::<_, Option<i32>>(6)?,
+                "outcome": row.get::<_, Option<String>>(7)?,
+                "log_path": row.get::<_, String>(8)?,
+                "commit_sha": row.get::<_, String>(9)?,
+                "build_type": row.get::<_, String>(10)?,
+                "pid": row.get::<_, Option<i64>>(11)?
+            }))
+        })
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| row.map_err(|error| error.to_string()))
+        .collect()
+}
+#[tauri::command]
 fn read_log(path: String, app: tauri::AppHandle) -> Result<String, String> {
     let base = fs::canonicalize(state_paths(&app)?.data.join("logs"))
         .map_err(|e| format!("Managed log directory is unavailable: {e}"))?;
@@ -9960,6 +10110,52 @@ fn export_log(path: String, destination: String, app: tauri::AppHandle) -> Resul
         return Err("Log path is outside the managed log directory".into());
     }
     copy_file_atomically(&source, Path::new(&destination), 512 * 1024 * 1024)
+}
+#[tauri::command]
+fn export_crash_report(destination: String, content: String) -> Result<(), String> {
+    const REPORT_LIMIT: usize = 2 * 1024 * 1024;
+    if content.len() > REPORT_LIMIT {
+        return Err("Crash report is larger than 2 MiB".into());
+    }
+    let destination = Path::new(&destination);
+    let name = destination.file_name().ok_or("Choose a report file name")?;
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = fs::canonicalize(parent)
+        .map_err(|error| format!("Report folder is unavailable: {error}"))?;
+    if !parent.is_dir() {
+        return Err("Report destination is not a folder".into());
+    }
+    let destination = parent.join(name);
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        nonce
+    ));
+    let result = (|| -> Result<(), String> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        file.write_all(content.as_bytes())
+            .map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        drop(file);
+        replace_file(&temporary, &destination)
+            .map_err(|error| format!("Could not finalize crash report: {error}"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 fn copy_file_atomically(source: &Path, destination: &Path, limit: u64) -> Result<(), String> {
     let source_size = fs::metadata(source)
@@ -10689,13 +10885,19 @@ pub fn run() {
             get_global_profile_options,
             get_active_profile_capabilities,
             set_global_profile_options,
+            get_build_profile_capabilities,
+            get_build_profile_options,
+            set_build_profile_options,
             add_game_to_steam,
             launch_game,
+            launch_game_ab,
             process_metrics,
             stop_game_session,
             recent_sessions,
+            game_sessions,
             read_log,
             export_log,
+            export_crash_report,
             read_build_log,
             get_setting,
             set_setting,

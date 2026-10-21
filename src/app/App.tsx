@@ -253,6 +253,9 @@ export function App() {
   >({});
   const [globalProfileCapabilities, setGlobalProfileCapabilities] =
     useState<ProfileCapabilities | null>(null);
+  const [globalProfileBuildId, setGlobalProfileBuildId] = useState<number | null>(null);
+  const [gameProfileGlobalOptions, setGameProfileGlobalOptions] = useState<Record<string, string>>({});
+  const [gameSessionHistory, setGameSessionHistory] = useState<Session[]>([]);
   const [gameIcon, setGameIcon] = useState<string | null>(null);
   const [gameLogo, setGameLogo] = useState<string | null>(null);
   const [gameBackground, setGameBackground] = useState<string | null>(null);
@@ -379,6 +382,17 @@ export function App() {
     });
     if (destination)
       await call("export_log", { path: selectedLogPath, destination });
+  };
+  const exportCrashReport = async (content: string) => {
+    const destination = await save({
+      defaultPath: "kytyps5-crash-report.md",
+      filters: [{ name: "Markdown report", extensions: ["md"] }],
+    });
+    if (!destination) return;
+    await action(async () => {
+      await call("export_crash_report", { destination, content });
+      setMessage("Crash analysis report exported");
+    });
   };
   const inspectGameContent = useCallback(
     (gameId: number) => call<GameContent>("inspect_game_content", { gameId }),
@@ -1202,6 +1216,7 @@ export function App() {
     try {
       const recent = await call<Session[]>("recent_sessions");
       setSessions(recent);
+      setGameSessionHistory(await call<Session[]>("game_sessions", { gameId }));
       const launched = recent.find(
         (session) => session.game_id === gameId && session.id > previousId,
       );
@@ -1209,6 +1224,31 @@ export function App() {
       await refreshData();
     } catch (error) {
       setMessage(`Could not refresh launcher session: ${String(error)}`);
+    }
+  };
+  const launchGameAB = async (gameId: number, buildId: number, settingsBuildId: number) => {
+    if (appUpdateBusy) {
+      setMessage("Wait for the Studio update to finish before launching a game.");
+      return;
+    }
+    if (gameRunning || sessions.some((session) => session.ended_at === null)) {
+      setMessage("Close the active emulator session before starting the next A/B run.");
+      return;
+    }
+    const previousId = sessions.reduce((latest, session) => Math.max(latest, session.id), 0);
+    setMessage("");
+    setLauncherDismissed(false);
+    try {
+      await call("launch_game_ab", { gameId, buildId, settingsBuildId });
+      refreshProcessMetricsNow();
+      const recent = await call<Session[]>("recent_sessions");
+      setSessions(recent);
+      setGameSessionHistory(await call<Session[]>("game_sessions", { gameId }));
+      const launched = recent.find((session) => session.game_id === gameId && session.id > previousId);
+      if (launched) setLauncherSessionId(launched.id);
+      await refreshData();
+    } catch (error) {
+      setMessage(String(error));
     }
   };
   const addGameToSteam = async (game: Game) => {
@@ -1712,22 +1752,26 @@ export function App() {
     };
   }, [launcherSession?.log_path]);
   useEffect(() => {
-    let alive = true;
-    invoke<Record<string, string>>("get_global_profile_options")
-      .then((options) => {
-        if (alive) setGlobalProfileOptions(options);
-      })
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, []);
+    if (page !== "settings") return;
+    setGlobalProfileBuildId((current) =>
+      current !== null && builds.some((build) => build.id === current)
+        ? current
+        : (builds.find((build) => build.active) ?? builds[0])?.id ?? null,
+    );
+  }, [page, builds]);
   useEffect(() => {
     if (page !== "settings") return;
     let alive = true;
+    if (globalProfileBuildId === null) {
+      setGlobalProfileOptions({});
+      setGlobalProfileCapabilities(null);
+      return () => { alive = false; };
+    }
+    setGlobalProfileOptions({});
+    setGlobalProfileCapabilities(null);
     Promise.all([
-      call<Record<string, string>>("get_global_profile_options"),
-      call<ProfileCapabilities>("get_active_profile_capabilities"),
+      call<Record<string, string>>("get_build_profile_options", { buildId: globalProfileBuildId }),
+      call<ProfileCapabilities>("get_build_profile_capabilities", { buildId: globalProfileBuildId }),
     ])
       .then(([options, caps]) => {
         if (alive) {
@@ -1739,7 +1783,27 @@ export function App() {
     return () => {
       alive = false;
     };
-  }, [page, active?.id]);
+  }, [page, globalProfileBuildId]);
+  useEffect(() => {
+    let alive = true;
+    const buildId = currentGame?.build_id ?? active?.id;
+    if (buildId === undefined || buildId === null) {
+      setGameProfileGlobalOptions({});
+      return () => { alive = false; };
+    }
+    call<Record<string, string>>("get_build_profile_options", { buildId })
+      .then((options) => { if (alive) setGameProfileGlobalOptions(options); })
+      .catch(() => { if (alive) setGameProfileGlobalOptions({}); });
+    return () => { alive = false; };
+  }, [currentGame?.build_id, currentGame?.id, active?.id]);
+  useEffect(() => {
+    if (page !== "game-details" || !currentGame) return;
+    let alive = true;
+    call<Session[]>("game_sessions", { gameId: currentGame.id })
+      .then((history) => { if (alive) setGameSessionHistory(history); })
+      .catch(() => { if (alive) setGameSessionHistory([]); });
+    return () => { alive = false; };
+  }, [page, currentGame?.id]);
   const copyProfileFromGame = async (sourceGameId: number) => {
     if (
       profileDirty &&
@@ -1763,7 +1827,7 @@ export function App() {
       profile={profile}
       setProfile={setProfile}
       capabilities={profileCapabilities}
-      globalOptions={globalProfileOptions}
+      globalOptions={gameProfileGlobalOptions}
       gpuDevices={vulkanGpus}
       sourceGameId={profileCopySource}
       setSourceGameId={setProfileCopySource}
@@ -2511,6 +2575,7 @@ export function App() {
                 })
               }
               onExportLog={() => action(exportSelectedLog)}
+              onExportCrashReport={(report) => void exportCrashReport(report)}
               onCopyLog={() => void copyToClipboard(selectedLog)}
             />
           )}
@@ -2534,9 +2599,13 @@ export function App() {
               manualNotes={manualNotes}
               setManualNotes={setManualNotes}
               compatibilityObservations={compatibilityObservations}
-              sessions={sessions}
+              sessions={gameSessionHistory}
               onBack={() => setPage("library")}
               onLaunch={(gameId) => void launchGame(gameId)}
+              onLaunchBuildAB={(gameId, buildId, settingsBuildId) =>
+                launchGameAB(gameId, buildId, settingsBuildId)
+              }
+              activeSessions={gameRunning || sessions.some((session) => session.ended_at === null)}
               onAddToSteam={addGameToSteam}
               onOpenGameFolder={() =>
                 action(() =>
@@ -2630,6 +2699,14 @@ export function App() {
           )}
           {page === "settings" && (
             <SettingsPage
+              builds={builds}
+              repos={repos}
+              selectedBuildId={globalProfileBuildId}
+              onSelectedBuildChange={(buildId) => {
+                setGlobalProfileOptions({});
+                setGlobalProfileCapabilities(null);
+                setGlobalProfileBuildId(buildId);
+              }}
               globalProfileCapabilities={globalProfileCapabilities}
               globalProfileOptions={globalProfileOptions}
               setGlobalProfileOptions={setGlobalProfileOptions}
@@ -2652,10 +2729,15 @@ export function App() {
               onInstallAppUpdate={installAppUpdate}
               onSaveGlobalDefaults={() =>
                 action(async () => {
-                  await call("set_global_profile_options", {
+                  if (globalProfileBuildId === null) throw new Error("Select an installed emulator build first");
+                  await call("set_build_profile_options", {
+                    buildId: globalProfileBuildId,
                     options: globalProfileOptions,
                   });
-                  setMessage("Global emulator defaults saved");
+                  if ((currentGame?.build_id ?? active?.id) === globalProfileBuildId) {
+                    setGameProfileGlobalOptions(globalProfileOptions);
+                  }
+                  setMessage("Emulator settings saved for the selected build");
                 })
               }
               onSaveGithubToken={(token) =>

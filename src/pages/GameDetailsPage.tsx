@@ -40,6 +40,8 @@ export type GameDetailsPageProps = {
   sessions: Session[];
   onBack: () => void;
   onLaunch: (gameId: number) => void;
+  onLaunchBuildAB?: (gameId: number, buildId: number, settingsBuildId: number) => void | Promise<void>;
+  activeSessions?: boolean;
   onAddToSteam?: (game: Game) => void;
   onOpenGameFolder: () => void;
   onRefreshMetadata: () => void;
@@ -79,6 +81,8 @@ export function GameDetailsPage({
   sessions,
   onBack,
   onLaunch,
+  onLaunchBuildAB,
+  activeSessions = false,
   onAddToSteam,
   onOpenGameFolder,
   onRefreshMetadata,
@@ -106,6 +110,15 @@ export function GameDetailsPage({
   const [customPatchError, setCustomPatchError] = useState("");
   const [customPatchBusy, setCustomPatchBusy] = useState(false);
   const [customPatchPath, setCustomPatchPath] = useState("");
+  const [abSettingsBuildId, setAbSettingsBuildId] = useState<number | null>(
+    currentGame.build_id ?? builds.find((build) => build.active)?.id ?? builds[0]?.id ?? null,
+  );
+  const [abLaunchingBuildId, setAbLaunchingBuildId] = useState<number | null>(null);
+  useEffect(() => {
+    setAbSettingsBuildId(
+      currentGame.build_id ?? builds.find((build) => build.active)?.id ?? builds[0]?.id ?? null,
+    );
+  }, [currentGame.id, currentGame.build_id, builds]);
   useEffect(() => {
     setCustomPatchDraft(JSON.stringify({
       id: currentGame.title_id || "TITLE_ID_REQUIRED",
@@ -409,6 +422,85 @@ export function GameDetailsPage({
       </div>}
       {gameDetailsTab === "Compatibility" && (
         <div className="panel compatibility-panel">
+          <section className="build-comparison-2">
+            <div className="sectionhead">
+              <div>
+                <span className="eyebrow">LOCAL SESSION EVIDENCE</span>
+                <h2>Build comparison</h2>
+                <p>Compare observed results for this game across installed builds. No phase or performance value is inferred.</p>
+              </div>
+            </div>
+            {builds.length > 1 ? (
+              <>
+                <div className="ab-test-controls">
+                  <label>
+                    Shared settings from
+                    <select
+                      aria-label="A/B test shared settings build"
+                      value={abSettingsBuildId ?? ""}
+                      onChange={(event) => setAbSettingsBuildId(event.target.value ? Number(event.target.value) : null)}
+                    >
+                      {builds.map((build) => {
+                        const repo = repos.find((item) => item.id === build.repo_id);
+                        return <option key={build.id} value={build.id}>
+                          {repo ? `${repo.owner}/${repo.name}` : "Unknown repository"} · {build.build_type} · {short(build.commit_sha)}
+                        </option>;
+                      })}
+                    </select>
+                  </label>
+                  <p className="hint">Each start uses this build’s saved defaults plus the game profile. Studio stops the test if the target build cannot accept the same options. Close the current session before starting the next run.</p>
+                </div>
+                <div className="comparison-table-wrap">
+                  <table className="comparison-table build-results-table">
+                    <thead><tr><th>Build</th><th>Attempts</th><th>Process started</th><th>Crashes</th><th>Non-zero exits</th><th>Reached phase</th><th>FPS</th><th>Frame time</th><th>A/B test</th></tr></thead>
+                    <tbody>
+                      {builds.map((build) => {
+                        const repo = repos.find((item) => item.id === build.repo_id);
+                        const runs = sessions.filter((session) => session.game_id === currentGame.id && session.build_id === build.id);
+                        const crashes = runs.filter((session) => session.outcome === "crash").length;
+                        const nonZeroExits = runs.filter((session) => session.outcome === "error" || (session.exit_code !== null && session.exit_code !== 0)).length;
+                        const observation = compatibilityObservations.find((item) => item.build_id === build.id);
+                        const phase = observation?.outcome.replaceAll("_", " ") || "Not recorded";
+                        return (
+                          <tr key={build.id}>
+                            <th scope="row">
+                              <strong>{repo ? `${repo.owner}/${repo.name}` : "Unknown repository"}</strong>
+                              <small>{build.build_type} · {short(build.commit_sha)}{build.active ? " · Active" : ""}</small>
+                            </th>
+                            <td>{runs.length}</td>
+                            <td>{runs.filter((session) => session.pid !== null).length} / {runs.length || 0}</td>
+                            <td>{crashes}</td>
+                            <td>{nonZeroExits}</td>
+                            <td>{phase}</td>
+                            <td>Not collected</td>
+                            <td>Not collected</td>
+                            <td>
+                              <button
+                                className="outline"
+                                disabled={activeSessions || abLaunchingBuildId !== null || !onLaunchBuildAB || abSettingsBuildId === null || !build.executable_status.startsWith("Executable")}
+                                title={activeSessions ? "Close the current emulator session first" : "Run this build using the shared settings snapshot"}
+                                onClick={() => {
+                                  if (!onLaunchBuildAB || abSettingsBuildId === null) return;
+                                  setAbLaunchingBuildId(build.id);
+                                  void Promise.resolve(onLaunchBuildAB(currentGame.id, build.id, abSettingsBuildId))
+                                    .finally(() => setAbLaunchingBuildId(null));
+                                }}
+                              >
+                                {abLaunchingBuildId === build.id ? "Starting…" : "Run this build"}
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <small className="hint">FPS and frame times are unavailable because the current emulator telemetry does not report them. Phase values come only from saved manual observations.</small>
+              </>
+            ) : (
+              <p className="hint">Install at least two emulator builds to compare or run an A/B test.</p>
+            )}
+          </section>
           <section className="official-compatibility-section">
             <div className="official-compatibility-heading">
               <div>

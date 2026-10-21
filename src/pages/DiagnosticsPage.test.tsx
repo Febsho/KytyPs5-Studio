@@ -18,6 +18,7 @@ function props(
     setLogFilter: vi.fn(),
     onSelectSessionLog: vi.fn(),
     onExportLog: vi.fn(),
+    onExportCrashReport: vi.fn(),
     ...overrides,
   };
 }

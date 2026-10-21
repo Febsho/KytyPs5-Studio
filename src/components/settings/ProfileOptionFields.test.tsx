@@ -139,13 +139,15 @@ describe('ProfileOptionFields', () => {
     expect(onChange).toHaveBeenLastCalledWith({ '--keymap': 'Circle=J' });
   });
 
-  it('offers resolution presets and inherited controls for the selected build', () => {
+  it('edits only reported resolution fields and preserves inherited controls', () => {
     const onChange = vi.fn();
     render(<ProfileOptionFields available={['--screen-width', '--screen-height', '--perf-overlay', '--fullscreen', '--controller-volume']} options={{}} inheritedOptions={{ '--screen-width': '1920', '--screen-height': '1080', '--perf-overlay': 'true' }} onChange={onChange} />);
-    expect(screen.getByRole('combobox', { name: 'Resolution preset' })).toHaveProperty('value', '1920×1080');
+    expect(screen.queryByLabelText('Resolution preset')).toBeNull();
+    expect((screen.getByRole('spinbutton', { name: 'Screen width' }) as HTMLInputElement).value).toBe('1920');
+    expect((screen.getByRole('spinbutton', { name: 'Screen height' }) as HTMLInputElement).value).toBe('1080');
     expect((screen.getAllByRole('checkbox', { name: 'Enabled' })[0] as HTMLInputElement).checked).toBe(true);
-    fireEvent.change(screen.getByRole('combobox', { name: 'Resolution preset' }), { target: { value: '2560×1440' } });
-    expect(onChange).toHaveBeenCalledWith({ '--screen-width': '2560', '--screen-height': '1440' });
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Screen width' }), { target: { value: '2560' } });
+    expect(onChange).toHaveBeenCalledWith({ '--screen-width': '2560' });
     expect(screen.getByText('Controls')).toBeTruthy();
   });
 

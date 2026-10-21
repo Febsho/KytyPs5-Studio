@@ -3240,6 +3240,128 @@ select:disabled {
   line-height: 1.55;
   color: var(--studio-muted);
 }
+
+.settings-emulator-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 16px;
+}
+
+.settings-emulator-heading > div { min-width: 220px; }
+.settings-emulator-heading h3 { margin-bottom: 6px; }
+.settings-emulator-heading p { margin: 0; color: var(--studio-muted); }
+.settings-emulator-heading label { display: grid; gap: 6px; width: min(100%, 440px); }
+.settings-emulator-heading select { width: 100%; }
+.settings-emulator-panel { display: grid; gap: 14px; }
+.settings-emulator-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 10px 12px;
+  margin: 0 0 12px;
+  border: 1px solid var(--studio-border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--studio-surface-raised) 70%, transparent);
+}
+.settings-emulator-summary span { color: var(--studio-muted); font-size: 0.9em; }
+.settings-build-caption {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 6px 14px;
+  color: var(--studio-muted);
+  font-size: 0.88em;
+}
+.settings-primary-options,
+.settings-additional-options {
+  padding: 14px;
+  border: 1px solid var(--studio-border);
+  border-radius: var(--studio-radius);
+  background: var(--studio-surface-soft);
+}
+.settings-primary-options h4 { margin: 0 0 10px; }
+.settings-primary-options .profile-group { margin: 0; padding: 0; border: 0; }
+.settings-primary-options .profile-group h4 { display: none; }
+.settings-primary-options .formgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.settings-additional-options > summary { cursor: pointer; font-weight: 600; }
+.settings-additional-options > p { margin: 8px 0 14px; }
+.settings-save-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 4px;
+  border-top: 1px solid var(--studio-border);
+}
+.settings-save-row > span { color: var(--studio-muted); font-size: 0.9em; }
+.settings-empty-options {
+  display: grid;
+  gap: 4px;
+  padding: 14px;
+  border: 1px dashed var(--studio-border);
+  border-radius: var(--studio-radius);
+}
+.settings-empty-options span { color: var(--studio-muted); }
+
+.build-comparison-2 {
+  display: grid;
+  gap: 12px;
+  padding: 16px 0 20px;
+  border-bottom: 1px solid var(--studio-border);
+  margin-bottom: 20px;
+}
+.build-comparison-2 .sectionhead { margin: 0; }
+.build-comparison-2 .sectionhead h2 { margin: 3px 0 5px; }
+.build-comparison-2 .sectionhead p { margin: 0; color: var(--studio-muted); }
+.ab-test-controls {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.7fr) minmax(260px, 1.3fr);
+  align-items: end;
+  gap: 12px 20px;
+}
+.ab-test-controls label { display: grid; gap: 6px; }
+.ab-test-controls p { margin: 0; }
+.build-results-table { min-width: 1060px; }
+.build-results-table th small { display: block; margin-top: 4px; color: var(--studio-muted); font-weight: 400; }
+.build-results-table td { vertical-align: middle; }
+.build-results-table td .outline { white-space: nowrap; }
+
+.crash-analyzer {
+  margin: 14px 0;
+  padding: 12px;
+  border: 1px solid var(--studio-border);
+  border-radius: var(--studio-radius);
+  background: var(--studio-surface-soft);
+}
+.crash-analyzer-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.crash-analyzer-heading h4 { margin: 0 0 4px; }
+.crash-analyzer-heading p { margin: 0; color: var(--studio-muted); font-size: 0.9em; }
+.crash-finding-list { display: grid; gap: 8px; margin-top: 12px; }
+.crash-finding { padding: 10px; border: 1px solid var(--studio-border-soft); border-radius: 6px; }
+.crash-finding p, .crash-finding small { display: block; margin: 5px 0; color: var(--studio-muted); }
+.crash-finding ul { margin: 8px 0 0; padding-left: 18px; }
+.crash-finding li + li { margin-top: 4px; }
+.crash-finding code { overflow-wrap: anywhere; white-space: pre-wrap; }
+
+@media (max-width: 860px) {
+  .ab-test-controls { grid-template-columns: 1fr; }
+  .crash-analyzer-heading { flex-direction: column; }
+}
+
+@media (max-width: 720px) {
+  .settings-emulator-heading { align-items: stretch; flex-direction: column; gap: 12px; }
+  .settings-emulator-heading label { width: 100%; }
+  .settings-primary-options .formgrid { grid-template-columns: 1fr; }
+  .settings-save-row { align-items: stretch; flex-direction: column; }
+}
 /* AnyPS5 keeps its build workspace centered at a compact desktop width. */
 .build-studio-page {
   max-width: 1408px;

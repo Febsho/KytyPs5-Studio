@@ -8221,10 +8221,10 @@ fn png_has_transparent_logo(bytes: &[u8]) -> bool {
     let pixels = &decoded[..frame.buffer_size()];
     match frame.color_type {
         png::ColorType::Rgba => {
-            transparent_logo_alpha(pixels.chunks_exact(4).map(|pixel| pixel[3]), pixel_count)
+            transparent_logo_alpha(pixels.iter().skip(3).step_by(4).copied(), pixel_count)
         }
         png::ColorType::GrayscaleAlpha => {
-            transparent_logo_alpha(pixels.chunks_exact(2).map(|pixel| pixel[1]), pixel_count)
+            transparent_logo_alpha(pixels.iter().skip(1).step_by(2).copied(), pixel_count)
         }
         _ => false,
     }
@@ -8254,7 +8254,7 @@ fn decode_dds_logo(bytes: &[u8]) -> Option<Vec<u8>> {
     let surface = image_dds::SurfaceRgba8::decode_layers_mipmaps_dds(&dds, 0..1, 0..1).ok()?;
     let image = surface.get_image(0, 0, 0)?;
     if !transparent_logo_alpha(
-        image.as_raw().chunks_exact(4).map(|pixel| pixel[3]),
+        image.as_raw().iter().skip(3).step_by(4).copied(),
         pixel_count,
     ) {
         return None;

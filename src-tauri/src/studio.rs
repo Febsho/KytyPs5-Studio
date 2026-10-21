@@ -12379,7 +12379,7 @@ mod tests {
             ),
             ("KytyPS5", "/build", "Existing Game", "dark")
         );
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
         assert_eq!(hidden_default, 0);
         assert_eq!(compatibility_table, 1);
         assert_eq!(columns, 4);
@@ -12428,7 +12428,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(row, (2560, 1440, "Mailbox".into(), 1, 0));
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
     }
     #[test]
     fn migration_removes_only_the_legacy_sqlite_github_token() {

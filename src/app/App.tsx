@@ -1136,10 +1136,7 @@ export function App() {
       } else if (!info.running_appimage) {
         setAppUpdateStatus(`Version ${info.latest_version} is available. In-place updates require launching Studio from its AppImage.`);
       } else {
-        setAppUpdateStatus(`Version ${info.latest_version} found. Downloading and verifying the AppImage…`);
-        const result = await invoke<string>("install_app_update");
-        setAppUpdateInfo({ ...info, current_version: info.latest_version, update_available: false });
-        setAppUpdateStatus(result);
+        setAppUpdateStatus(`Version ${info.latest_version} is available. Choose Install Verified AppImage Update to download and verify it.`);
       }
     } catch (error) {
       setAppUpdateStatus(`App update failed: ${String(error)}`);
@@ -1148,21 +1145,25 @@ export function App() {
       setAppUpdateBusy(false);
     }
   };
-  const installWindowsAppUpdate = async () => {
-    if (!appUpdateInfo?.update_available || !appUpdateInfo.asset_name?.toLowerCase().endsWith(".exe")) return;
-    if (gameRunning || busy) {
+  const installAppUpdate = async () => {
+    if (!appUpdateInfo?.update_available || !appUpdateInfo.asset_name) return;
+    const isWindowsInstaller = appUpdateInfo.asset_name.toLowerCase().endsWith(".exe");
+    if (isWindowsInstaller && (gameRunning || busy)) {
       setAppUpdateStatus("Finish active builds and close emulator sessions before installing a Studio update.");
       return;
     }
     if (appUpdateInFlight.current) return;
     appUpdateInFlight.current = true;
     setAppUpdateBusy(true);
-    setAppUpdateStatus("Downloading and verifying the NSIS installer…");
+    setAppUpdateStatus(`Downloading and verifying the ${isWindowsInstaller ? "NSIS installer" : "AppImage"}…`);
     let installerStarted = false;
     try {
       const result = await invoke<string>("install_app_update");
+      if (!isWindowsInstaller) {
+        setAppUpdateInfo({ ...appUpdateInfo, current_version: appUpdateInfo.latest_version, update_available: false });
+      }
       setAppUpdateStatus(result);
-      installerStarted = true;
+      installerStarted = isWindowsInstaller;
     } catch (error) {
       setAppUpdateStatus(`App update failed: ${String(error)}`);
     } finally {
@@ -2606,7 +2607,7 @@ export function App() {
               busy={busy}
               activeSessions={gameRunning}
               onCheckAppUpdate={checkAppUpdate}
-              onInstallAppUpdate={installWindowsAppUpdate}
+              onInstallAppUpdate={installAppUpdate}
               onSaveGlobalDefaults={() =>
                 action(async () => {
                   await call("set_global_profile_options", {

@@ -403,16 +403,18 @@ export function SettingsPage({
           </p>
         )}
         <button className="outline" disabled={appUpdateBusy} onClick={() => onCheckAppUpdate?.()}>
-          {appUpdateBusy ? "Checking / updating…" : "Check for App Update"}
+          {appUpdateBusy ? "Working…" : "Check for App Update"}
         </button>
-        {appUpdate?.update_available && appUpdate.asset_name?.toLowerCase().endsWith(".exe") && (
-          <button
-            className="primary"
-            disabled={appUpdateBusy || activeSessions || busy}
-            onClick={() => onInstallAppUpdate?.()}
-          >
-            Install Verified Update
-          </button>
+        {appUpdate?.update_available && appUpdate.asset_name && (
+          appUpdate.asset_name.toLowerCase().endsWith(".exe") || appUpdate.running_appimage ? (
+            <button
+              className="primary"
+              disabled={appUpdateBusy || (appUpdate.asset_name.toLowerCase().endsWith(".exe") && (activeSessions || busy))}
+              onClick={() => onInstallAppUpdate?.()}
+            >
+              {appUpdate.asset_name.toLowerCase().endsWith(".exe") ? "Install Verified Update" : "Install Verified AppImage Update"}
+            </button>
+          ) : null
         )}
         {(activeSessions || busy) && appUpdate?.asset_name?.toLowerCase().endsWith(".exe") && (
           <p className="hint">Finish active builds and close emulator sessions before installing the Studio update.</p>

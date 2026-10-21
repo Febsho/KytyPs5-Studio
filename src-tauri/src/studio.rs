@@ -4314,7 +4314,12 @@ fn github_token_status() -> Result<bool, String> {
     Ok(github_token()?.is_some())
 }
 fn github_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
-    let mut request = ureq::get(url)
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .new_agent();
+    let mut request = agent
+        .get(url)
         .header("User-Agent", "KytyPS5-Studio")
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28");
@@ -4340,6 +4345,14 @@ const APP_RELEASES_API: &str = "https://api.github.com/repos/Febsho/KytyPs5-Stud
 const APP_RELEASES_DOWNLOAD_PREFIX: &str =
     "https://github.com/Febsho/KytyPs5-Studio/releases/download/";
 const MAX_APP_UPDATE_ASSET_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+fn app_update_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_recv_body(Some(Duration::from_secs(120)))
+        .build()
+        .new_agent()
+}
 
 fn release_version_tuple(value: &str) -> Option<Vec<u64>> {
     value
@@ -4493,7 +4506,8 @@ fn release_asset_text(
     release: &GithubAppRelease,
 ) -> Result<String, String> {
     let url = release_asset_url(release, asset)?;
-    let request = ureq::get(&url)
+    let request = app_update_agent()
+        .get(&url)
         .header("User-Agent", "KytyPS5-Studio")
         .header("Accept", "application/octet-stream");
     let mut response = request
@@ -4558,7 +4572,8 @@ fn download_and_install_app_update() -> Result<String, String> {
     let _ = fs::remove_file(&temporary);
     let result = (|| {
         let url = release_asset_url(&release, asset)?;
-        let request = ureq::get(&url)
+        let request = app_update_agent()
+            .get(&url)
             .header("User-Agent", "KytyPS5-Studio")
             .header("Accept", "application/octet-stream");
         let mut response = request
@@ -4809,8 +4824,10 @@ fn has_active_game_sessions(connection: &Connection) -> Result<bool, String> {
 
 #[tauri::command]
 #[cfg(unix)]
-fn install_app_update() -> Result<String, String> {
-    download_and_install_app_update()
+async fn install_app_update() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(download_and_install_app_update)
+        .await
+        .map_err(|error| format!("AppImage update worker failed: {error}"))?
 }
 #[tauri::command]
 #[cfg(windows)]

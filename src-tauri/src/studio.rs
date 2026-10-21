@@ -42,6 +42,8 @@ mod steam;
 #[path = "steam_shortcuts.rs"]
 mod steam_shortcuts;
 
+#[cfg(any(windows, test))]
+#[cfg_attr(test, allow(dead_code))]
 #[path = "platform/windows_build.rs"]
 mod windows_build;
 #[cfg(windows)]

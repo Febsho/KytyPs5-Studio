@@ -1,5 +1,5 @@
-use super::*;
 use super::steam_shortcuts::*;
+use super::*;
 
 pub(super) fn add_game_to_steam(
     app: tauri::AppHandle,
@@ -192,4 +192,3 @@ pub(super) fn add_game_to_steam(
     }
     Ok(format!("Added {} to Steam with its included cover and selected emulator build. Restart Steam to see it in your library.", g.title))
 }
-

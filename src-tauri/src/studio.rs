@@ -37,10 +37,10 @@ impl ProcessGroupCommandExt for Command {
         self.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED | CREATE_NO_WINDOW)
     }
 }
-#[path = "steam_shortcuts.rs"]
-mod steam_shortcuts;
 #[path = "steam.rs"]
 mod steam;
+#[path = "steam_shortcuts.rs"]
+mod steam_shortcuts;
 
 #[path = "platform/windows_build.rs"]
 mod windows_build;
@@ -9362,9 +9362,9 @@ fn steam_windows_path(path: &Path) -> String {
     }
 }
 
+use self::steam::add_game_to_steam as add_game_to_steam_impl;
 #[cfg(test)]
 use self::steam_shortcuts::*;
-use self::steam::add_game_to_steam as add_game_to_steam_impl;
 
 fn steam_config_dir() -> Result<PathBuf, String> {
     #[cfg(unix)]
@@ -9433,13 +9433,8 @@ fn steam_config_dir() -> Result<PathBuf, String> {
     })
 }
 
-
 #[tauri::command]
-fn add_game_to_steam(
-    app: tauri::AppHandle,
-    game_id: i64,
-    build_id: i64,
-) -> Result<String, String> {
+fn add_game_to_steam(app: tauri::AppHandle, game_id: i64, build_id: i64) -> Result<String, String> {
     add_game_to_steam_impl(app, game_id, build_id)
 }
 
@@ -10949,9 +10944,20 @@ mod tests {
         let updated = make_entry("new-emulator.exe", "new-game-args");
         steam_upsert_shortcut(&mut shortcuts, "Game · KytyPS5 Studio", &updated).unwrap();
 
-        assert_eq!(shortcuts.windows(b"Game · KytyPS5 Studio".len()).filter(|part| *part == b"Game · KytyPS5 Studio").count(), 1);
-        assert!(shortcuts.windows(b"new-emulator.exe".len()).any(|part| part == b"new-emulator.exe"));
-        assert!(!shortcuts.windows(b"old-emulator.exe".len()).any(|part| part == b"old-emulator.exe"));
+        let app_name = "Game · KytyPS5 Studio".as_bytes();
+        assert_eq!(
+            shortcuts
+                .windows(app_name.len())
+                .filter(|part| *part == app_name)
+                .count(),
+            1
+        );
+        assert!(shortcuts
+            .windows(b"new-emulator.exe".len())
+            .any(|part| part == b"new-emulator.exe"));
+        assert!(!shortcuts
+            .windows(b"old-emulator.exe".len())
+            .any(|part| part == b"old-emulator.exe"));
     }
     #[test]
     fn steam_shortcut_vdf_strings_reject_nuls_and_preserve_unicode() {

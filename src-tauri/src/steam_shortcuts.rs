@@ -157,7 +157,9 @@ pub(super) fn steam_upsert_shortcut(
         let mut cursor = value_pos;
         let mut found_name = None;
         loop {
-            let field_kind = *bytes.get(cursor).ok_or("Steam shortcut entry is incomplete")?;
+            let field_kind = *bytes
+                .get(cursor)
+                .ok_or("Steam shortcut entry is incomplete")?;
             if field_kind == 8 {
                 cursor += 1;
                 break;
@@ -211,4 +213,3 @@ pub(super) fn steam_crc32(bytes: &[u8]) -> u32 {
     }
     !crc
 }
-

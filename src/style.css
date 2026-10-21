@@ -4181,6 +4181,12 @@ main {
 .steam-shortcut-preview { display: flex; align-items: center; gap: 16px; margin: 20px 0; padding: 14px; border: 1px solid var(--studio-border); border-radius: 12px; background: var(--studio-surface-raised); }
 .steam-shortcut-preview img, .steam-art-placeholder { width: 84px; height: 84px; flex: 0 0 84px; border-radius: 10px; object-fit: cover; background: var(--studio-surface-soft); }
 .steam-art-placeholder { display: grid; place-items: center; font-size: 32px; color: var(--studio-muted); }
+.studio-prompt-backdrop { position: fixed; z-index: 1300; inset: 0; display: grid; place-items: center; padding: 24px; background: #05070bd9; backdrop-filter: blur(5px); }
+.studio-prompt-dialog { width: min(440px, 100%); padding: 24px; border: 1px solid var(--studio-border); border-radius: 16px; background: var(--studio-surface); box-shadow: 0 24px 80px #0009; }
+.studio-prompt-dialog h2 { margin: 0 0 18px; font-size: 20px; }
+.studio-prompt-dialog label { display: grid; gap: 8px; color: var(--studio-muted); font-size: 13px; }
+.studio-prompt-dialog input { width: 100%; box-sizing: border-box; }
+.studio-prompt-dialog footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
 .steam-shortcut-preview strong, .steam-shortcut-preview small { display: block; }
 .steam-shortcut-preview small { margin-top: 6px; color: var(--studio-muted); overflow-wrap: anywhere; }
 .steam-build-select { display: grid; gap: 8px; }

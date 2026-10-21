@@ -1,0 +1,41 @@
+name: KytyPS5 upstream compatibility monitor
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  latest-upstream-smoke:
+    name: Latest upstream configure, build, and CLI check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install emulator build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            clang cmake git glslang-tools lld ninja-build pkg-config \
+            libasound2-dev libdbus-1-dev libgl1-mesa-dev libpulse-dev \
+            libudev-dev libwayland-dev libx11-dev libxcursor-dev libxext-dev \
+            libxfixes-dev libxi-dev libxkbcommon-dev libxrandr-dev libxss-dev \
+            libxtst-dev wayland-protocols
+      - name: Clone latest KytyPS5 and its submodules
+        run: git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/KytyPS5/KytyPS5.git "$RUNNER_TEMP/KytyPS5"
+      - name: Configure, build, and inspect current CLI
+        run: |
+          source="$RUNNER_TEMP/KytyPS5"
+          build="$RUNNER_TEMP/KytyPS5-build"
+          install="$RUNNER_TEMP/KytyPS5-install"
+          cmake -S "$source" -B "$build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DKYTY_BUILD_LAUNCHER=OFF
+          cmake --build "$build" --target kyty_emulator --parallel 4
+          cmake --install "$build" --prefix "$install"
+          test -x "$install/kyty_emulator"
+          "$install/kyty_emulator" --help | tee "$RUNNER_TEMP/kyty-help.txt"
+          grep -q -- '--game' "$RUNNER_TEMP/kyty-help.txt"

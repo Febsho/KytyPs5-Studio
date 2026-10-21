@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.0
+
+### Games and Steam
+
+- Show the PS5 `pic2` game logo over the game artwork when available, with cached DDS conversion and fallbacks for unsupported or missing logos.
+- Update an existing Steam shortcut when adding a game again with a different emulator build, instead of leaving a duplicate shortcut behind.
+- Use the Studio icon as Steam artwork when a game does not include a cover image.
+- Improve keyboard focus and Escape handling in the Steam build selection dialog.
+
+### Updates and build reliability
+
+- Improve Linux AppImage update handling.
+- Pin the KytyPS5 revision used by regression builds and add a separate scheduled workflow to check the latest upstream build and CLI.
+- Move Steam shortcut creation and VDF handling into dedicated Rust modules.
+
+### Dialogs
+
+- Replace browser confirmation prompts with native Tauri confirmation dialogs and add a Studio-styled dialog for renaming community build configurations.
+
 ## 0.5.0
 
 ### Build Studio and forks

@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { confirm as nativeConfirm, open, save } from "@tauri-apps/plugin-dialog";
 import {
   filterAndSortGames,
   isPubliclyRecognizedGame,
@@ -68,6 +68,7 @@ import { BuildStudioPage } from "../pages/BuildStudioPage";
 import { EmulatorManagerPage } from "../pages/EmulatorManagerPage";
 import { GameLibraryPage } from "../pages/GameLibraryPage";
 import { SteamShortcutDialog } from "../components/games/SteamShortcutDialog";
+import { TextPromptDialog } from "../components/common/TextPromptDialog";
 import { SettingsPage } from "../pages/SettingsPage";
 import { LauncherSessionModal } from "../components/emulator/LauncherSessionModal";
 import { RepositoryManagerPage } from "../pages/RepositoryManagerPage";
@@ -135,6 +136,7 @@ export function App() {
   const [steamGame, setSteamGame] = useState<Game | null>(null);
   const [steamBuildId, setSteamBuildId] = useState<number | null>(null);
   const [steamBusy, setSteamBusy] = useState(false);
+  const [renameCommunityBuild, setRenameCommunityBuild] = useState<CommunityBuildHistoryEntry | null>(null);
   const [controllerRemapOpen, setControllerRemapOpen] = useState(false);
   const controllerRemappingEnabled = false;
   const controllerRemapOpenRef = useRef(false);
@@ -1371,14 +1373,19 @@ export function App() {
     !profileLoading &&
     savedProfileSnapshot !== "" &&
     JSON.stringify(profile) !== savedProfileSnapshot;
-  const selectGameWithGuard = (id: number) => {
-    if (
-      profileDirty &&
-      !window.confirm(
+  const selectGameWithGuard = (id: number, afterSelect?: () => void) => {
+    if (profileDirty) {
+      void nativeConfirm(
         "This game profile has unsaved changes. Discard them and switch games?",
-      )
-    )
+        { title: "Unsaved game profile", kind: "warning", okLabel: "Discard changes", cancelLabel: "Keep editing" },
+      ).then((approved) => {
+        if (approved) {
+          setSelectedGame(id);
+          afterSelect?.();
+        }
+      });
       return false;
+    }
     setSelectedGame(id);
     return true;
   };
@@ -1736,9 +1743,10 @@ export function App() {
   const copyProfileFromGame = async (sourceGameId: number) => {
     if (
       profileDirty &&
-      !window.confirm(
+      !(await nativeConfirm(
         "Discard the current unsaved profile changes and copy another game profile?",
-      )
+        { title: "Unsaved game profile", kind: "warning", okLabel: "Discard changes", cancelLabel: "Keep editing" },
+      ))
     )
       return;
     const copied = await copyFromGame(sourceGameId);
@@ -2276,11 +2284,11 @@ export function App() {
                     .join(" + ");
                   const targetBranch =
                     review[0]?.pull_request.base_branch ?? "target branch";
-                  const approved = window.confirm(
+                  void nativeConfirm(
                     `Build exactly ${reviewed} in ${communityPrs?.repository ?? "the selected repository"} on ${targetBranch}. Studio applies the PRs in the selected order to the latest branch commit. This runs community code. Confirm only after reviewing all listed files.`,
-                  );
-                  if (approved && selectedRepo)
-                    void runJob("start_community_build", {
+                    { title: "Build community changes", kind: "warning", okLabel: "Build reviewed changes", cancelLabel: "Cancel" },
+                  ).then((approved) => {
+                    if (approved && selectedRepo) void runJob("start_community_build", {
                       repositoryId: selectedRepo,
                       pullRequests: review.map((detail) => ({
                         number: detail.pull_request.number,
@@ -2293,6 +2301,7 @@ export function App() {
                         clean: cleanBuild,
                       },
                     });
+                  });
                 }}
                 onBuildTypeChange={setBuildType}
                 onJobsChange={setJobs}
@@ -2308,22 +2317,7 @@ export function App() {
                 }
                 onReview={(entry) => void reviewHistoryHeads(entry)}
                 onRename={(entry) => {
-                  const name = window.prompt(
-                    "Rename community build configuration",
-                    entry.name,
-                  );
-                  if (name === null) return;
-                  action(async () => {
-                    await call("rename_community_build_config", {
-                      configId: entry.config_id,
-                      name,
-                    });
-                    setCommunityHistory(
-                      await call<CommunityBuildHistoryEntry[]>(
-                        "community_build_history",
-                      ),
-                    );
-                  });
+                  setRenameCommunityBuild(entry);
                 }}
               />
               <CommunityPullRequestDrawer
@@ -2809,6 +2803,22 @@ export function App() {
               onSelectBuild={setSteamBuildId}
               onAdd={() => void confirmAddGameToSteam()}
               onClose={() => { if (!steamBusy) setSteamGame(null); }}
+            />
+          )}
+          {renameCommunityBuild && (
+            <TextPromptDialog
+              title="Rename build configuration"
+              label="Configuration name"
+              initialValue={renameCommunityBuild.name}
+              onCancel={() => setRenameCommunityBuild(null)}
+              onSubmit={(name) => {
+                const configId = renameCommunityBuild.config_id;
+                setRenameCommunityBuild(null);
+                action(async () => {
+                  await call("rename_community_build_config", { configId, name });
+                  setCommunityHistory(await call<CommunityBuildHistoryEntry[]>("community_build_history"));
+                });
+              }}
             />
           )}
         </div>

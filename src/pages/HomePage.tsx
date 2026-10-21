@@ -41,7 +41,7 @@ export type HomePageProps = {
   setPage: Dispatch<SetStateAction<Page>>;
   choose: (kind: "file" | "directory") => Promise<void>;
   launchGame: (gameId: number) => Promise<void>;
-  selectGameWithGuard: (gameId: number) => boolean | void;
+  selectGameWithGuard: (gameId: number, afterSelect?: () => void) => boolean | void;
   setGameDetailsTab: Dispatch<
     SetStateAction<"Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Cheats">
   >;
@@ -189,9 +189,11 @@ export function HomePage({
               <button
                 className="ghost"
                 onClick={() => {
-                  selectGameWithGuard(featuredGame.id);
-                  setGameDetailsTab("Overview");
-                  setPage("game-details");
+                  const openDetails = () => {
+                    setGameDetailsTab("Overview");
+                    setPage("game-details");
+                  };
+                  if (selectGameWithGuard(featuredGame.id, openDetails) !== false) openDetails();
                 }}
               >
                 Game Details

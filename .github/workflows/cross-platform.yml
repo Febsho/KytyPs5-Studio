@@ -256,8 +256,15 @@ jobs:
       - name: Clone KytyPS5 and its submodules
         shell: pwsh
         run: |
-          git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/KytyPS5/KytyPS5.git "$env:RUNNER_TEMP\KytyPS5"
+          $source = Join-Path $env:RUNNER_TEMP 'KytyPS5'
+          git clone --no-checkout https://github.com/KytyPS5/KytyPS5.git $source
           if ($LASTEXITCODE -ne 0) { throw 'Could not clone the KytyPS5 source and submodules' }
+          git -C $source fetch --depth 1 origin 4644c5292773095b8ee30483aaf6e017bba3c713
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the pinned KytyPS5 regression revision' }
+          git -C $source checkout --detach 4644c5292773095b8ee30483aaf6e017bba3c713
+          if ($LASTEXITCODE -ne 0) { throw 'Could not check out the pinned KytyPS5 regression revision' }
+          git -C $source submodule update --init --recursive --depth 1
+          if ($LASTEXITCODE -ne 0) { throw 'Could not initialize pinned KytyPS5 submodules' }
       - name: Configure, build, install, and validate kyty_emulator.exe
         shell: pwsh
         run: |
@@ -301,7 +308,11 @@ jobs:
             libxfixes-dev libxi-dev libxkbcommon-dev libxrandr-dev libxss-dev \
             libxtst-dev wayland-protocols
       - name: Clone KytyPS5 and its submodules
-        run: git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/KytyPS5/KytyPS5.git "$RUNNER_TEMP/KytyPS5"
+        run: |
+          git clone --no-checkout https://github.com/KytyPS5/KytyPS5.git "$RUNNER_TEMP/KytyPS5"
+          git -C "$RUNNER_TEMP/KytyPS5" fetch --depth 1 origin 4644c5292773095b8ee30483aaf6e017bba3c713
+          git -C "$RUNNER_TEMP/KytyPS5" checkout --detach 4644c5292773095b8ee30483aaf6e017bba3c713
+          git -C "$RUNNER_TEMP/KytyPS5" submodule update --init --recursive --depth 1
       - name: Configure, build, install, and test kyty_emulator
         run: |
           source="$RUNNER_TEMP/KytyPS5"

@@ -37,8 +37,11 @@ impl ProcessGroupCommandExt for Command {
         self.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED | CREATE_NO_WINDOW)
     }
 }
-#[cfg(any(windows, test))]
-#[cfg_attr(test, allow(dead_code))]
+#[path = "steam_shortcuts.rs"]
+mod steam_shortcuts;
+#[path = "steam.rs"]
+mod steam;
+
 #[path = "platform/windows_build.rs"]
 mod windows_build;
 #[cfg(windows)]
@@ -9359,201 +9362,9 @@ fn steam_windows_path(path: &Path) -> String {
     }
 }
 
-fn steam_vdf_string(out: &mut Vec<u8>, key: &str, value: &str) -> Result<(), String> {
-    if key.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
-        return Err("Steam shortcut contains a string with an embedded NUL byte".into());
-    }
-    out.push(1);
-    out.extend_from_slice(key.as_bytes());
-    out.push(0);
-    out.extend_from_slice(value.as_bytes());
-    out.push(0);
-    Ok(())
-}
-
-fn steam_vdf_int(out: &mut Vec<u8>, key: &str, value: u32) {
-    out.push(2);
-    out.extend_from_slice(key.as_bytes());
-    out.push(0);
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn steam_vdf_key(bytes: &[u8], mut pos: usize) -> Result<(String, usize), String> {
-    let start = pos;
-    while pos < bytes.len() && bytes[pos] != 0 {
-        pos += 1;
-    }
-    if pos >= bytes.len() {
-        return Err("Steam shortcuts file is malformed".into());
-    }
-    Ok((
-        String::from_utf8_lossy(&bytes[start..pos]).into_owned(),
-        pos + 1,
-    ))
-}
-
-const STEAM_VDF_MAX_NESTING: usize = 64;
-
-fn steam_vdf_skip(bytes: &[u8], kind: u8, pos: usize) -> Result<usize, String> {
-    steam_vdf_skip_nested(bytes, kind, pos, 0)
-}
-
-fn steam_vdf_skip_nested(
-    bytes: &[u8],
-    kind: u8,
-    mut pos: usize,
-    depth: usize,
-) -> Result<usize, String> {
-    match kind {
-        0 => loop {
-            if depth >= STEAM_VDF_MAX_NESTING {
-                return Err("Steam shortcuts file exceeds the supported nesting depth".into());
-            }
-            let next = *bytes.get(pos).ok_or("Steam shortcuts file is malformed")?;
-            pos += 1;
-            if next == 8 {
-                return Ok(pos);
-            }
-            let (_, value_pos) = steam_vdf_key(bytes, pos)?;
-            pos = steam_vdf_skip_nested(bytes, next, value_pos, depth + 1)?;
-        },
-        1 | 5 => {
-            if kind == 1 {
-                while pos < bytes.len() && bytes[pos] != 0 {
-                    pos += 1;
-                }
-                if pos >= bytes.len() {
-                    return Err("Steam shortcuts file is malformed".into());
-                }
-                Ok(pos + 1)
-            } else {
-                while pos + 1 < bytes.len() && (bytes[pos] != 0 || bytes[pos + 1] != 0) {
-                    pos += 2;
-                }
-                if pos + 1 >= bytes.len() {
-                    return Err("Steam shortcuts file is malformed".into());
-                }
-                Ok(pos + 2)
-            }
-        }
-        2 | 3 | 4 | 6 => pos
-            .checked_add(4)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| "Steam shortcuts file is malformed".into()),
-        7 => pos
-            .checked_add(8)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| "Steam shortcuts file is malformed".into()),
-        _ => Err("Steam shortcuts file contains an unsupported value".into()),
-    }
-}
-
-fn steam_root_end(bytes: &[u8]) -> Result<(usize, u32), String> {
-    if bytes.get(..11) != Some(b"\0shortcuts\0") || bytes.get(11) != Some(&0) {
-        return Err("Steam shortcuts.vdf has an unexpected format".into());
-    }
-    let mut pos = 12;
-    let mut max_index = None;
-    loop {
-        let kind = *bytes.get(pos).ok_or("Steam shortcuts.vdf is incomplete")?;
-        if kind == 8 {
-            return Ok((pos, max_index.unwrap_or(0)));
-        }
-        pos += 1;
-        let (key, value_pos) = steam_vdf_key(bytes, pos)?;
-        if kind == 0 {
-            if let Ok(index) = key.parse::<u32>() {
-                max_index = Some(max_index.map_or(index, |previous: u32| previous.max(index)));
-            }
-        }
-        pos = steam_vdf_skip(bytes, kind, value_pos)?;
-    }
-}
-
-fn steam_next_entry_index(root_end: usize, max_index: u32) -> Result<u32, String> {
-    if max_index == 0 && root_end == 12 {
-        Ok(0)
-    } else {
-        max_index
-            .checked_add(1)
-            .ok_or_else(|| "Steam shortcuts.vdf has no available entry index".into())
-    }
-}
-
-fn steam_vdf_string_value(bytes: &[u8], mut pos: usize) -> Result<(String, usize), String> {
-    let start = pos;
-    while pos < bytes.len() && bytes[pos] != 0 {
-        pos += 1;
-    }
-    if pos >= bytes.len() {
-        return Err("Steam shortcuts file is malformed".into());
-    }
-    let value = std::str::from_utf8(&bytes[start..pos])
-        .map_err(|_| "Steam shortcuts file contains invalid UTF-8")?
-        .to_string();
-    Ok((value, pos + 1))
-}
-
-fn steam_shortcut_exists(
-    bytes: &[u8],
-    executable: &str,
-    launch_options: &str,
-) -> Result<bool, String> {
-    let _ = steam_root_end(bytes)?;
-    let mut pos = 12;
-    loop {
-        let kind = *bytes.get(pos).ok_or("Steam shortcuts file is incomplete")?;
-        if kind == 8 {
-            return Ok(false);
-        }
-        pos += 1;
-        let (_, value_pos) = steam_vdf_key(bytes, pos)?;
-        if kind != 0 {
-            return Err("Steam shortcuts file has a non-object entry in its root".into());
-        }
-        let mut entry_pos = value_pos;
-        let mut entry_executable = None;
-        let mut entry_options = None;
-        loop {
-            let field_kind = *bytes
-                .get(entry_pos)
-                .ok_or("Steam shortcut entry is incomplete")?;
-            if field_kind == 8 {
-                pos = entry_pos + 1;
-                break;
-            }
-            entry_pos += 1;
-            let (field, field_value_pos) = steam_vdf_key(bytes, entry_pos)?;
-            if field_kind == 1 && matches!(field.as_str(), "Exe" | "LaunchOptions") {
-                let (value, next) = steam_vdf_string_value(bytes, field_value_pos)?;
-                if field == "Exe" {
-                    entry_executable = Some(value);
-                } else {
-                    entry_options = Some(value);
-                }
-                entry_pos = next;
-            } else {
-                entry_pos = steam_vdf_skip(bytes, field_kind, field_value_pos)?;
-            }
-        }
-        if entry_executable.as_deref() == Some(executable)
-            && entry_options.as_deref() == Some(launch_options)
-        {
-            return Ok(true);
-        }
-    }
-}
-
-fn steam_crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0_u32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (0_u32.wrapping_sub(crc & 1)));
-        }
-    }
-    !crc
-}
+#[cfg(test)]
+use self::steam_shortcuts::*;
+use self::steam::add_game_to_steam as add_game_to_steam_impl;
 
 fn steam_config_dir() -> Result<PathBuf, String> {
     #[cfg(unix)]
@@ -9622,191 +9433,14 @@ fn steam_config_dir() -> Result<PathBuf, String> {
     })
 }
 
-#[tauri::command]
-fn add_game_to_steam(app: tauri::AppHandle, game_id: i64, build_id: i64) -> Result<String, String> {
-    #[cfg(unix)]
-    let steam_running = fs::read_dir("/proc")
-        .ok()
-        .into_iter()
-        .flatten()
-        .flatten()
-        .any(|entry| {
-            fs::read_to_string(entry.path().join("comm"))
-                .ok()
-                .is_some_and(|name| matches!(name.trim(), "steam" | "steam-runtime"))
-        });
-    #[cfg(windows)]
-    let steam_running = windows_process::process_name_exists("steam.exe")?;
-    if steam_running {
-        return Err("Close Steam completely, then add the game again so Steam cannot overwrite its shortcut list.".into());
-    }
-    let c = db(&app)?;
-    let g = game(&c, game_id)?;
-    let artwork_root = game_artwork_root(Path::new(&g.path))
-        .ok_or("The game folder does not contain its included artwork")?;
-    let artwork_root =
-        fs::canonicalize(artwork_root).map_err(|_| "The game folder is missing or inaccessible")?;
-    let image = fs::canonicalize(
-        g.icon_path
-            .as_deref()
-            .map(Path::new)
-            .unwrap_or(&artwork_root.join("sce_sys/icon0.png")),
-    )
-    .map_err(|_| "The game's included sce_sys/icon0.png cover is missing")?;
-    if !path_starts_with(&image, &artwork_root) || !image.is_file() {
-        return Err("The game's included cover image is outside its game folder".into());
-    }
-    let game_profile = profile(&c, game_id)?;
-    let b = build(&c, build_id)?;
-    let capabilities = capabilities_for_build(&b)?;
-    let mut options = effective_profile_options(
-        &global_profile_options(&c)?,
-        &game_profile.options,
-        &capabilities,
-    )?;
-    if game_profile.screen_width.is_some() && !capabilities.screen_width
-        || game_profile.screen_height.is_some() && !capabilities.screen_height
-        || game_profile.present_mode.is_some() && !capabilities.present_mode
-        || game_profile.perf_overlay && !capabilities.perf_overlay
-        || game_profile.fullscreen && !capabilities.fullscreen
-        || game_profile.controller_color.is_some() && !capabilities.controller_color
-        || game_profile.controller_volume.is_some() && !capabilities.controller_volume
-        || game_profile.controller_vibration.is_some() && !capabilities.controller_vibration
-        || game_profile.keyboard_player.is_some() && !capabilities.keyboard_player
-    {
-        return Err("The selected emulator build no longer supports this game's saved profile. Clear unsupported profile options before adding it to Steam.".into());
-    }
-    for (flag, value) in &mut options {
-        if [
-            "--game-patch",
-            "--printf-output-file",
-            "--addcont-dir",
-            "--shader-log-folder",
-            "--command-buffer-dump-folder",
-        ]
-        .contains(&flag.as_str())
-        {
-            *value = canonicalize_option_path(flag, value)?;
-        }
-    }
-    let exe = emulator_executable(Path::new(&b.path));
-    if !is_emulator_executable(&exe) {
-        return Err("The selected emulator build is missing or not executable".into());
-    }
-    let game_path = fs::canonicalize(&g.path)
-        .map_err(|_| "The registered game path is missing or inaccessible".to_string())?;
-    if !supported_game_path(&game_path) {
-        return Err(
-            "The registered game path no longer contains a supported eboot.bin, ELF, or ZArchive"
-                .into(),
-        );
-    }
-    let args = extra_profile_arguments(&options, &capabilities.switch_options);
-    let config = steam_config_dir()?;
-    #[cfg(unix)]
-    let (exe_field, start_dir, launch_options) = {
-        let launcher_dir = state_paths(&app)?.data.join("steam-launchers");
-        fs::create_dir_all(&launcher_dir).map_err(|e| e.to_string())?;
-        let launcher = launcher_dir.join(format!("game-{game_id}.sh"));
-        let mut script = format!(
-            "#!/bin/sh\nexec {} --game {}",
-            steam_shell_quote(&exe.display().to_string()),
-            steam_shell_quote(&game_path.display().to_string())
-        );
-        for arg in args {
-            script.push(' ');
-            script.push_str(&steam_shell_quote(&arg.to_string_lossy()));
-        }
-        script.push('\n');
-        fs::write(&launcher, script)
-            .map_err(|e| format!("Could not create Steam game launcher: {e}"))?;
-        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))
-            .map_err(|e| e.to_string())?;
-        let exe_field = format!("\"{}\"", launcher.display());
-        (
-            exe_field,
-            format!("\"{}\"", launcher_dir.display()),
-            String::new(),
-        )
-    };
-    #[cfg(windows)]
-    let (exe_field, start_dir, launch_options) = {
-        let exe_field = format!("\"{}\"", steam_windows_path(&exe));
-        let game_path = steam_windows_path(&game_path);
-        let mut arguments = vec![OsString::from("--game"), OsString::from(&game_path)];
-        arguments.extend(args);
-        let launch_options = arguments
-            .iter()
-            .map(|argument| windows_command_line_quote(&argument.to_string_lossy()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let start_dir = format!(
-            "\"{}\"",
-            steam_windows_path(exe.parent().unwrap_or(Path::new(&b.path)))
-        );
-        (exe_field, start_dir, launch_options)
-    };
 
-    let app_name = format!("{} · KytyPS5 Studio", g.title);
-    let app_id = steam_crc32(format!("{exe_field}{app_name}").as_bytes()) | 0x8000_0000;
-    let grid = config.join("grid");
-    fs::create_dir_all(&grid).map_err(|e| format!("Could not create Steam artwork folder: {e}"))?;
-    let artwork = grid.join(format!("{app_id}p.png"));
-    fs::copy(&image, &artwork).map_err(|e| format!("Could not copy cover image to Steam: {e}"))?;
-    let shortcuts_path = config.join("shortcuts.vdf");
-    let mut shortcuts = if shortcuts_path.exists() {
-        fs::read(&shortcuts_path).map_err(|e| e.to_string())?
-    } else {
-        b"\0shortcuts\0\0\x08\x08".to_vec()
-    };
-    if !steam_shortcut_exists(&shortcuts, &exe_field, &launch_options)? {
-        let (root_end, max_index) = steam_root_end(&shortcuts)?;
-        let mut entry = Vec::new();
-        entry.push(0);
-        let entry_index = steam_next_entry_index(root_end, max_index)?;
-        entry.extend_from_slice(entry_index.to_string().as_bytes());
-        entry.push(0);
-        steam_vdf_int(&mut entry, "appid", app_id);
-        steam_vdf_string(&mut entry, "AppName", &app_name)?;
-        steam_vdf_string(&mut entry, "Exe", &exe_field)?;
-        steam_vdf_string(&mut entry, "StartDir", &start_dir)?;
-        steam_vdf_string(&mut entry, "icon", &artwork.display().to_string())?;
-        steam_vdf_string(&mut entry, "ShortcutPath", "")?;
-        steam_vdf_string(&mut entry, "LaunchOptions", &launch_options)?;
-        steam_vdf_int(&mut entry, "IsHidden", 0);
-        steam_vdf_int(&mut entry, "AllowDesktopConfig", 1);
-        steam_vdf_int(&mut entry, "AllowOverlay", 1);
-        steam_vdf_int(&mut entry, "OpenVR", 0);
-        steam_vdf_int(&mut entry, "Devkit", 0);
-        steam_vdf_string(&mut entry, "DevkitGameID", "")?;
-        steam_vdf_int(&mut entry, "DevkitOverrideAppID", 0);
-        steam_vdf_int(&mut entry, "LastPlayTime", 0);
-        steam_vdf_string(&mut entry, "FlatpakAppID", "")?;
-        steam_vdf_string(&mut entry, "sortas", &app_name)?;
-        entry.push(0);
-        entry.extend_from_slice(b"tags\0");
-        entry.push(8);
-        entry.push(8);
-        shortcuts.splice(root_end..root_end, entry);
-        let temporary =
-            shortcuts_path.with_file_name(format!("shortcuts.vdf.tmp-{}", std::process::id()));
-        let write_result = (|| {
-            use std::io::Write as _;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(&shortcuts)?;
-            file.sync_all()?;
-            drop(file);
-            replace_file(&temporary, &shortcuts_path)
-        })();
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&temporary);
-            return Err(format!("Could not update Steam shortcuts: {error}"));
-        }
-    }
-    Ok(format!("Added {} to Steam with its included cover and selected emulator build. Restart Steam to see it in your library.", g.title))
+#[tauri::command]
+fn add_game_to_steam(
+    app: tauri::AppHandle,
+    game_id: i64,
+    build_id: i64,
+) -> Result<String, String> {
+    add_game_to_steam_impl(app, game_id, build_id)
 }
 
 #[tauri::command]
@@ -11297,45 +10931,27 @@ mod tests {
         );
     }
     #[test]
-    fn steam_shortcut_deduplication_matches_executable_and_game_arguments() {
+    fn steam_shortcut_upsert_updates_build_and_collapses_duplicates() {
         let mut shortcuts = b"\0shortcuts\0\0\x08\x08".to_vec();
         let (root_end, _) = steam_root_end(&shortcuts).unwrap();
-        let mut entry = vec![0];
-        entry.extend_from_slice(b"0\0");
-        steam_vdf_string(
-            &mut entry,
-            "Exe",
-            r#""C:\Program Files\Kyty\kyty_emulator.exe""#,
-        )
-        .unwrap();
-        steam_vdf_string(
-            &mut entry,
-            "LaunchOptions",
-            r#""--game" "D:\保存したゲーム\Game One""#,
-        )
-        .unwrap();
-        entry.push(8);
-        shortcuts.splice(root_end..root_end, entry);
+        let make_entry = |exe: &str, options: &str| {
+            let mut entry = vec![0];
+            entry.extend_from_slice(b"0\0");
+            steam_vdf_string(&mut entry, "AppName", "Game · KytyPS5 Studio").unwrap();
+            steam_vdf_string(&mut entry, "Exe", exe).unwrap();
+            steam_vdf_string(&mut entry, "LaunchOptions", options).unwrap();
+            entry.push(8);
+            entry
+        };
+        let first = make_entry("old-emulator.exe", "old-game-args");
+        shortcuts.splice(root_end..root_end, first.clone());
+        shortcuts.splice(root_end..root_end, first);
+        let updated = make_entry("new-emulator.exe", "new-game-args");
+        steam_upsert_shortcut(&mut shortcuts, "Game · KytyPS5 Studio", &updated).unwrap();
 
-        let executable = r#""C:\Program Files\Kyty\kyty_emulator.exe""#;
-        assert!(steam_shortcut_exists(
-            &shortcuts,
-            executable,
-            r#""--game" "D:\保存したゲーム\Game One""#
-        )
-        .unwrap());
-        assert!(!steam_shortcut_exists(
-            &shortcuts,
-            executable,
-            r#""--game" "D:\保存したゲーム\Game Two""#
-        )
-        .unwrap());
-        assert!(!steam_shortcut_exists(
-            &shortcuts,
-            r#""C:\Program Files\Kyty\kyty_emulator.exe.old""#,
-            r#""--game" "D:\保存したゲーム\Game One""#
-        )
-        .unwrap());
+        assert_eq!(shortcuts.windows(b"Game · KytyPS5 Studio".len()).filter(|part| *part == b"Game · KytyPS5 Studio").count(), 1);
+        assert!(shortcuts.windows(b"new-emulator.exe".len()).any(|part| part == b"new-emulator.exe"));
+        assert!(!shortcuts.windows(b"old-emulator.exe".len()).any(|part| part == b"old-emulator.exe"));
     }
     #[test]
     fn steam_shortcut_vdf_strings_reject_nuls_and_preserve_unicode() {

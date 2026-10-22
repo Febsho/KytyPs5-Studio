@@ -3381,12 +3381,18 @@ fn shader_precompile_files(build_path: &Path) -> Option<(PathBuf, PathBuf)> {
     #[cfg(windows)]
     let (script_name, tool_names) = (
         "precompile-windows.ps1",
-        ["kyty_shader_precompile.exe", "_Build/windows/kyty_shader_precompile.exe"],
+        [
+            "kyty_shader_precompile.exe",
+            "_Build/windows/kyty_shader_precompile.exe",
+        ],
     );
     #[cfg(not(windows))]
     let (script_name, tool_names) = (
         "precompile-linux.sh",
-        ["kyty_shader_precompile", "_Build/linux/kyty_shader_precompile"],
+        [
+            "kyty_shader_precompile",
+            "_Build/linux/kyty_shader_precompile",
+        ],
     );
     let script = build_path.join(script_name);
     if !script.is_file() {

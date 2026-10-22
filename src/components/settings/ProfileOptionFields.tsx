@@ -81,6 +81,7 @@ export const cliOptionInfo: Record<
     group: "Graphics",
     kind: "enum",
     choices: ["None", "Size", "Performance"],
+    hint: "This changes shader optimization, not precompilation. Shader precompile support depends on the selected fork.",
   },
   "--controller-color": {
     label: "Controller lightbar color",

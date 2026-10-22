@@ -3267,6 +3267,27 @@ select:disabled {
   background: color-mix(in srgb, var(--studio-surface-raised) 70%, transparent);
 }
 .settings-emulator-summary span { color: var(--studio-muted); font-size: 0.9em; }
+.settings-shader-cache {
+  padding: 12px 14px;
+  border: 1px solid var(--studio-border);
+  border-left: 3px solid var(--studio-accent);
+  border-radius: var(--studio-radius);
+  background: var(--studio-surface-soft);
+}
+.settings-shader-cache-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+}
+.settings-shader-cache-heading span { color: var(--studio-muted); font-size: 0.88em; }
+.settings-shader-cache p { margin: 6px 0 0; color: var(--studio-muted); }
+.settings-shader-precompile-toggle { display: flex; align-items: center; gap: 9px; margin-top: 10px; cursor: pointer; }
+.settings-shader-precompile-toggle input { accent-color: var(--studio-accent); }
+.shader-precompile-panel { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 16px 0; padding: 14px; border: 1px solid var(--studio-border); border-radius: var(--studio-radius); background: var(--studio-surface-soft); }
+.shader-precompile-panel p { margin: 5px 0; color: var(--studio-muted); }
+.shader-precompile-panel small { display: block; margin-top: 4px; color: var(--studio-muted); overflow-wrap: anywhere; }
+@media (max-width: 720px) { .shader-precompile-panel { align-items: flex-start; flex-direction: column; } }
 .settings-build-caption {
   display: flex;
   flex-wrap: wrap;

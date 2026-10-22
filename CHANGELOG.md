@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.0
+
+### Shader precompilation
+
+- Added a per-build background shader-precompile setting for the Jetsku KytyPS5 fork. Supported builds launch with shader precompile and fast-first pipeline preparation enabled; Windows defaults on, while Linux remains opt-in because it has not been verified here.
+- Added a full precompile action in game details when the selected build includes its platform-specific script and shader precompile tool, with live output and build-local cache information.
+- Prevented launching or precompiling concurrently, and kept precompile caches within the selected emulator build so the fork can key them by game and graphics driver.
+- Clarified that shader optimization and shader precompilation are separate settings.
+
 ## 0.7.0
 
 ### Build comparison and sessions

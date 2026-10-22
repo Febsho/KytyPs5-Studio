@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
 import { Settings } from "lucide-react";
 import type { AppUpdateInfo, Build, ProfileCapabilities, Repo, StorageReport } from "../types/studio";
 import { ProfileOptionFields } from "../components/settings/ProfileOptionFields";
@@ -101,6 +102,15 @@ export function SettingsPage({
   const additionalOptions = reportedOptions.filter(
     (flag) => !primaryEmulatorFlags.includes(flag),
   );
+  const isOfficialKytyPs5 =
+    selectedRepo?.owner.toLowerCase() === "kytyps5" &&
+    selectedRepo.name.toLowerCase() === "kytyps5";
+  const supportsBackgroundShaderPrecompile =
+    selectedRepo?.owner.toLowerCase() === "jetsku" &&
+    selectedRepo.name.toLowerCase() === "kytyps5";
+  const shaderPrecompileOption = reportedOptions.find((flag) =>
+    /(?:shader.*pre.?comp|pre.?comp.*shader)/i.test(flag),
+  );
   const hostOS = currentCompatibilityOS();
   const storageDescription = hostOS === "windows"
     ? "Application data and cache use LocalAppData; configuration uses Roaming AppData."
@@ -114,6 +124,7 @@ export function SettingsPage({
       : "the host credential store";
   const [storageTask, setStorageTask] = useState<string | null>(null);
   const [installedVersion, setInstalledVersion] = useState("Loading…");
+  const [shaderPrecompileEnabled, setShaderPrecompileEnabled] = useState(false);
   const storageTaskActive = useRef(false);
   useEffect(() => {
     let mounted = true;
@@ -128,6 +139,35 @@ export function SettingsPage({
       mounted = false;
     };
   }, []);
+  useEffect(() => {
+    if (!selectedBuild || !supportsBackgroundShaderPrecompile) {
+      setShaderPrecompileEnabled(false);
+      return;
+    }
+    let mounted = true;
+    void invoke<string | null>("get_setting", {
+      key: `shader_precompile_enabled:${selectedBuild.id}`,
+    })
+      .then((value) => {
+        if (!mounted) return;
+        const enabled = value === null
+          ? currentCompatibilityOS() === "windows"
+          : value === "true";
+        setShaderPrecompileEnabled(enabled);
+        if (value === null) {
+          void invoke("set_setting", {
+            key: `shader_precompile_enabled:${selectedBuild.id}`,
+            value: String(enabled),
+          }).catch(() => {});
+        }
+      })
+      .catch(() => {
+        if (mounted) setShaderPrecompileEnabled(false);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [selectedBuild?.id, supportsBackgroundShaderPrecompile]);
   const runStorageTask = (name: string, task: () => void | Promise<void>) => {
     if (storageTaskActive.current) return;
     storageTaskActive.current = true;
@@ -183,6 +223,57 @@ export function SettingsPage({
               {selectedBuild.active ? " · currently active" : ""}
             </span>
           </div>
+        )}
+        {selectedBuild && isOfficialKytyPs5 && (
+          <aside className="settings-shader-cache" role="note">
+            <div className="settings-shader-cache-heading">
+              <strong>Shader precompilation</strong>
+              <span>{shaderPrecompileOption ?? "No precompile option reported"}</span>
+            </div>
+            {selectedBuild.build_type.toLowerCase() === "release" ? (
+              <p>
+                No complete precompile-before-launch option is available in this
+                build. KytyPS5 Release builds do save Vulkan pipeline-cache data
+                as the game uses shaders and can reuse it on later launches,
+                but the first launch still compiles shaders as needed.
+              </p>
+            ) : (
+              <p>
+                KytyPS5 disables its persistent Vulkan pipeline cache in Debug
+                builds, and does not provide a setting for full shader
+                precompilation before launch.
+              </p>
+            )}
+          </aside>
+        )}
+        {selectedBuild && supportsBackgroundShaderPrecompile && (
+          <aside className="settings-shader-cache" role="group" aria-label="Shader precompilation">
+            <div className="settings-shader-cache-heading">
+              <strong>Background shader precompile</strong>
+              <span>Jetsku fork</span>
+            </div>
+            <p>
+              Records shaders seen during play and translates them in the background on later starts.
+              This also enables the fork’s fast-first pipeline mode. The first run still discovers
+              shaders; this does not precompile every game area.
+              {hostOS === "linux" && " Linux support depends on the selected build and has not been verified here."}
+            </p>
+            <label className="settings-shader-precompile-toggle">
+              <input
+                type="checkbox"
+                checked={shaderPrecompileEnabled}
+                onChange={(event) => {
+                  const enabled = event.target.checked;
+                  setShaderPrecompileEnabled(enabled);
+                  void invoke("set_setting", {
+                    key: `shader_precompile_enabled:${selectedBuild.id}`,
+                    value: String(enabled),
+                  }).catch(() => setShaderPrecompileEnabled(!enabled));
+                }}
+              />
+              <span>Enable known shader precompile on each launch</span>
+            </label>
+          </aside>
         )}
         {selectedBuild && globalProfileCapabilities && (
           <div className="settings-build-caption">

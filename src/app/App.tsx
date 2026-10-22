@@ -40,6 +40,7 @@ import type {
   ProfileCapabilities,
   Session,
   ProcessMetric,
+  ShaderPrecompileSupport,
   Job,
   GameScanEvent,
   GameScanResult,
@@ -256,6 +257,9 @@ export function App() {
   const [globalProfileBuildId, setGlobalProfileBuildId] = useState<number | null>(null);
   const [gameProfileGlobalOptions, setGameProfileGlobalOptions] = useState<Record<string, string>>({});
   const [gameSessionHistory, setGameSessionHistory] = useState<Session[]>([]);
+  const [shaderPrecompileSupport, setShaderPrecompileSupport] = useState<ShaderPrecompileSupport | null>(null);
+  const [shaderPrecompileStatus, setShaderPrecompileStatus] = useState("");
+  const [shaderPrecompileBusy, setShaderPrecompileBusy] = useState(false);
   const [gameIcon, setGameIcon] = useState<string | null>(null);
   const [gameLogo, setGameLogo] = useState<string | null>(null);
   const [gameBackground, setGameBackground] = useState<string | null>(null);
@@ -544,6 +548,10 @@ export function App() {
       j.kind === "community-build" ||
       j.kind === "install-tools";
     if (isJob) queueJobLog(`[${j.channel} · ${j.phase}] ${j.line}`);
+    if (j.kind === "shader-precompile") {
+      setShaderPrecompileStatus(j.line);
+      setShaderPrecompileBusy(!j.done);
+    }
     if ((j.kind === "build" || j.kind === "clone" || j.kind === "community-build" || j.kind === "install-tools") && !j.done)
       setCurrentBuildPhase(j.phase);
     if (j.done) {
@@ -1226,6 +1234,19 @@ export function App() {
       setMessage(`Could not refresh launcher session: ${String(error)}`);
     }
   };
+  const precompileGameShaders = async (gameId: number) => {
+    const game = games.find((item) => item.id === gameId);
+    const buildId = game?.build_id ?? active?.id ?? builds[0]?.id;
+    if (buildId == null) throw new Error("Install an emulator build before precompiling shaders");
+    setShaderPrecompileBusy(true);
+    setShaderPrecompileStatus("Starting shader precompile…");
+    try {
+      await call("precompile_game_shaders", { gameId, buildId });
+    } catch (error) {
+      setShaderPrecompileBusy(false);
+      setShaderPrecompileStatus(String(error));
+    }
+  };
   const launchGameAB = async (gameId: number, buildId: number, settingsBuildId: number) => {
     if (appUpdateBusy) {
       setMessage("Wait for the Studio update to finish before launching a game.");
@@ -1356,6 +1377,28 @@ export function App() {
   };
   const active = builds.find((b) => b.active);
   const currentGame = games.find((g) => g.id === selectedGame) || games[0];
+  const currentGameBuildId = currentGame?.build_id ?? active?.id ?? builds[0]?.id ?? null;
+  useEffect(() => {
+    if (page !== "game-details" || !currentGame || currentGameBuildId === null) {
+      setShaderPrecompileSupport(null);
+      return;
+    }
+    let alive = true;
+    setShaderPrecompileSupport(null);
+    setShaderPrecompileStatus("");
+    void call<ShaderPrecompileSupport>("shader_precompile_support", {
+      buildId: currentGameBuildId,
+    })
+      .then((support) => {
+        if (alive) setShaderPrecompileSupport(support);
+      })
+      .catch(() => {
+        if (alive) setShaderPrecompileSupport(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [page, currentGame?.id, currentGameBuildId]);
   const publicGames = useMemo(
     () => games.filter(isPubliclyRecognizedGame),
     [games],
@@ -2602,6 +2645,10 @@ export function App() {
               sessions={gameSessionHistory}
               onBack={() => setPage("library")}
               onLaunch={(gameId) => void launchGame(gameId)}
+              shaderPrecompileSupport={shaderPrecompileSupport}
+              shaderPrecompileStatus={shaderPrecompileStatus}
+              shaderPrecompileBusy={shaderPrecompileBusy}
+              onPrecompileShaders={precompileGameShaders}
               onLaunchBuildAB={(gameId, buildId, settingsBuildId) =>
                 launchGameAB(gameId, buildId, settingsBuildId)
               }

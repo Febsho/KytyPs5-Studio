@@ -10,6 +10,7 @@ import type {
   ManualCompatibilityObservation,
   Repo,
   Session,
+  ShaderPrecompileSupport,
   OfficialCompatibilityDetails,
   OfficialCompatibilityIndex,
 } from "../types/studio";
@@ -53,6 +54,10 @@ export type GameDetailsPageProps = {
   onOpenSessionLog: (session: Session) => void;
   onInspectContent?: (gameId:number) => Promise<GameContent>;
   onFetchOnlineCheats?: (gameId:number) => Promise<RemoteCheatFile[]>;
+  shaderPrecompileSupport?: ShaderPrecompileSupport | null;
+  shaderPrecompileStatus?: string;
+  shaderPrecompileBusy?: boolean;
+  onPrecompileShaders?: (gameId: number) => Promise<void>;
   onDownloadOnlineCheat?: (gameId:number, filename:string) => Promise<string>;
   onImportCustomPatch?: (gameId:number) => Promise<{path:string;content:string} | null>;
   onSaveCustomPatch?: (gameId:number, content:string) => Promise<string>;
@@ -94,6 +99,10 @@ export function GameDetailsPage({
   onOpenSessionLog,
   onInspectContent,
   onFetchOnlineCheats,
+  shaderPrecompileSupport = null,
+  shaderPrecompileStatus = "",
+  shaderPrecompileBusy = false,
+  onPrecompileShaders,
   onDownloadOnlineCheat,
   onImportCustomPatch,
   onSaveCustomPatch,
@@ -269,6 +278,26 @@ export function GameDetailsPage({
               Game files remain at their registered location. Studio does not
               copy or modify the original game data.
             </p>
+            {shaderPrecompileSupport?.full_precompile && onPrecompileShaders && (
+              <div className="shader-precompile-panel">
+                <div>
+                  <strong>Full shader precompile</strong>
+                  <p>
+                    Uses the selected fork’s bundled tool. The cache is stored with this emulator build
+                    and is specific to this game and graphics driver. This can take a long time.
+                  </p>
+                  <small>{shaderPrecompileSupport.cache_directory}</small>
+                  {shaderPrecompileStatus && <small role="status">{shaderPrecompileStatus}</small>}
+                </div>
+                <button
+                  className="outline"
+                  disabled={currentGame.file_status === "Missing" || activeSessions || shaderPrecompileBusy}
+                  onClick={() => void onPrecompileShaders(currentGame.id)}
+                >
+                  {shaderPrecompileBusy ? "Precompiling…" : "Precompile shaders"}
+                </button>
+              </div>
+            )}
             <div className="buttonrow">
               <button
                 className="outline"

@@ -144,6 +144,57 @@ describe("SettingsPage", () => {
     });
   });
 
+  it("shows the real KytyPS5 pipeline cache without inventing a precompile switch", () => {
+    render(
+      <SettingsPage
+        {...props({
+          builds: [
+            {
+              id: 2,
+              repo_id: 1,
+              commit_sha: "0123456789abcdef",
+              build_type: "Release",
+              path: "/builds/kyty",
+              created_at: 0,
+              active: true,
+              install_size_bytes: null,
+              validation_status: "validated",
+              executable_status: "available",
+              configuration: {
+                compiler: null,
+                jobs: null,
+                clean: null,
+                cmake_arguments: [],
+              },
+              last_session_at: null,
+              last_session_outcome: null,
+              last_session_exit_code: null,
+            },
+          ],
+          repos: [
+            {
+              id: 1,
+              owner: "KytyPS5",
+              name: "KytyPS5",
+              url: "https://github.com/KytyPS5/KytyPS5",
+              branch: "main",
+              source_path: null,
+              adapter: "upstream",
+              installed_commit: null,
+            },
+          ],
+          selectedBuildId: 2,
+          globalUnsupported: false,
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("note").textContent).toMatch(/Shader precompilation/);
+    expect(screen.getByText(/first launch still compiles shaders as needed/)).toBeTruthy();
+    expect(screen.getByText(/No complete precompile-before-launch option is available/)).toBeTruthy();
+    expect(screen.queryByRole("checkbox", { name: /precompilation/i })).toBeNull();
+  });
+
   it("keeps credential storage and cache cleanup actions explicit", async () => {
     const page = props();
     render(<SettingsPage {...page} />);

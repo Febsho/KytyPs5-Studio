@@ -2087,7 +2087,7 @@ dependencies = [
 
 [[package]]
 name = "kytyps5-studio"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "image_dds",
  "libc",

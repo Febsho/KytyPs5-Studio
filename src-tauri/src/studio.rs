@@ -746,6 +746,11 @@ struct Game {
     file_status: String,
 }
 #[derive(Serialize)]
+struct ShaderPrecompileSupport {
+    full_precompile: bool,
+    cache_directory: String,
+}
+#[derive(Serialize)]
 struct GameCompatibility {
     path_recognized: bool,
     launch_attempts: i64,
@@ -1489,6 +1494,7 @@ struct GameScanResult {
 }
 static NEXT_GAME_SCAN_ID: AtomicU64 = AtomicU64::new(1);
 static GAME_SIZE_REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
+static SHADER_PRECOMPILE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_JOB_ID: AtomicU64 = AtomicU64::new(0);
 static SESSION_LIFECYCLE_LOCK: Mutex<()> = Mutex::new(());
@@ -3370,6 +3376,179 @@ fn open_game_folder(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
         path.parent().ok_or("Game path has no parent directory")?
     };
     open_directory(directory)
+}
+fn shader_precompile_files(build_path: &Path) -> Option<(PathBuf, PathBuf)> {
+    #[cfg(windows)]
+    let (script_name, tool_names) = (
+        "precompile-windows.ps1",
+        ["kyty_shader_precompile.exe", "_Build/windows/kyty_shader_precompile.exe"],
+    );
+    #[cfg(not(windows))]
+    let (script_name, tool_names) = (
+        "precompile-linux.sh",
+        ["kyty_shader_precompile", "_Build/linux/kyty_shader_precompile"],
+    );
+    let script = build_path.join(script_name);
+    if !script.is_file() {
+        return None;
+    }
+    tool_names
+        .iter()
+        .map(|name| build_path.join(name))
+        .find(|tool| is_emulator_executable(tool))
+        .map(|tool| (script, tool))
+}
+#[tauri::command]
+fn shader_precompile_support(
+    app: tauri::AppHandle,
+    build_id: i64,
+) -> Result<ShaderPrecompileSupport, String> {
+    let installation = build(&db(&app)?, build_id)?;
+    Ok(ShaderPrecompileSupport {
+        full_precompile: shader_precompile_files(Path::new(&installation.path)).is_some(),
+        cache_directory: Path::new(&installation.path)
+            .join("_PipelineCache")
+            .display()
+            .to_string(),
+    })
+}
+#[tauri::command]
+async fn precompile_game_shaders(
+    app: tauri::AppHandle,
+    game_id: i64,
+    build_id: i64,
+) -> Result<(), String> {
+    let worker_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        precompile_game_shaders_sync(worker_app, game_id, build_id)
+    })
+    .await
+    .map_err(|error| format!("Shader precompile task failed: {error}"))?
+}
+fn precompile_game_shaders_sync(
+    app: tauri::AppHandle,
+    game_id: i64,
+    build_id: i64,
+) -> Result<(), String> {
+    if SHADER_PRECOMPILE_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("A shader precompile is already running".into());
+    }
+    let result = (|| {
+        let (game_info, installation) = {
+            let _session_lifecycle = SESSION_LIFECYCLE_LOCK
+                .lock()
+                .map_err(|error| error.to_string())?;
+            let c = db(&app)?;
+            let game_info = game(&c, game_id)?;
+            let installation = build(&c, build_id)?;
+            let active_session: bool = c
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE ended_at IS NULL)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if active_session {
+                return Err("Close the running emulator before precompiling shaders".into());
+            }
+            (game_info, installation)
+        };
+        let (script, _tool) = shader_precompile_files(Path::new(&installation.path))
+            .ok_or("The selected build does not include a full shader precompile tool")?;
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("powershell.exe");
+            command
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+                .arg(script)
+                .args(["-Game"])
+                .arg(&game_info.path);
+            command
+        } else {
+            let mut command = Command::new("bash");
+            command.arg(script).args(["--game"]).arg(&game_info.path);
+            command
+        };
+        command
+            .current_dir(&installation.path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("Could not start the shader precompile tool: {error}"))?;
+        emit(
+            &app,
+            "shader-precompile",
+            "Precompiling",
+            format!("Precompiling shaders for {}", game_info.title),
+            false,
+            true,
+        );
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdout_app = app.clone();
+        let stdout_reader = thread::spawn(move || {
+            if let Some(stdout) = stdout {
+                drain_job_output(
+                    stdout,
+                    "stdout",
+                    &stdout_app,
+                    "shader-precompile",
+                    "Precompiling",
+                    None,
+                    None,
+                );
+            }
+        });
+        let stderr_app = app.clone();
+        let stderr_reader = thread::spawn(move || {
+            if let Some(stderr) = stderr {
+                drain_job_output(
+                    stderr,
+                    "stderr",
+                    &stderr_app,
+                    "shader-precompile",
+                    "Precompiling",
+                    None,
+                    None,
+                );
+            }
+        });
+        let status = child.wait().map_err(|error| error.to_string())?;
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        if !status.success() {
+            return Err(format!("Shader precompile exited with status {status}"));
+        }
+        Ok(())
+    })();
+    SHADER_PRECOMPILE_ACTIVE.store(false, Ordering::Release);
+    match result {
+        Ok(()) => {
+            emit(
+                &app,
+                "shader-precompile",
+                "Completed",
+                "Shader precompile completed",
+                true,
+                true,
+            );
+            Ok(())
+        }
+        Err(error) => {
+            emit(
+                &app,
+                "shader-precompile",
+                "Failed",
+                error.clone(),
+                true,
+                false,
+            );
+            Err(error)
+        }
+    }
 }
 fn build(conn: &Connection, id: i64) -> Result<Build, String> {
     let mut result = conn.query_row(
@@ -5882,6 +6061,7 @@ fn emit(
 fn job_event_channel(kind: &str, phase: &str) -> &'static str {
     match kind {
         "game" => "runtime",
+        "shader-precompile" => "shader-precompile",
         "clone" => "repository-clone",
         "community-build" => "community-pr-build",
         "build"
@@ -9543,9 +9723,15 @@ fn launch_game_impl(
     requested_build_id: Option<i64>,
     settings_build_id: Option<i64>,
 ) -> Result<(), String> {
+    if SHADER_PRECOMPILE_ACTIVE.load(Ordering::Acquire) {
+        return Err("Wait for shader precompilation to finish before launching a game".into());
+    }
     let _session_lifecycle = SESSION_LIFECYCLE_LOCK
         .lock()
         .map_err(|error| error.to_string())?;
+    if SHADER_PRECOMPILE_ACTIVE.load(Ordering::Acquire) {
+        return Err("Wait for shader precompilation to finish before launching a game".into());
+    }
     if app.state::<Arc<Jobs>>().updating.load(Ordering::SeqCst) {
         return Err("KytyPS5 Studio is installing an application update".into());
     }
@@ -9563,6 +9749,9 @@ fn launch_game_impl(
         .map_err(|_| "Select an active emulator build".to_string())?
     };
     let b = build(&c, build_id)?;
+    let selected_repo = repo(&c, b.repo_id)?;
+    let enable_shader_precompile = is_jetsku_precompile_fork(&selected_repo)
+        && get_build_shader_precompile_enabled(&c, build_id)?;
     let capabilities = capabilities_for_build(&b)?;
     let settings_build_id = settings_build_id.unwrap_or(build_id);
     let settings_defaults = build_profile_options(&c, settings_build_id)?;
@@ -9642,6 +9831,16 @@ fn launch_game_impl(
     )?;
     let mut command = Command::new(&exe);
     command.arg("--game").arg(&game_path);
+    if is_jetsku_precompile_fork(&selected_repo) {
+        command.env(
+            "KYTY_SHADER_PRECOMPILE",
+            if enable_shader_precompile { "1" } else { "0" },
+        );
+        command.env(
+            "KYTY_PIPELINE_FAST_FIRST",
+            if enable_shader_precompile { "1" } else { "0" },
+        );
+    }
     command.args(extra_profile_arguments(
         &effective_options,
         &capabilities.switch_options,
@@ -10710,6 +10909,7 @@ fn get_setting(app: tauri::AppHandle, key: String) -> Result<Option<String>, Str
         "discord_presence_enabled",
     ]
     .contains(&key.as_str())
+        && !valid_shader_precompile_setting_key(&key)
     {
         return Err("Unsupported setting".into());
     }
@@ -10729,6 +10929,7 @@ fn set_setting(app: tauri::AppHandle, key: String, value: String) -> Result<(), 
         "discord_presence_enabled",
     ]
     .contains(&key.as_str())
+        && !valid_shader_precompile_setting_key(&key)
     {
         return Err("Unsupported setting".into());
     }
@@ -10741,8 +10942,37 @@ fn set_setting(app: tauri::AppHandle, key: String, value: String) -> Result<(), 
     if key == "discord_presence_enabled" && !["true", "false"].contains(&value.as_str()) {
         return Err("Discord presence must be enabled or disabled".into());
     }
+    if valid_shader_precompile_setting_key(&key) && !["true", "false"].contains(&value.as_str()) {
+        return Err("Shader precompile setting must be enabled or disabled".into());
+    }
     db(&app)?.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value]).map_err(|e|e.to_string())?;
     Ok(())
+}
+fn valid_shader_precompile_setting_key(key: &str) -> bool {
+    key.strip_prefix("shader_precompile_enabled:")
+        .and_then(|id| id.parse::<i64>().ok())
+        .is_some_and(|id| id > 0)
+}
+fn shader_precompile_setting_key(build_id: i64) -> String {
+    format!("shader_precompile_enabled:{build_id}")
+}
+fn is_jetsku_precompile_fork(repository: &Repo) -> bool {
+    repository.owner.eq_ignore_ascii_case("Jetsku")
+        && repository.name.eq_ignore_ascii_case("KytyPS5")
+}
+fn get_build_shader_precompile_enabled(conn: &Connection, build_id: i64) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key=?",
+        [shader_precompile_setting_key(build_id)],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map(|value| match value.as_deref() {
+        Some("true") => true,
+        Some("false") => false,
+        _ => cfg!(windows),
+    })
+    .map_err(|error| error.to_string())
 }
 fn valid_update_interval(value: &str) -> bool {
     matches!(value, "0" | "6" | "24" | "168")
@@ -10830,6 +11060,8 @@ pub fn run() {
             open_build_folder,
             validate_build,
             list_games,
+            shader_precompile_support,
+            precompile_game_shaders,
             remove_game_entry,
             game_compatibility,
             official_compatibility_index,

@@ -9,7 +9,7 @@ vi.mock("../../services/gameArtwork", () => ({
   retainGameIcon: vi.fn(() => vi.fn()),
 }));
 
-import { VirtualGameGrid } from "./GameLibrary";
+import { VirtualGameGrid, VirtualHomeGameRow } from "./GameLibrary";
 
 const games: Game[] = Array.from({ length: 1000 }, (_, index) => ({
   id: index + 1,
@@ -26,7 +26,35 @@ const games: Game[] = Array.from({ length: 1000 }, (_, index) => ({
   file_status: "Available",
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+describe("VirtualHomeGameRow", () => {
+  it("updates its virtual window when horizontally scrolled", () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    render(
+      <VirtualHomeGameRow
+        games={games.slice(0, 30)}
+        selectedId={1}
+        onSelect={vi.fn()}
+      />,
+    );
+
+    const row = document.querySelector<HTMLElement>(".home-game-row")!;
+    Object.defineProperty(row, "clientWidth", { configurable: true, value: 500 });
+    Object.defineProperty(row, "scrollLeft", { configurable: true, value: 1000 });
+    expect(() => fireEvent.scroll(row)).not.toThrow();
+    expect(screen.queryByRole("button", { name: "Game 1" })).toBeNull();
+  });
+});
 
 describe("VirtualGameGrid", () => {
   it("renders a bounded visible window and advances to the scrolled rows", () => {

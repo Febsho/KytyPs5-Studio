@@ -322,12 +322,13 @@ export function VirtualHomeGameRow({
     <div
       ref={row}
       className="home-game-row"
-      onScroll={(event) =>
+      onScroll={(event) => {
+        const left = event.currentTarget.scrollLeft;
         setViewport((current) => ({
           ...current,
-          left: event.currentTarget.scrollLeft,
-        }))
-      }
+          left,
+        }));
+      }}
     >
       {start > 0 && (
         <span

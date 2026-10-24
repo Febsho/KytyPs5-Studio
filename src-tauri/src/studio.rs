@@ -6977,6 +6977,44 @@ fn linux_x86_64_cmake_cpu_flags(target_os: &str, target_arch: &str) -> Vec<Strin
         Vec::new()
     }
 }
+// Recent upstream Kyty sources include Microsoft's <intrin.h> unconditionally
+// in bufferCache.cpp. On Linux, Clang's compatibility header forwards to a
+// nonexistent system header. Put a tiny x86 compatibility header ahead of
+// Clang's builtin include directory, without modifying the user's checkout.
+#[cfg(any(not(windows), test))]
+fn linux_x86_64_intrin_compat_flags(
+    target_os: &str,
+    target_arch: &str,
+    source: &Path,
+    build_dir: &Path,
+) -> Result<Vec<String>, String> {
+    if target_os != "linux" || target_arch != "x86_64" {
+        return Ok(Vec::new());
+    }
+    let affected_source = source.join("src/graphics/host_gpu/renderer/cache/bufferCache.cpp");
+    let contents = match fs::read_to_string(affected_source) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if !contents
+        .lines()
+        .any(|line| line.trim() == "#include <intrin.h>")
+    {
+        return Ok(Vec::new());
+    }
+
+    let include_dir = build_dir.join("compat/include");
+    fs::create_dir_all(&include_dir).map_err(|error| error.to_string())?;
+    fs::write(include_dir.join("intrin.h"), "#include <x86intrin.h>\n")
+        .map_err(|error| error.to_string())?;
+    // CMake tokenizes CMAKE_CXX_FLAGS when generating compiler commands, so
+    // quote the include path to preserve source/cache paths containing spaces.
+    Ok(vec![format!(
+        "-DCMAKE_CXX_FLAGS=-msse4.1 -I\"{}\"",
+        include_dir.display()
+    )])
+}
 fn verify_build_dependencies(app: &tauri::AppHandle, job_kind: &str) -> Result<(), String> {
     emit(
         app,
@@ -7540,6 +7578,13 @@ fn build_and_register(
     let source_s = source.display().to_string();
     let mut conf = vec!["-S".into(), source_s, "-B".into(), build_dir_s.clone()];
     conf.extend(cmake_configuration_arguments(&options.build_type)?);
+    #[cfg(not(windows))]
+    conf.extend(linux_x86_64_intrin_compat_flags(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        source,
+        &build_dir,
+    )?);
     conf.push("-DKYTY_BUILD_LAUNCHER=OFF".into());
     let log_path = build_dir.join("build.log");
     fs::write(&log_path, b"").map_err(|e| e.to_string())?;
@@ -14173,6 +14218,36 @@ mod tests {
         );
         assert!(linux_x86_64_cmake_cpu_flags("windows", "x86_64").is_empty());
         assert!(linux_x86_64_cmake_cpu_flags("linux", "aarch64").is_empty());
+    }
+    #[cfg(not(windows))]
+    #[test]
+    fn linux_clang_intrinsics_workaround_is_scoped_to_affected_x86_checkout() {
+        let root = env::temp_dir().join(format!("kyty-intrin-compat-{} space", now()));
+        let source = root.join("source");
+        let build = root.join("build");
+        let affected = source.join("src/graphics/host_gpu/renderer/cache/bufferCache.cpp");
+        fs::create_dir_all(affected.parent().unwrap()).unwrap();
+        fs::write(&affected, "#include <intrin.h>\n").unwrap();
+
+        let flags = linux_x86_64_intrin_compat_flags("linux", "x86_64", &source, &build).unwrap();
+        assert_eq!(flags.len(), 1);
+        assert!(flags[0].contains("-I\""));
+        assert_eq!(
+            fs::read_to_string(build.join("compat/include/intrin.h")).unwrap(),
+            "#include <x86intrin.h>\n"
+        );
+        assert!(
+            linux_x86_64_intrin_compat_flags("windows", "x86_64", &source, &build)
+                .unwrap()
+                .is_empty()
+        );
+        fs::write(&affected, "#include <x86intrin.h>\n").unwrap();
+        assert!(
+            linux_x86_64_intrin_compat_flags("linux", "x86_64", &source, &build)
+                .unwrap()
+                .is_empty()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
     #[cfg(target_os = "linux")]
     #[test]

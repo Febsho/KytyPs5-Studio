@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.1
+
+### Build reliability
+
+- Fix Linux x86_64 emulator source builds with upstream's Microsoft-specific `intrin.h` include.
+
 ## 0.9.0
 
 ### Emulator settings

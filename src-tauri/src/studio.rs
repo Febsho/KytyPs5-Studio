@@ -748,6 +748,8 @@ struct Game {
 #[derive(Serialize)]
 struct ShaderPrecompileSupport {
     full_precompile: bool,
+    background_precompile: bool,
+    background_enabled: bool,
     cache_directory: String,
 }
 #[derive(Serialize)]
@@ -904,6 +906,17 @@ struct ProfileCapabilities {
     keyboard_player: bool,
     options: Vec<String>,
     switch_options: Vec<String>,
+    option_metadata: HashMap<String, CliOptionMetadata>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CliOptionMetadata {
+    kind: String,
+    choices: Vec<String>,
+    minimum: Option<i64>,
+    maximum: Option<i64>,
+    default_value: Option<String>,
+    description: String,
 }
 
 const CONFIGURABLE_CLI_OPTIONS: &[&str] = &[
@@ -1030,6 +1043,157 @@ fn profile_capabilities(help: &str) -> ProfileCapabilities {
             .filter(|(flag, takes_value)| !takes_value && configurable(flag))
             .map(|(flag, _)| (*flag).to_string())
             .collect(),
+        option_metadata: cli_option_metadata(help),
+    }
+}
+
+fn cli_option_metadata(help: &str) -> HashMap<String, CliOptionMetadata> {
+    let mut definitions = Vec::<(String, Option<String>, String)>::new();
+    for line in help.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("--") {
+            let Some(flag_end) = trimmed.find(char::is_whitespace) else {
+                continue;
+            };
+            let flag = &trimmed[..flag_end];
+            if !flag[2..]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                continue;
+            }
+            let mut remainder = trimmed[flag_end..].trim_start();
+            let mut value_token = None;
+            if remainder.starts_with('<') || remainder.starts_with('[') {
+                let closing = if remainder.starts_with('<') { '>' } else { ']' };
+                if let Some(end) = remainder.find(closing) {
+                    value_token = Some(remainder[..=end].to_string());
+                    remainder = remainder[end + 1..].trim_start();
+                }
+            }
+            definitions.push((flag.to_string(), value_token, remainder.to_string()));
+        } else if !trimmed.is_empty() {
+            if let Some((_, _, description)) = definitions.last_mut() {
+                if !description.is_empty() {
+                    description.push(' ');
+                }
+                description.push_str(trimmed);
+            }
+        }
+    }
+
+    definitions
+        .into_iter()
+        .map(|(flag, value_token, description)| {
+            let token_value = value_token
+                .as_deref()
+                .unwrap_or_default()
+                .trim_start_matches(|character| character == '<' || character == '[')
+                .trim_end_matches(|character| character == '>' || character == ']');
+            let mut choices = token_value
+                .split('|')
+                .map(str::trim)
+                .filter(|choice| !choice.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let mut minimum = None;
+            let mut maximum = None;
+            if choices.len() < 2 {
+                choices.clear();
+                let range = token_value
+                    .split_once('-')
+                    .or_else(|| token_value.split_once('–'));
+                if let Some((low, high)) = range {
+                    minimum = low.trim().parse().ok();
+                    maximum = high.trim().parse().ok();
+                }
+            }
+            let placeholder = token_value.to_ascii_lowercase();
+            if choices.is_empty()
+                && matches!(placeholder.as_str(), "value" | "mode" | "type" | "option")
+            {
+                choices = choices_from_description(&description);
+            }
+            let kind = if choices.len() >= 2 {
+                if choices.len() == 2
+                    && ((choices[0] == "true" && choices[1] == "false")
+                        || (choices[0] == "false" && choices[1] == "true"))
+                {
+                    "bool"
+                } else {
+                    "enum"
+                }
+            } else if minimum.is_some() && maximum.is_some()
+                || matches!(
+                    placeholder.as_str(),
+                    "num"
+                        | "number"
+                        | "index"
+                        | "seconds"
+                        | "duration"
+                        | "volume"
+                        | "frequency"
+                        | "hz"
+                        | "id"
+                        | "percent"
+                )
+            {
+                "number"
+            } else if ["path", "file", "dir", "directory", "folder", "json"]
+                .contains(&placeholder.as_str())
+            {
+                "path"
+            } else if placeholder == "mapping" {
+                "keymap"
+            } else {
+                "text"
+            };
+            let default_value = description
+                .split_once("Default:")
+                .and_then(|(_, value)| value.split(['.', ')']).next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            (
+                flag,
+                CliOptionMetadata {
+                    kind: kind.to_string(),
+                    choices,
+                    minimum,
+                    maximum,
+                    default_value,
+                    description,
+                },
+            )
+        })
+        .collect()
+}
+
+fn choices_from_description(description: &str) -> Vec<String> {
+    let sentence = description.split('.').next().unwrap_or_default().trim();
+    let normalized = sentence
+        .replace(", or ", "|")
+        .replace(" or ", "|")
+        .replace(", and ", "|")
+        .replace(" and ", "|")
+        .replace(", ", "|");
+    let choices = normalized
+        .split('|')
+        .map(str::trim)
+        .filter(|choice| !choice.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if (2..=8).contains(&choices.len())
+        && choices.iter().all(|choice| {
+            choice.len() <= 32
+                && choice.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || " _-/#".contains(character)
+                })
+        })
+    {
+        choices
+    } else {
+        Vec::new()
     }
 }
 
@@ -1143,6 +1307,32 @@ fn validate_extra_profile_options(
         {
             return Err(format!("The selected emulator does not support {flag}"));
         }
+        if let Some(metadata) = capabilities.option_metadata.get(flag) {
+            if !metadata.choices.is_empty() && !metadata.choices.contains(value) {
+                return Err(format!(
+                    "{flag} must be one of: {}",
+                    metadata.choices.join(", ")
+                ));
+            }
+            if metadata.minimum.is_some() || metadata.maximum.is_some() {
+                let number = value
+                    .parse::<i64>()
+                    .map_err(|_| format!("{flag} must be a number"))?;
+                if metadata.minimum.is_some_and(|minimum| number < minimum)
+                    || metadata.maximum.is_some_and(|maximum| number > maximum)
+                {
+                    return Err(format!(
+                        "{flag} must be between {} and {}",
+                        metadata
+                            .minimum
+                            .map_or_else(|| "any value".into(), |n| n.to_string()),
+                        metadata
+                            .maximum
+                            .map_or_else(|| "any value".into(), |n| n.to_string())
+                    ));
+                }
+            }
+        }
         if !CONFIGURABLE_CLI_OPTIONS.contains(&flag.as_str()) {
             if flag.len() > 128
                 || !flag.strip_prefix("--").is_some_and(|name| {
@@ -1185,7 +1375,15 @@ fn validate_extra_profile_options(
                 }
             }
             "--present-mode" => {
-                if !["Fifo", "Mailbox", "Immediate"].contains(&value.as_str()) {
+                let supported_modes = capabilities
+                    .option_metadata
+                    .get(flag)
+                    .map(|metadata| metadata.choices.as_slice())
+                    .filter(|choices| !choices.is_empty());
+                if supported_modes.map_or_else(
+                    || !["Fifo", "Mailbox", "Immediate"].contains(&value.as_str()),
+                    |choices| !choices.iter().any(|choice| choice == value),
+                ) {
                     return Err("Present mode must be Fifo, Mailbox, or Immediate".into());
                 }
             }
@@ -1246,12 +1444,28 @@ fn validate_extra_profile_options(
                 }
             }
             "--shader-optimization-type" => {
-                if !["None", "Size", "Performance"].contains(&value.as_str()) {
+                let supported_modes = capabilities
+                    .option_metadata
+                    .get(flag)
+                    .map(|metadata| metadata.choices.as_slice())
+                    .filter(|choices| !choices.is_empty());
+                if supported_modes.map_or_else(
+                    || !["None", "Size", "Performance"].contains(&value.as_str()),
+                    |choices| !choices.iter().any(|choice| choice == value),
+                ) {
                     return Err("Shader optimization must be None, Size, or Performance".into());
                 }
             }
             "--shader-log-direction" | "--printf-direction" => {
-                if !["Silent", "Console", "File"].contains(&value.as_str()) {
+                let supported_modes = capabilities
+                    .option_metadata
+                    .get(flag)
+                    .map(|metadata| metadata.choices.as_slice())
+                    .filter(|choices| !choices.is_empty());
+                if supported_modes.map_or_else(
+                    || !["Silent", "Console", "File"].contains(&value.as_str()),
+                    |choices| !choices.iter().any(|choice| choice == value),
+                ) {
                     return Err(format!("{flag} must be Silent, Console, or File"));
                 }
             }
@@ -3378,40 +3592,90 @@ fn open_game_folder(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
     open_directory(directory)
 }
 fn shader_precompile_files(build_path: &Path) -> Option<(PathBuf, PathBuf)> {
-    #[cfg(windows)]
-    let (script_name, tool_names) = (
-        "precompile-windows.ps1",
-        [
-            "kyty_shader_precompile.exe",
-            "_Build/windows/kyty_shader_precompile.exe",
-        ],
-    );
-    #[cfg(not(windows))]
-    let (script_name, tool_names) = (
-        "precompile-linux.sh",
-        [
-            "kyty_shader_precompile",
-            "_Build/linux/kyty_shader_precompile",
-        ],
-    );
-    let script = build_path.join(script_name);
-    if !script.is_file() {
-        return None;
-    }
-    tool_names
+    let script = precompile_script_candidates(build_path)
+        .into_iter()
+        .find(|path| path.is_file())?;
+    let script_requires_windows_tool = precompile_script_requires_windows_tool(&script);
+    precompile_tool_candidates(build_path)
         .iter()
-        .map(|name| build_path.join(name))
-        .find(|tool| is_emulator_executable(tool))
+        .find(|tool| {
+            if script_requires_windows_tool {
+                tool.file_name()
+                    .is_some_and(|name| name == "kyty_shader_precompile.exe")
+                    && tool.is_file()
+            } else {
+                shader_precompile_tool_available(tool)
+            }
+        })
+        .cloned()
         .map(|tool| (script, tool))
+}
+fn precompile_script_candidates(root: &Path) -> Vec<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &[
+            "precompile-windows.ps1",
+            "precompile.ps1",
+            "precompile.cmd",
+            "precompile.bat",
+        ]
+    } else {
+        &["precompile-linux.sh", "precompile.sh"]
+    };
+    names.iter().map(|name| root.join(name)).collect()
+}
+fn precompile_script_requires_windows_tool(script: &Path) -> bool {
+    fs::read_to_string(script).is_ok_and(|contents| contents.contains("kyty_shader_precompile.exe"))
+}
+fn configured_build_directory(build: &Build) -> Option<PathBuf> {
+    let args = &build.configuration.cmake_arguments;
+    args.iter().enumerate().find_map(|(index, argument)| {
+        if argument == "-B" {
+            args.get(index + 1).map(|value| PathBuf::from(value))
+        } else {
+            argument
+                .strip_prefix("-B")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        }
+    })
+}
+fn stage_precompile_for_build(build: &Build, repository: &Repo) -> Result<(), String> {
+    if shader_precompile_files(Path::new(&build.path)).is_some() {
+        return Ok(());
+    }
+    let Some(source) = repository
+        .source_path
+        .as_deref()
+        .map(|path| Path::new(path))
+    else {
+        return Ok(());
+    };
+    let source_commit = git(Some(source), &["rev-parse", "HEAD"]).ok();
+    let source_changes = git(Some(source), &["status", "--porcelain"]).ok();
+    if source_commit.as_deref() != Some(build.commit_sha.as_str())
+        || source_changes.as_deref() != Some("")
+    {
+        return Ok(());
+    }
+    let build_dir = configured_build_directory(build).unwrap_or_else(|| PathBuf::from(&build.path));
+    stage_shader_precompile_assets(source, &build_dir, Path::new(&build.path))
 }
 #[tauri::command]
 fn shader_precompile_support(
     app: tauri::AppHandle,
+    game_id: i64,
     build_id: i64,
 ) -> Result<ShaderPrecompileSupport, String> {
-    let installation = build(&db(&app)?, build_id)?;
+    let connection = db(&app)?;
+    let installation = build(&connection, build_id)?;
+    let repository = repo(&connection, installation.repo_id)?;
+    stage_precompile_for_build(&installation, &repository)?;
+    let background_precompile = is_jetsku_precompile_fork(&repository);
     Ok(ShaderPrecompileSupport {
         full_precompile: shader_precompile_files(Path::new(&installation.path)).is_some(),
+        background_precompile,
+        background_enabled: background_precompile
+            && get_game_shader_precompile_enabled(&connection, game_id, build_id)?,
         cache_directory: Path::new(&installation.path)
             .join("_PipelineCache")
             .display()
@@ -3443,13 +3707,14 @@ fn precompile_game_shaders_sync(
         return Err("A shader precompile is already running".into());
     }
     let result = (|| {
-        let (game_info, installation) = {
+        let (game_info, installation, repository) = {
             let _session_lifecycle = SESSION_LIFECYCLE_LOCK
                 .lock()
                 .map_err(|error| error.to_string())?;
             let c = db(&app)?;
             let game_info = game(&c, game_id)?;
             let installation = build(&c, build_id)?;
+            let repository = repo(&c, installation.repo_id)?;
             let active_session: bool = c
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sessions WHERE ended_at IS NULL)",
@@ -3460,18 +3725,33 @@ fn precompile_game_shaders_sync(
             if active_session {
                 return Err("Close the running emulator before precompiling shaders".into());
             }
-            (game_info, installation)
+            (game_info, installation, repository)
         };
+        stage_precompile_for_build(&installation, &repository)?;
         let (script, _tool) = shader_precompile_files(Path::new(&installation.path))
             .ok_or("The selected build does not include a full shader precompile tool")?;
         let mut command = if cfg!(windows) {
-            let mut command = Command::new("powershell.exe");
-            command
-                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-                .arg(script)
-                .args(["-Game"])
-                .arg(&game_info.path);
-            command
+            if script
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
+            {
+                let mut command = Command::new("cmd.exe");
+                command
+                    .arg("/C")
+                    .arg(script)
+                    .arg("-Game")
+                    .arg(&game_info.path);
+                command
+            } else {
+                let mut command = Command::new("powershell.exe");
+                command
+                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+                    .arg(script)
+                    .args(["-Game"])
+                    .arg(&game_info.path);
+                command
+            }
         } else {
             let mut command = Command::new("bash");
             command.arg(script).args(["--game"]).arg(&game_info.path);
@@ -7022,6 +7302,196 @@ fn insert_registered_build(
         .map_err(|error| error.to_string())?;
     Ok(inserted == 1)
 }
+fn build_optional_shader_tool(
+    app: &tauri::AppHandle,
+    jobs: &Jobs,
+    kind: &str,
+    build_dir: &Path,
+    log_path: &Path,
+    target: &str,
+) {
+    let mut help = host_tool_command("cmake");
+    help.arg("--build")
+        .arg(build_dir)
+        .args(["--target", "help"]);
+    #[cfg(windows)]
+    if windows_build::apply_environment(&mut help).is_err() {
+        return;
+    }
+    let Ok(output) = help.output() else { return };
+    if !output.status.success() {
+        return;
+    }
+    let targets = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !targets.lines().any(|line| line.contains(target)) {
+        return;
+    }
+    if let Err(error) = execute(
+        app,
+        jobs,
+        kind,
+        "Shader tools",
+        "cmake",
+        &[
+            "--build".into(),
+            build_dir.display().to_string(),
+            "--target".into(),
+            target.into(),
+            "--parallel".into(),
+            "2".into(),
+        ],
+        None,
+        Some(log_path),
+    ) {
+        if let Ok(mut log) = fs::OpenOptions::new().append(true).open(log_path) {
+            let _ = writeln!(
+                log,
+                "[shader-tools] optional target {target} was unavailable: {error}"
+            );
+        }
+    }
+}
+
+fn copy_directory_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_directory_tree(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(source_path, destination_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn precompile_tool_candidates(root: &Path) -> Vec<PathBuf> {
+    let platform = if cfg!(windows) { "windows" } else { "linux" };
+    let names: &[&str] = if cfg!(windows) {
+        &["kyty_shader_precompile.exe"]
+    } else {
+        &["kyty_shader_precompile", "kyty_shader_precompile.exe"]
+    };
+    names
+        .iter()
+        .flat_map(|name| {
+            [
+                root.join(name),
+                root.join("Release").join(name),
+                root.join("_Build").join(platform).join(name),
+                root.join("tools/local/static-precompile").join(name),
+            ]
+        })
+        .collect()
+}
+
+fn shader_seeds_tool_candidates(root: &Path) -> Vec<PathBuf> {
+    let platform = if cfg!(windows) { "windows" } else { "linux" };
+    let names: &[&str] = if cfg!(windows) {
+        &["kyty_seeds.exe"]
+    } else {
+        &["kyty_seeds", "kyty_seeds.exe"]
+    };
+    names
+        .iter()
+        .flat_map(|name| {
+            [
+                root.join(name),
+                root.join("Release").join(name),
+                root.join("_Build/seeds-dist").join(name),
+                root.join("_Build").join(platform).join(name),
+                root.join("tools/local/static-precompile").join(name),
+            ]
+        })
+        .collect()
+}
+
+fn shader_precompile_tool_available(path: &Path) -> bool {
+    if !cfg!(windows)
+        && path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        path.is_file()
+    } else {
+        is_emulator_executable(path)
+    }
+}
+
+fn stage_shader_precompile_assets(
+    source: &Path,
+    build_dir: &Path,
+    install: &Path,
+) -> Result<(), String> {
+    let Some(script) = [build_dir, source, install]
+        .into_iter()
+        .flat_map(precompile_script_candidates)
+        .find(|path| path.is_file())
+    else {
+        return Ok(());
+    };
+    let script_requires_windows_tool = precompile_script_requires_windows_tool(&script);
+    let Some(tool) = precompile_tool_candidates(build_dir)
+        .into_iter()
+        .chain(precompile_tool_candidates(source))
+        .chain(precompile_tool_candidates(install))
+        .find(|path| {
+            if script_requires_windows_tool {
+                path.file_name()
+                    .is_some_and(|name| name == "kyty_shader_precompile.exe")
+                    && path.is_file()
+            } else {
+                shader_precompile_tool_available(path)
+            }
+        })
+    else {
+        return Ok(());
+    };
+    let script_name = script
+        .file_name()
+        .ok_or("Shader precompile script has no filename")?;
+    fs::copy(&script, install.join(script_name)).map_err(|error| error.to_string())?;
+    let tool_name = tool
+        .file_name()
+        .ok_or("Shader precompile tool has no filename")?;
+    if tool != install.join(tool_name) {
+        fs::copy(&tool, install.join(tool_name)).map_err(|error| error.to_string())?;
+    }
+    if let Some(seeds) = [build_dir, source, install]
+        .into_iter()
+        .flat_map(shader_seeds_tool_candidates)
+        .find(|path| shader_precompile_tool_available(path))
+    {
+        let seeds_name = seeds
+            .file_name()
+            .ok_or("Shader seeds tool has no filename")?
+            .to_owned();
+        let staged_seeds = install.join(seeds_name);
+        if seeds != staged_seeds {
+            fs::copy(&seeds, staged_seeds).map_err(|error| error.to_string())?;
+        }
+    }
+    for root in [source, build_dir] {
+        let support_files = root.join("tools/local/static-precompile");
+        if support_files.is_dir() {
+            copy_directory_tree(
+                &support_files,
+                &install.join("tools/local/static-precompile"),
+            )
+            .map_err(|error| error.to_string())?;
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)] // Build orchestration uses explicit inputs shared by both host platforms.
 fn build_and_register(
     app: &tauri::AppHandle,
@@ -7104,6 +7574,15 @@ fn build_and_register(
         None,
         Some(&log_path),
     )?;
+    build_optional_shader_tool(
+        app,
+        jobs,
+        job_kind,
+        &build_dir,
+        &log_path,
+        "kyty_shader_precompile",
+    );
+    build_optional_shader_tool(app, jobs, job_kind, &build_dir, &log_path, "kyty_seeds");
     execute(
         app,
         jobs,
@@ -7120,6 +7599,14 @@ fn build_and_register(
         Some(&log_path),
     )?;
     ensure_job_not_cancelled(jobs)?;
+    if let Err(error) = stage_shader_precompile_assets(source, &build_dir, &install) {
+        if let Ok(mut log) = fs::OpenOptions::new().append(true).open(&log_path) {
+            let _ = writeln!(
+                log,
+                "[shader-tools] could not stage optional precompile assets: {error}"
+            );
+        }
+    }
     emit(
         app,
         job_kind,
@@ -9757,7 +10244,7 @@ fn launch_game_impl(
     let b = build(&c, build_id)?;
     let selected_repo = repo(&c, b.repo_id)?;
     let enable_shader_precompile = is_jetsku_precompile_fork(&selected_repo)
-        && get_build_shader_precompile_enabled(&c, build_id)?;
+        && get_game_shader_precompile_enabled(&c, game_id, build_id)?;
     let capabilities = capabilities_for_build(&b)?;
     let settings_build_id = settings_build_id.unwrap_or(build_id);
     let settings_defaults = build_profile_options(&c, settings_build_id)?;
@@ -10955,9 +11442,16 @@ fn set_setting(app: tauri::AppHandle, key: String, value: String) -> Result<(), 
     Ok(())
 }
 fn valid_shader_precompile_setting_key(key: &str) -> bool {
-    key.strip_prefix("shader_precompile_enabled:")
-        .and_then(|id| id.parse::<i64>().ok())
-        .is_some_and(|id| id > 0)
+    let Some(ids) = key.strip_prefix("shader_precompile_enabled:") else {
+        return false;
+    };
+    let parsed = ids
+        .split(':')
+        .map(str::parse::<i64>)
+        .collect::<Result<Vec<_>, _>>();
+    parsed.is_ok_and(|values| {
+        (values.len() == 1 || values.len() == 2) && values.iter().all(|id| *id > 0)
+    })
 }
 fn shader_precompile_setting_key(build_id: i64) -> String {
     format!("shader_precompile_enabled:{build_id}")
@@ -10979,6 +11473,26 @@ fn get_build_shader_precompile_enabled(conn: &Connection, build_id: i64) -> Resu
         _ => cfg!(windows),
     })
     .map_err(|error| error.to_string())
+}
+fn get_game_shader_precompile_enabled(
+    conn: &Connection,
+    game_id: i64,
+    build_id: i64,
+) -> Result<bool, String> {
+    let game_key = format!("shader_precompile_enabled:{build_id}:{game_id}");
+    let game_value = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key=?",
+            [game_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    match game_value.as_deref() {
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        _ => get_build_shader_precompile_enabled(conn, build_id),
+    }
 }
 fn valid_update_interval(value: &str) -> bool {
     matches!(value, "0" | "6" | "24" | "168")

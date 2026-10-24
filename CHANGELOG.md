@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.0
+
+### Emulator settings
+
+- Read CLI option types, choices, defaults, ranges, and descriptions from each installed build so reported settings use usable selectors instead of plain text fields.
+- Improve path selection and validation for settings dialogs, and prevent form buttons from accidentally submitting the settings form.
+- Keep common game-profile settings and build defaults in sync with the same per-build option metadata.
+
+### Shader precompilation
+
+- Stage a fork's bundled shader precompile assets when installing or building it, and detect supported precompile tools per build and platform.
+- Add a per-game control to enable background shader precompilation on supported forks; keep the full manual precompile action available when the selected build provides it.
+- Report unsupported precompile modes accurately instead of treating background shader recording as full offline precompilation.
+
+### Game details
+
+- Improve settings and compatibility page layout and expose the current emulator build's real game-profile options in game details.
+
 ## 0.8.0
 
 ### Shader precompilation

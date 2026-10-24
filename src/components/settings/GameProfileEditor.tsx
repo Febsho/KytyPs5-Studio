@@ -51,7 +51,13 @@ export function GameProfileEditor({
 }: Props) {
   return (
     <div className="profile">
-      <h3>Game profile</h3>
+      <div className="game-profile-heading">
+        <div>
+          <h3>Game profile</h3>
+          <p>Override the emulator defaults for this game. Clear a field to inherit the selected build’s global value.</p>
+        </div>
+        {capabilities && <span>{capabilities.options.length} supported options</span>}
+      </div>
       <ProfileActions
         games={games}
         currentGameId={gameId}
@@ -65,6 +71,7 @@ export function GameProfileEditor({
       />
       <ProfileOptionFields
         available={capabilities?.options || []}
+        optionMetadata={capabilities?.option_metadata}
         options={profile.options}
         inheritedOptions={globalOptions}
         switchOptions={capabilities?.switch_options || []}
@@ -74,6 +81,12 @@ export function GameProfileEditor({
         }
         gpuDevices={gpuDevices}
       />
+      {capabilities?.options.length === 0 && (
+        <div className="settings-empty-options">
+          <strong>No launch settings reported</strong>
+          <span>This emulator build does not advertise configurable options for this game.</span>
+        </div>
+      )}
       {unsupported && (
         <button className="outline" onClick={onClearUnsupported}>
           Clear unsupported saved options

@@ -55,6 +55,7 @@ export type GameDetailsPageProps = {
   onInspectContent?: (gameId:number) => Promise<GameContent>;
   onFetchOnlineCheats?: (gameId:number) => Promise<RemoteCheatFile[]>;
   shaderPrecompileSupport?: ShaderPrecompileSupport | null;
+  onSetShaderPrecompileEnabled?: (enabled: boolean) => void;
   shaderPrecompileStatus?: string;
   shaderPrecompileBusy?: boolean;
   onPrecompileShaders?: (gameId: number) => Promise<void>;
@@ -100,6 +101,7 @@ export function GameDetailsPage({
   onInspectContent,
   onFetchOnlineCheats,
   shaderPrecompileSupport = null,
+  onSetShaderPrecompileEnabled,
   shaderPrecompileStatus = "",
   shaderPrecompileBusy = false,
   onPrecompileShaders,
@@ -123,6 +125,8 @@ export function GameDetailsPage({
     currentGame.build_id ?? builds.find((build) => build.active)?.id ?? builds[0]?.id ?? null,
   );
   const [abLaunchingBuildId, setAbLaunchingBuildId] = useState<number | null>(null);
+  const gameSettingsBuild = builds.find((build) => build.id === currentGame.build_id) ??
+    builds.find((build) => build.active) ?? builds[0] ?? null;
   useEffect(() => {
     setAbSettingsBuildId(
       currentGame.build_id ?? builds.find((build) => build.active)?.id ?? builds[0]?.id ?? null,
@@ -278,24 +282,44 @@ export function GameDetailsPage({
               Game files remain at their registered location. Studio does not
               copy or modify the original game data.
             </p>
-            {shaderPrecompileSupport?.full_precompile && onPrecompileShaders && (
+            {onPrecompileShaders && (
               <div className="shader-precompile-panel">
                 <div>
-                  <strong>Full shader precompile</strong>
+                  <strong>Precompile shaders for this game</strong>
                   <p>
-                    Uses the selected fork’s bundled tool. The cache is stored with this emulator build
-                    and is specific to this game and graphics driver. This can take a long time.
+                    {shaderPrecompileSupport?.full_precompile
+                      ? "Run the selected emulator build’s shader tool now. It can take a while; the cache is specific to this game and graphics driver."
+                      : shaderPrecompileSupport?.background_precompile
+                        ? "This fork records shaders while you play and compiles known shaders in the background on later launches. The first playthrough discovers them."
+                      : shaderPrecompileSupport
+                        ? "The selected emulator build does not include a full game shader precompile tool. Choose a build with the tool installed to enable this action."
+                        : gameSettingsBuild
+                          ? "Checking whether the selected emulator build includes a shader precompile tool…"
+                          : "Install an emulator build to check shader precompile support."}
                   </p>
-                  <small>{shaderPrecompileSupport.cache_directory}</small>
+                  {gameSettingsBuild && <small>Build: {gameSettingsBuild.commit_sha.slice(0, 8)} · {gameSettingsBuild.build_type}</small>}
+                  {shaderPrecompileSupport?.cache_directory && <small>Cache: {shaderPrecompileSupport.cache_directory}</small>}
                   {shaderPrecompileStatus && <small role="status">{shaderPrecompileStatus}</small>}
                 </div>
-                <button
-                  className="outline"
-                  disabled={currentGame.file_status === "Missing" || activeSessions || shaderPrecompileBusy}
-                  onClick={() => void onPrecompileShaders(currentGame.id)}
-                >
-                  {shaderPrecompileBusy ? "Precompiling…" : "Precompile shaders"}
-                </button>
+                {shaderPrecompileSupport?.background_precompile && !shaderPrecompileSupport.full_precompile ? (
+                  <label className="shader-precompile-game-toggle">
+                    <input
+                      type="checkbox"
+                      checked={shaderPrecompileSupport.background_enabled}
+                      disabled={currentGame.file_status === "Missing" || activeSessions}
+                      onChange={(event) => onSetShaderPrecompileEnabled?.(event.target.checked)}
+                    />
+                    Precompile known shaders on this game’s launches
+                  </label>
+                ) : (
+                  <button
+                    className="outline"
+                    disabled={currentGame.file_status === "Missing" || activeSessions || shaderPrecompileBusy || !shaderPrecompileSupport?.full_precompile}
+                    onClick={() => void onPrecompileShaders?.(currentGame.id)}
+                  >
+                    {shaderPrecompileBusy ? "Precompiling…" : shaderPrecompileSupport?.full_precompile ? "Precompile now" : "Precompile unavailable"}
+                  </button>
+                )}
               </div>
             )}
             <div className="buttonrow">
@@ -351,13 +375,67 @@ export function GameDetailsPage({
       )}
       {gameDetailsTab === "Settings" && (
         <div className="game-profile-workspace">
-          <div>
-            <h2>Game settings</h2>
-            <p>
-              Only options advertised by this selected emulator build can be
-              saved. Empty values inherit global defaults or KytyPS5 defaults.
-            </p>
+          <div className="game-settings-heading">
+            <div>
+              <h2>Game settings</h2>
+              <p>Choose this game’s emulator, then override its launch settings. Empty fields inherit that build’s global defaults.</p>
+            </div>
+            <label>
+              Preferred emulator
+              <select
+                aria-label="Preferred emulator build"
+                value={currentGame.build_id ?? ""}
+                onChange={(event) => {
+                  if (profileDirty && !window.confirm("This game profile has unsaved changes. Discard them and switch emulator builds?")) return;
+                  onSetPreferredBuild(event.target.value ? Number(event.target.value) : null);
+                }}
+              >
+                <option value="">Use active build{gameSettingsBuild ? ` · ${gameSettingsBuild.commit_sha.slice(0, 8)}` : ""}</option>
+                {builds.map((build) => (
+                  <option value={build.id} key={build.id}>
+                    {repos.find((repo) => repo.id === build.repo_id)?.name ?? "Emulator"} · {build.commit_sha.slice(0, 8)} · {build.build_type}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
+          {onPrecompileShaders && (
+            <section className="game-shader-precompile-card" aria-label="Game shader precompile">
+              <div>
+                <span className="eyebrow">PER-GAME ACTION</span>
+                <h3>Precompile shaders</h3>
+                <p>
+                  {shaderPrecompileSupport?.full_precompile
+                    ? "Build the shader cache for this game with the selected emulator fork. This can take a while."
+                    : shaderPrecompileSupport?.background_precompile
+                      ? "This fork records shaders during play, then compiles those known shaders in the background on later launches."
+                    : shaderPrecompileSupport
+                      ? "The selected fork does not provide a full game shader precompile tool."
+                      : "Checking precompile support for the selected emulator…"}
+                </p>
+                {shaderPrecompileStatus && <small role="status">{shaderPrecompileStatus}</small>}
+              </div>
+              {shaderPrecompileSupport?.background_precompile && !shaderPrecompileSupport.full_precompile ? (
+                <label className="shader-precompile-game-toggle">
+                  <input
+                    type="checkbox"
+                    checked={shaderPrecompileSupport.background_enabled}
+                    disabled={currentGame.file_status === "Missing" || activeSessions}
+                    onChange={(event) => onSetShaderPrecompileEnabled?.(event.target.checked)}
+                  />
+                  Enable for this game
+                </label>
+              ) : (
+                <button
+                  className="primary"
+                  disabled={currentGame.file_status === "Missing" || activeSessions || shaderPrecompileBusy || !shaderPrecompileSupport?.full_precompile}
+                  onClick={() => void onPrecompileShaders?.(currentGame.id)}
+                >
+                  {shaderPrecompileBusy ? "Precompiling…" : "Precompile for this game"}
+                </button>
+              )}
+            </section>
+          )}
           {gameProfileEditor}
         </div>
       )}

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
-import { Settings } from "lucide-react";
+import { Database, Gamepad2, Github, RefreshCw, Settings } from "lucide-react";
 import type { AppUpdateInfo, Build, ProfileCapabilities, Repo, StorageReport } from "../types/studio";
 import { ProfileOptionFields } from "../components/settings/ProfileOptionFields";
 import { formatBytes } from "../utils/format";
@@ -39,7 +39,7 @@ export type SettingsPageProps = {
   appUpdateBusy?: boolean;
   busy: boolean;
   activeSessions: boolean;
-  onSaveGlobalDefaults: () => void;
+  onSaveGlobalDefaults: () => void | Promise<void>;
   onSaveGithubToken: (token: string) => void;
   onDeleteGithubToken: () => void;
   onUpdateIntervalChange: (value: string) => void;
@@ -125,7 +125,13 @@ export function SettingsPage({
   const [storageTask, setStorageTask] = useState<string | null>(null);
   const [installedVersion, setInstalledVersion] = useState("Loading…");
   const [shaderPrecompileEnabled, setShaderPrecompileEnabled] = useState(false);
+  const [savingDefaults, setSavingDefaults] = useState(false);
+  const [saveDefaultsError, setSaveDefaultsError] = useState("");
   const storageTaskActive = useRef(false);
+  const storageTotal = storageReport?.categories.reduce(
+    (total, category) => total + category.size_bytes,
+    0,
+  ) ?? 0;
   useEffect(() => {
     let mounted = true;
     void getVersion()
@@ -180,9 +186,39 @@ export function SettingsPage({
         setStorageTask(null);
       });
   };
+  const saveDefaults = async () => {
+    if (savingDefaults) return;
+    setSavingDefaults(true);
+    setSaveDefaultsError("");
+    try {
+      await onSaveGlobalDefaults();
+    } catch (error) {
+      setSaveDefaultsError(`Settings could not be saved: ${String(error)}`);
+    } finally {
+      setSavingDefaults(false);
+    }
+  };
   return (
     <section className="page settings-page">
-      <div className="panel settings-emulator-panel">
+      <header className="settings-hero">
+        <div className="settings-hero-icon"><Settings size={22} /></div>
+        <div>
+          <span className="eyebrow">STUDIO PREFERENCES</span>
+          <h2>Settings</h2>
+          <p>Configure emulator behavior, manage local files, and control Studio integrations.</p>
+        </div>
+        <span className="settings-version">v{installedVersion}</span>
+      </header>
+      <nav className="settings-nav" aria-label="Settings sections">
+        <a href="#settings-emulator"><Gamepad2 size={16} /> Emulator</a>
+        <a href="#settings-github"><Github size={16} /> GitHub</a>
+        <a href="#settings-emulator-updates"><RefreshCw size={16} /> Emulator updates</a>
+        <a href="#settings-storage"><Database size={16} /> Storage</a>
+        <a href="#settings-discord"><Settings size={16} /> Discord</a>
+        <a href="#settings-app-updates"><RefreshCw size={16} /> Studio updates</a>
+        <a href="#settings-about"><Settings size={16} /> About</a>
+      </nav>
+      <div id="settings-emulator" className="panel settings-emulator-panel settings-section">
         <div className="settings-emulator-heading">
           <div>
             <h3>Emulator settings</h3>
@@ -260,6 +296,7 @@ export function SettingsPage({
             </p>
             <label className="settings-shader-precompile-toggle">
               <input
+                aria-label="Enable known shader precompile on each launch"
                 type="checkbox"
                 checked={shaderPrecompileEnabled}
                 onChange={(event) => {
@@ -271,7 +308,8 @@ export function SettingsPage({
                   }).catch(() => setShaderPrecompileEnabled(!enabled));
                 }}
               />
-              <span>Enable known shader precompile on each launch</span>
+              <span className="settings-toggle-track" aria-hidden="true"><i /></span>
+              <span className="settings-toggle-label">Enable known shader precompile on each launch</span>
             </label>
           </aside>
         )}
@@ -306,6 +344,7 @@ export function SettingsPage({
             <h4>Common settings</h4>
             <ProfileOptionFields
               available={primaryOptions}
+              optionMetadata={globalProfileCapabilities.option_metadata}
               options={globalProfileOptions}
               switchOptions={globalProfileCapabilities.switch_options || []}
               previewTitle="Emulator launch arguments"
@@ -321,6 +360,7 @@ export function SettingsPage({
             <p className="hint">These options come from the selected emulator’s command-line help.</p>
             <ProfileOptionFields
               available={additionalOptions}
+              optionMetadata={globalProfileCapabilities.option_metadata}
               options={globalProfileOptions}
               switchOptions={globalProfileCapabilities.switch_options || []}
               previewTitle="Emulator launch arguments"
@@ -340,12 +380,13 @@ export function SettingsPage({
           <span>{selectedBuild ? "Changes apply to games assigned to this build." : "Select an installed build to edit its settings."}</span>
           <button
             className="primary"
-            disabled={!globalProfileCapabilities || !selectedBuildId || busy}
-            onClick={onSaveGlobalDefaults}
+            disabled={!globalProfileCapabilities || !selectedBuildId || savingDefaults}
+            onClick={() => void saveDefaults()}
           >
-            {busy ? "Saving…" : "Save settings"}
+            {savingDefaults ? "Saving…" : "Save settings"}
           </button>
         </div>
+        {saveDefaultsError && <p role="alert" className="error-note">{saveDefaultsError}</p>}
       </div>
       <div className="sectionhead">
         <div>
@@ -354,7 +395,7 @@ export function SettingsPage({
         </div>
         <Settings />
       </div>
-      <div className="panel">
+      <div className="panel settings-section" id="settings-github">
         <h3>GitHub access</h3>
         <p>
           Anonymous access works within GitHub rate limits. A personal access
@@ -396,7 +437,7 @@ export function SettingsPage({
           </button>
         </div>
       </div>
-      <div className="panel">
+      <div className="panel settings-section" id="settings-emulator-updates">
         <h3>Emulator update checks</h3>
         <p>
           Checks compare each tracked source and newest verified build with its
@@ -430,22 +471,35 @@ export function SettingsPage({
           when to activate the verified build.
         </p>
       </div>
-      <div className="panel">
+      <div className="panel settings-section" id="settings-storage">
         <h3>Storage management</h3>
         <p>
           Sizes include downloaded source repositories and Studio-managed build
           data. Source repositories and original game content are not cleanup
           targets here.
         </p>
-        {storageReport?.categories.map((category) => (
-          <div className="kv" key={category.name}>
-            <span>
-              {category.name}
-              <small className="storage-path">{category.path}</small>
-            </span>
-            <strong>{formatBytes(category.size_bytes)}</strong>
+        <div className="storage-overview">
+          <div className="storage-total-card">
+            <span>Studio-managed data</span>
+            <strong>{storageReport ? formatBytes(storageTotal) : "Not scanned"}</strong>
+            <small>{storageReport ? `${storageReport.categories.length} locations` : "Refresh sizes to scan storage"}</small>
           </div>
-        ))}
+          <div className="storage-breakdown" aria-label="Storage by category">
+            {storageReport?.categories.map((category, index) => {
+              const share = storageTotal > 0 ? (category.size_bytes / storageTotal) * 100 : 0;
+              return (
+                <div className="storage-category" key={category.name}>
+                  <div className="storage-category-label">
+                    <span><i className={`storage-dot tone-${index % 5}`} />{category.name}</span>
+                    <strong>{formatBytes(category.size_bytes)}</strong>
+                  </div>
+                  <div className="storage-meter" aria-hidden="true"><span style={{ width: `${share}%` }} /></div>
+                  <small className="storage-path">{category.path}</small>
+                </div>
+              );
+            })}
+          </div>
+        </div>
         <div className="buttonrow">
           <button
             className="outline"
@@ -547,7 +601,7 @@ export function SettingsPage({
           </button>
         </div>
       </div>
-      <div className="panel">
+      <div className="panel settings-section" id="settings-discord">
         <h3>Discord Rich Presence</h3>
         <p>
           Show KytyPS5 Studio while it is open and the current game with its
@@ -567,7 +621,7 @@ export function SettingsPage({
           local to Studio.
         </small>
       </div>
-      <div className="panel">
+      <div className="panel settings-section" id="settings-app-updates">
         <h3>KytyPS5 Studio updates</h3>
         <p>
           {appUpdateStatus || "App updates are checked automatically when Studio starts."}
@@ -601,7 +655,7 @@ export function SettingsPage({
           <p className="hint">Finish active builds and close emulator sessions before installing the Studio update.</p>
         )}
       </div>
-      <div className="panel">
+      <div className="panel settings-section" id="settings-about">
         <h3>About</h3>
         <p>KytyPS5 Studio {installedVersion} · Cross-platform desktop</p>
         <p>

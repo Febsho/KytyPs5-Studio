@@ -1,4 +1,6 @@
+import { useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import type { CliOptionMetadata } from "../../types/studio";
 
 export const cliOptionInfo: Record<
   string,
@@ -15,6 +17,7 @@ export const cliOptionInfo: Record<
       | "keymap"
       | "color";
     choices?: string[];
+    choiceLabels?: Record<string, string>;
     directory?: boolean;
     hint?: string;
   }
@@ -123,9 +126,21 @@ export const cliOptionInfo: Record<
     hint: "KytyPS5 allows 0–2,147,482,879 except reserved IDs 254 and 255.",
   },
   "--console-language": {
-    label: "Console language code (0–29)",
+    label: "Console language",
     group: "System",
-    kind: "number",
+    kind: "enum",
+    choices: Array.from({ length: 30 }, (_, index) => String(index)),
+    choiceLabels: {
+      "0": "Japanese", "1": "English (United States)", "2": "French (France)",
+      "3": "Spanish (Spain)", "4": "German", "5": "Italian", "6": "Dutch",
+      "7": "Portuguese (Portugal)", "8": "Russian", "9": "Korean",
+      "10": "Chinese (Traditional)", "11": "Chinese (Simplified)", "12": "Finnish",
+      "13": "Swedish", "14": "Danish", "15": "Norwegian", "16": "Polish",
+      "17": "Portuguese (Brazil)", "18": "English (United Kingdom)", "19": "Turkish",
+      "20": "Spanish (Latin America)", "21": "Arabic", "22": "French (Canada)",
+      "23": "Czech", "24": "Hungarian", "25": "Greek", "26": "Romanian",
+      "27": "Thai", "28": "Vietnamese", "29": "Indonesian",
+    },
   },
   "--network-connected": {
     label: "Network connected",
@@ -275,6 +290,7 @@ type Props = {
   switchOptions?: string[];
   previewTitle?: string;
   showUnavailable?: boolean;
+  optionMetadata?: Record<string, CliOptionMetadata>;
 };
 
 export function ProfileOptionFields({
@@ -286,33 +302,54 @@ export function ProfileOptionFields({
   switchOptions = [],
   previewTitle = "CLI argument preview",
   showUnavailable = true,
+  optionMetadata = {},
 }: Props) {
+  const [dialogError, setDialogError] = useState("");
   const update = (flag: string, value: string) => {
     const next = { ...options };
     if (value === "") delete next[flag];
     else next[flag] = value;
+    if (flag === "--amd-cpu" && value === "true") delete next["--no-amd-cpu"];
+    if (flag === "--no-amd-cpu" && value === "true") delete next["--amd-cpu"];
     onChange(next);
   };
   return (
     <>
       {(["Graphics", "Controls", "System", "Content", "Advanced"] as const).map(
         (group) => {
-          const fields = available.filter(
-            (flag) => (cliOptionInfo[flag]?.group ?? "Advanced") === group,
-          );
+          const fields = available.filter((flag) => (cliOptionInfo[flag]?.group ?? "Advanced") === group);
           if (!fields.length) return null;
           const body = (
             <>
               <div className="formgrid">
                 {fields.map((flag) => {
-                  const info =
-                    cliOptionInfo[flag] ?? {
+                  const staticInfo = cliOptionInfo[flag];
+                  const metadata = optionMetadata[flag];
+                  const metadataBoolean = metadata?.choices?.length === 2 &&
+                    metadata.choices.includes("true") && metadata.choices.includes("false");
+                  const metadataHasChoices = (metadata?.choices?.length ?? 0) > 1;
+                  const inferredKind = metadata?.kind === "bool" && switchOptions.includes(flag)
+                    ? "switch"
+                    : metadata?.kind;
+                  const info = staticInfo
+                    ? {
+                        ...staticInfo,
+                        kind: (staticInfo.kind === "switch" || staticInfo.kind === "bool"
+                          ? staticInfo.kind
+                          : metadataBoolean
+                            ? "bool"
+                            : metadataHasChoices
+                              ? "enum"
+                              : staticInfo.kind) as typeof staticInfo.kind,
+                        choices: metadata?.choices?.length ? metadata.choices : staticInfo.choices,
+                        hint: staticInfo.hint || metadata?.description,
+                      }
+                    : {
                       label: flag,
                       group: "Advanced" as const,
-                      kind: switchOptions.includes(flag)
-                        ? ("switch" as const)
-                        : ("text" as const),
-                      hint: "Advertised by this emulator build; Studio passes this value as an individual argument.",
+                      kind: switchOptions.includes(flag) ? ("switch" as const) : ((inferredKind || "text") as "switch" | "bool" | "text" | "number" | "enum" | "path" | "keymap" | "color"),
+                      choices: metadata?.choices,
+                      hint: metadata?.description || "Advertised by this emulator build; Studio passes this value as an individual argument.",
                     };
                   const isInherited =
                     options[flag] === undefined &&
@@ -342,6 +379,20 @@ export function ProfileOptionFields({
                           value={value || "#ffffff"}
                           onChange={(event) => set(event.target.value)}
                         />
+                      ) : info.kind === "enum" ? (
+                        <select
+                          aria-label={info.label}
+                          value={value}
+                          onChange={(event) => set(event.target.value)}
+                        >
+                          <option value="">Emulator default</option>
+                          {value && !info.choices?.includes(value) && (
+                            <option value={value}>{value} · saved value</option>
+                          )}
+                          {info.choices?.map((choice) => (
+                            <option key={choice} value={choice}>{info.choiceLabels?.[choice] ? `${info.choiceLabels[choice]} (${choice})` : choice}</option>
+                          ))}
+                        </select>
                       ) : flag === "--gpu" && gpuDevices.length > 0 ? (
                         <select
                           aria-label={info.label}
@@ -409,6 +460,7 @@ export function ProfileOptionFields({
                                     }
                                   />
                                   <button
+                                    type="button"
                                     className="outline"
                                     aria-label={`Remove mapping ${index + 1}`}
                                     onClick={() =>
@@ -427,6 +479,7 @@ export function ProfileOptionFields({
                               );
                             })}
                           <button
+                            type="button"
                             className="outline"
                             onClick={() =>
                               set(
@@ -446,20 +499,20 @@ export function ProfileOptionFields({
                             aria-label={info.label}
                             type={info.kind === "number" ? "number" : "text"}
                             min={
-                              flag === "--user-id"
+                              metadata?.minimum ?? (flag === "--user-id"
                                 ? 0
                                 : flag === "--gpu"
                                   ? -1
                                   : flag === "--vblank-frequency"
                                     ? 30
-                                    : undefined
+                                    : undefined)
                             }
                             max={
-                              flag === "--user-id"
+                              metadata?.maximum ?? (flag === "--user-id"
                                 ? 2147482879
                                 : flag === "--vblank-frequency"
                                   ? 360
-                                  : undefined
+                                  : undefined)
                             }
                             placeholder={
                               flag === "--mic"
@@ -471,18 +524,24 @@ export function ProfileOptionFields({
                           />
                           {info.kind === "path" && (
                             <button
+                              type="button"
                               className="outline"
                               onClick={async () => {
-                                const path =
-                                  flag === "--printf-output-file"
-                                    ? await save({
-                                        defaultPath: value || undefined,
-                                      })
-                                    : await open({
-                                        directory: !!info.directory,
-                                        multiple: false,
-                                      });
-                                if (typeof path === "string") set(path);
+                                setDialogError("");
+                                try {
+                                  const path =
+                                    flag === "--printf-output-file"
+                                      ? await save({
+                                          defaultPath: value || undefined,
+                                        })
+                                      : await open({
+                                          directory: !!info.directory,
+                                          multiple: false,
+                                        });
+                                  if (typeof path === "string") set(path);
+                                } catch (error) {
+                                  setDialogError(`Could not open the file picker: ${String(error)}`);
+                                }
                               }}
                             >
                               Browse
@@ -492,6 +551,7 @@ export function ProfileOptionFields({
                       )}
                       {options[flag] !== undefined && (
                         <button
+                          type="button"
                           className="text-button"
                           onClick={() => update(flag, "")}
                         >
@@ -527,6 +587,7 @@ export function ProfileOptionFields({
           );
         },
       )}
+      {dialogError && <small role="alert" className="error-note">{dialogError}</small>}
       {showUnavailable && Object.entries(cliOptionInfo).some(([flag]) => !available.includes(flag)) && (
         <details className="unsupported-profile-options">
           <summary>

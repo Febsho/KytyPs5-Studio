@@ -1387,6 +1387,7 @@ export function App() {
     setShaderPrecompileSupport(null);
     setShaderPrecompileStatus("");
     void call<ShaderPrecompileSupport>("shader_precompile_support", {
+      gameId: currentGame.id,
       buildId: currentGameBuildId,
     })
       .then((support) => {
@@ -1521,7 +1522,7 @@ export function App() {
         .catch(() => {});
   }, [currentGame?.id]);
   useEffect(() => {
-    if (page !== "diagnostics" && !(page === "home" && specsOpen)) return;
+    if (page !== "diagnostics" && page !== "settings" && !(page === "home" && specsOpen)) return;
     let disposed = false;
     setGraphics(null);
     invoke<GraphicsDiagnostics>("inspect_graphics")
@@ -2646,6 +2647,22 @@ export function App() {
               onBack={() => setPage("library")}
               onLaunch={(gameId) => void launchGame(gameId)}
               shaderPrecompileSupport={shaderPrecompileSupport}
+              onSetShaderPrecompileEnabled={(enabled) => {
+                if (!currentGame || currentGameBuildId === null) return;
+                const previous = shaderPrecompileSupport?.background_enabled ?? false;
+                setShaderPrecompileSupport((support) => support
+                  ? { ...support, background_enabled: enabled }
+                  : support);
+                void call("set_setting", {
+                  key: `shader_precompile_enabled:${currentGameBuildId}:${currentGame.id}`,
+                  value: String(enabled),
+                }).catch((error) => {
+                  setShaderPrecompileSupport((support) => support
+                    ? { ...support, background_enabled: previous }
+                    : support);
+                  setMessage(`Could not save this game's shader precompile setting: ${String(error)}`);
+                });
+              }}
               shaderPrecompileStatus={shaderPrecompileStatus}
               shaderPrecompileBusy={shaderPrecompileBusy}
               onPrecompileShaders={precompileGameShaders}
@@ -2775,7 +2792,7 @@ export function App() {
               onCheckAppUpdate={checkAppUpdate}
               onInstallAppUpdate={installAppUpdate}
               onSaveGlobalDefaults={() =>
-                action(async () => {
+                (async () => {
                   if (globalProfileBuildId === null) throw new Error("Select an installed emulator build first");
                   await call("set_build_profile_options", {
                     buildId: globalProfileBuildId,
@@ -2785,7 +2802,7 @@ export function App() {
                     setGameProfileGlobalOptions(globalProfileOptions);
                   }
                   setMessage("Emulator settings saved for the selected build");
-                })
+                })()
               }
               onSaveGithubToken={(token) =>
                 action(async () => {

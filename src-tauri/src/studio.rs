@@ -6981,7 +6981,7 @@ fn linux_x86_64_cmake_cpu_flags(target_os: &str, target_arch: &str) -> Vec<Strin
 // in bufferCache.cpp. On Linux, Clang's compatibility header forwards to a
 // nonexistent system header. Put a tiny x86 compatibility header ahead of
 // Clang's builtin include directory, without modifying the user's checkout.
-#[cfg(any(not(windows), test))]
+#[cfg(not(windows))]
 fn linux_x86_64_intrin_compat_flags(
     target_os: &str,
     target_arch: &str,

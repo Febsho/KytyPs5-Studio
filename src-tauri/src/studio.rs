@@ -1088,8 +1088,8 @@ fn cli_option_metadata(help: &str) -> HashMap<String, CliOptionMetadata> {
             let token_value = value_token
                 .as_deref()
                 .unwrap_or_default()
-                .trim_start_matches(|character| character == '<' || character == '[')
-                .trim_end_matches(|character| character == '>' || character == ']');
+                .trim_start_matches(['<', '['])
+                .trim_end_matches(['>', ']']);
             let mut choices = token_value
                 .split('|')
                 .map(str::trim)
@@ -3630,7 +3630,7 @@ fn configured_build_directory(build: &Build) -> Option<PathBuf> {
     let args = &build.configuration.cmake_arguments;
     args.iter().enumerate().find_map(|(index, argument)| {
         if argument == "-B" {
-            args.get(index + 1).map(|value| PathBuf::from(value))
+            args.get(index + 1).map(PathBuf::from)
         } else {
             argument
                 .strip_prefix("-B")
@@ -3643,11 +3643,7 @@ fn stage_precompile_for_build(build: &Build, repository: &Repo) -> Result<(), St
     if shader_precompile_files(Path::new(&build.path)).is_some() {
         return Ok(());
     }
-    let Some(source) = repository
-        .source_path
-        .as_deref()
-        .map(|path| Path::new(path))
-    else {
+    let Some(source) = repository.source_path.as_deref().map(Path::new) else {
         return Ok(());
     };
     let source_commit = git(Some(source), &["rev-parse", "HEAD"]).ok();

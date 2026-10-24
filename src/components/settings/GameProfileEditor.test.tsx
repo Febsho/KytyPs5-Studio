@@ -16,7 +16,7 @@ const game = (id: number, title: string): Game => ({
   build_id: null,
   play_seconds: 0,
   last_played: null,
-  title_id: null,
+  title_id: `PPSA${String(id).padStart(5, "0")}`,
   game_version: null,
   icon_path: null,
   install_size: null,

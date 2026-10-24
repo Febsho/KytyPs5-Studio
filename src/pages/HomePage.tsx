@@ -11,9 +11,9 @@ import type {
   OfficialCompatibilityIndex,
 } from "../types/studio";
 import { GameContextMenu, VirtualHomeGameRow } from "../components/games/GameLibrary";
-import { date, formatBytes, short } from "../utils/format";
+import { GameCompatibilityBadge } from "../components/games/GameCompatibilityBadge";
+import { date, emulatorBuildName, formatBytes } from "../utils/format";
 import { trophySummary } from "../utils/trophies";
-import { compatibilityBadgeLabel, officialCompatibilityForGame } from "../utils/compatibility";
 
 type Page =
   | "home"
@@ -43,7 +43,7 @@ export type HomePageProps = {
   launchGame: (gameId: number) => Promise<void>;
   selectGameWithGuard: (gameId: number, afterSelect?: () => void) => boolean | void;
   setGameDetailsTab: Dispatch<
-    SetStateAction<"Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Cheats">
+    SetStateAction<"Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Patches">
   >;
   setHomeSelection: Dispatch<SetStateAction<number | null>>;
   inspectGameContent?: (gameId:number) => Promise<GameContent>;
@@ -113,6 +113,7 @@ export function HomePage({
             games={games}
             selectedId={featuredGame?.id}
             onSelect={setHomeSelection}
+            officialCompatibilityIndex={officialCompatibilityIndex}
             onActivate={(gameId) => void launchGame(gameId)}
             onContextMenu={(selected, event) => {
               event.preventDefault();
@@ -133,7 +134,7 @@ export function HomePage({
       {featuredGame && <div className="home-feature">
         <div className="home-game-meta">
           {featuredGame?.title_id && <span>{featuredGame.title_id}</span>}
-          {featuredGame && officialCompatibilityIndex && officialCompatibilityForGame(featuredGame, officialCompatibilityIndex) && <span className="home-official-compatibility">{compatibilityBadgeLabel(officialCompatibilityForGame(featuredGame, officialCompatibilityIndex))}</span>}
+          {featuredGame && <GameCompatibilityBadge game={featuredGame} index={officialCompatibilityIndex} className="home-official-compatibility" />}
           {featuredGame?.game_version && (
             <span>VERSION {featuredGame.game_version}</span>
           )}
@@ -161,9 +162,9 @@ export function HomePage({
               : "Imported game · gameplay compatibility is unconfirmed."
             : "Import a supported game folder to build your library."}
         </p>
-        {trophyProgress?.earned !== null && trophyProgress?.earned !== undefined && trophyProgress.total > 0 && <div className="home-trophy-progress" aria-label="Trophy progress">
-          <span>{trophyProgress.earned} of {trophyProgress.total} earned</span>
-          {(["platinum", "gold", "silver", "bronze"] as const).filter((grade) => trophyProgress.counts[grade] > 0).map((grade) => <span className={`trophy-progress-grade trophy-${grade}`} key={grade}>{trophyProgress.earnedByGrade[grade]}/{trophyProgress.counts[grade]} {grade}</span>)}
+        {trophyProgress && trophyProgress.total > 0 && <div className="home-trophy-progress" aria-label="Trophy progress">
+          <div className="trophy-progress-heading"><strong>Trophies</strong><span>{trophyProgress.earned === null ? "Earned status unavailable" : `${trophyProgress.earned} / ${trophyProgress.total} earned`}</span></div>
+          <div className="trophy-progress-grid">{(["bronze", "silver", "gold", "platinum"] as const).map((grade) => <div className={`trophy-progress-grade trophy-${grade}`} key={grade}><span>{grade}</span><strong>{trophyProgress.earned === null ? "—" : trophyProgress.earnedByGrade[grade]} <i>/</i> {trophyProgress.counts[grade]}</strong></div>)}</div>
         </div>}
         <div className="hero-actions">
           {featuredGame ? (
@@ -215,7 +216,7 @@ export function HomePage({
           <span>
             <i className="statusdot" />
             {active
-              ? `${repos.find((repo) => repo.id === active.repo_id)?.name || "KytyPS5"} · ${short(active.commit_sha)}`
+              ? emulatorBuildName(repos.find((repo) => repo.id === active.repo_id), active)
               : "No verified emulator build"}
           </span>
           {message.includes("Update available:") && (
@@ -296,7 +297,7 @@ export function HomePage({
               <span>Active emulator</span>
               <strong>
                 {active
-                  ? `${short(active.commit_sha)} · ${active.build_type}`
+                  ? `${emulatorBuildName(repos.find((repo) => repo.id === active.repo_id), active)} · ${active.build_type}`
                   : "None"}
               </strong>
             </div>

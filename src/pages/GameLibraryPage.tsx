@@ -12,16 +12,15 @@ import {
 import type {
   Build,
   Game,
-  GameCompatibility,
   GameContent,
   GameScanEvent,
   OfficialCompatibilityIndex,
   Repo,
 } from "../types/studio";
 import { GameContextMenu, VirtualGameGrid } from "../components/games/GameLibrary";
-import { short } from "../utils/format";
+import { GameCompatibilityBadge } from "../components/games/GameCompatibilityBadge";
+import { emulatorBuildName } from "../utils/format";
 import { trophySummary } from "../utils/trophies";
-import { compatibilityOsLabel, compatibilityStatusLabel, currentCompatibilityOS, officialCompatibilityForGame } from "../utils/compatibility";
 
 export type GameLibraryPageProps = {
   games: Game[];
@@ -30,7 +29,6 @@ export type GameLibraryPageProps = {
   gameBackground: string | null;
   gameIcon: string | null;
   gameScan: GameScanEvent | null;
-  gameCompatibility: GameCompatibility | null;
   officialCompatibilityIndex?: OfficialCompatibilityIndex | null;
   inspectGameContent?: (gameId: number) => Promise<GameContent>;
   query: string;
@@ -51,7 +49,6 @@ export type GameLibraryPageProps = {
   onOpenDetails: () => void;
   onOpenGameFolder: () => void;
   onOpenFolderForGame?: (game: Game) => void;
-  onOpenLatestSessionLog: () => void;
   onLaunch: (id: number) => void;
   onToggleFavorite: (id: number) => void;
   onSetPreferredBuild: (id: number | null) => void;
@@ -66,7 +63,6 @@ export function GameLibraryPage({
   gameBackground,
   gameIcon,
   gameScan,
-  gameCompatibility,
   officialCompatibilityIndex,
   inspectGameContent,
   query,
@@ -85,7 +81,6 @@ export function GameLibraryPage({
   onOpenDetails,
   onOpenGameFolder,
   onOpenFolderForGame,
-  onOpenLatestSessionLog,
   onLaunch,
   onToggleFavorite,
   onSetPreferredBuild,
@@ -198,6 +193,7 @@ export function GameLibraryPage({
           games={filteredGames}
           selectedId={currentGame?.id}
           onSelect={onSelectGame}
+          officialCompatibilityIndex={officialCompatibilityIndex}
           onContextMenu={(game, event: ReactMouseEvent<HTMLButtonElement>) => {
             event.preventDefault();
             setContextMenu({ game, x: event.clientX, y: event.clientY });
@@ -224,8 +220,10 @@ export function GameLibraryPage({
                 !gameBackground && <Gamepad2 size={56} />
               )}
             </div>
-            <h2>{currentGame.title}</h2>
-            {officialCompatibilityIndex && officialCompatibilityForGame(currentGame, officialCompatibilityIndex) && <div className="library-official-compatibility"><span>Official compatibility</span><strong>{compatibilityStatusLabel(officialCompatibilityForGame(currentGame, officialCompatibilityIndex)?.status)}</strong><small>{officialCompatibilityForGame(currentGame, officialCompatibilityIndex)?.preferred_os === currentCompatibilityOS() ? `${compatibilityOsLabel(currentCompatibilityOS())} result` : Object.keys(officialCompatibilityForGame(currentGame, officialCompatibilityIndex)?.os ?? {}).length ? "Best available result" : "No report"}</small></div>}
+            <div className="library-title-row">
+              <h2>{currentGame.title}</h2>
+              <GameCompatibilityBadge game={currentGame} index={officialCompatibilityIndex} />
+            </div>
             <p className="path">{currentGame.path}</p>
             <div className="library-detail-actions">
               <button
@@ -252,76 +250,9 @@ export function GameLibraryPage({
               )}
             </div>
             {trophyProgress && trophyProgress.total > 0 && <div className="library-trophy-progress">
-              <strong>Trophies</strong>
-              <span>{trophyProgress.earned === null ? `${trophyProgress.total} total · earned status unavailable` : `${trophyProgress.earned} / ${trophyProgress.total} earned`}</span>
-              {trophyProgress.earned !== null && <div>{(["platinum", "gold", "silver", "bronze"] as const).filter((grade) => trophyProgress.counts[grade] > 0).map((grade) => <span className={`trophy-progress-grade trophy-${grade}`} key={grade}>{trophyProgress.earnedByGrade[grade]}/{trophyProgress.counts[grade]} {grade}</span>)}</div>}
+              <div className="trophy-progress-heading"><strong>Trophies</strong><span>{trophyProgress.earned === null ? "Earned status unavailable" : `${trophyProgress.earned} / ${trophyProgress.total} earned`}</span></div>
+              <div className="trophy-progress-grid">{(["bronze", "silver", "gold", "platinum"] as const).map((grade) => <div className={`trophy-progress-grade trophy-${grade}`} key={grade}><span>{grade}</span><strong>{trophyProgress.earned === null ? "—" : trophyProgress.earnedByGrade[grade]} <i>/</i> {trophyProgress.counts[grade]}</strong></div>)}</div>
             </div>}
-            <div className="compatibility-panel">
-              <h3>Compatibility evidence</h3>
-              <div className="kv">
-                <span>Supported path recognized</span>
-                <strong
-                  className={
-                    gameCompatibility?.path_recognized ? "good" : "bad"
-                  }
-                >
-                  {gameCompatibility
-                    ? gameCompatibility.path_recognized
-                      ? "Yes"
-                      : "No"
-                    : "Checking…"}
-                </strong>
-              </div>
-              <div className="kv">
-                <span>Emulator process starts</span>
-                <strong>
-                  {gameCompatibility?.emulator_process_starts ?? "—"} /{" "}
-                  {gameCompatibility?.launch_attempts ?? "—"} attempts
-                </strong>
-              </div>
-              <div className="kv">
-                <span>Emulator reported title ID</span>
-                <strong>
-                  {gameCompatibility
-                    ? gameCompatibility.emulator_reported_title_id
-                      ? "Observed"
-                      : "Not observed"
-                    : "Checking…"}
-                </strong>
-              </div>
-              <div className="kv">
-                <span>Reached gameplay</span>
-                <strong>
-                  {gameCompatibility?.gameplay_status || "Unknown"}
-                </strong>
-              </div>
-              <div className="kv">
-                <span>Confirmed playable</span>
-                <strong>
-                  {gameCompatibility?.playable_status || "Unconfirmed"}
-                </strong>
-              </div>
-              {gameCompatibility?.last_outcome && (
-                <div className="kv">
-                  <span>Last result</span>
-                  <strong>
-                    {gameCompatibility.last_outcome}
-                    {gameCompatibility.last_exit_code !== null
-                      ? ` · exit ${gameCompatibility.last_exit_code}`
-                      : ""}
-                  </strong>
-                </div>
-              )}
-              {gameCompatibility?.latest_log_path && (
-                <button className="outline" onClick={onOpenLatestSessionLog}>
-                  Open latest session log
-                </button>
-              )}
-              <p className="hint">
-                Studio records file recognition and process evidence. It cannot
-                currently detect when a game reaches gameplay.
-              </p>
-            </div>
             <div className="buttonrow">
               <button
                 className="primary"
@@ -364,8 +295,7 @@ export function GameLibraryPage({
               <option value="">Use active build</option>
               {builds.map((b) => (
                 <option value={b.id} key={b.id}>
-                  {repos.find((r) => r.id === b.repo_id)?.name} ·{" "}
-                  {short(b.commit_sha)} · {b.build_type}
+                  {emulatorBuildName(repos.find((r) => r.id === b.repo_id), b)}
                 </option>
               ))}
             </select>

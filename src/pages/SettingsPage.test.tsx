@@ -37,8 +37,6 @@ function props(overrides: Partial<SettingsPageProps> = {}): SettingsPageProps {
     githubTokenAvailable: false,
     githubTokenInput: "secret-value",
     setGithubTokenInput: vi.fn(),
-    updateInterval: "24",
-    autoUpdateMode: "notify",
     storageReport: {
       categories: [
         {
@@ -53,8 +51,6 @@ function props(overrides: Partial<SettingsPageProps> = {}): SettingsPageProps {
     onSaveGlobalDefaults: vi.fn(),
     onSaveGithubToken: vi.fn(),
     onDeleteGithubToken: vi.fn(),
-    onUpdateIntervalChange: vi.fn(),
-    onAutoUpdateModeChange: vi.fn(),
     onRefreshStorage: vi.fn(),
     onCleanIncompleteBuilds: vi.fn(),
     onClearCompilerCache: vi.fn(),
@@ -89,7 +85,7 @@ describe("SettingsPage", () => {
       onInstallAppUpdate: vi.fn(),
     })} />);
 
-    expect(screen.getByText(/opens only after you choose to install it/)).toBeTruthy();
+    expect(screen.getByText(/restarts automatically when the verified NSIS update finishes/)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Install Verified Update" }).hasAttribute("disabled")).toBe(true);
     expect(screen.getByText(/Finish active builds and close emulator sessions/)).toBeTruthy();
   });

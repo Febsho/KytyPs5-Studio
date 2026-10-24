@@ -60,7 +60,7 @@ function props(
     onOpenForkManager: vi.fn(),
     onOpenBuildFolder: vi.fn(),
     onVerifyBuild: vi.fn(),
-    onCheckUpdates: vi.fn(),
+    onCheckUpdates: vi.fn().mockResolvedValue(undefined),
     onRebuild: vi.fn(),
     onActivateBuild: vi.fn(),
     onOpenBuildLog: vi.fn(),
@@ -76,11 +76,27 @@ describe("EmulatorManagerPage", () => {
     const page = props();
     render(<EmulatorManagerPage {...page} />);
 
-    expect(screen.getByText(/abc1234/)).toBeTruthy();
+    expect(screen.getByText(/#abc1234/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Open folder" }));
     expect(page.onOpenBuildFolder).toHaveBeenCalledWith(build.id);
     fireEvent.click(screen.getByRole("button", { name: "Verify CLI" }));
     expect(page.onVerifyBuild).toHaveBeenCalledWith(build.id);
+  });
+
+  it("lets the user manually check an installed build for updates", async () => {
+    const page = props();
+    render(<EmulatorManagerPage {...page} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Check updates" }));
+
+    expect(page.onCheckUpdates).toHaveBeenCalledWith(build);
+  });
+
+  it("keeps update checks and rebuild disabled only while a task is running", () => {
+    render(<EmulatorManagerPage {...props({ busy: true })} />);
+
+    expect((screen.getByRole("button", { name: "Check updates" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Rebuild" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("removes a game-preferred build immediately without a confirmation popup", () => {

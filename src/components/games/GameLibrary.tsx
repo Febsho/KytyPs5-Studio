@@ -1,10 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { Gamepad2, Trash2, ExternalLink, FolderOpen } from "lucide-react";
-import type { Game } from "../../types/studio";
+import type { Game, OfficialCompatibilityIndex } from "../../types/studio";
 import { getGridColumnCount, getVirtualWindow } from "./virtualWindow";
 import { date, formatBytes } from "../../utils/format";
 import { loadGameIcon, retainGameIcon } from "../../services/gameArtwork";
+import { GameCompatibilityBadge } from "./GameCompatibilityBadge";
+import { compatibilityBadgeLabel, officialCompatibilityForGame } from "../../utils/compatibility";
 
 export function GameContextMenu({
   game,
@@ -75,12 +77,14 @@ export function GameCard({
   selected,
   onSelect,
   onContextMenu,
+  officialCompatibilityIndex,
   mode,
 }: {
   game: Game;
   selected: boolean;
   onSelect: () => void;
   onContextMenu?: (game: Game, event: ReactMouseEvent<HTMLButtonElement>) => void;
+  officialCompatibilityIndex?: OfficialCompatibilityIndex | null;
   mode: "grid" | "list";
 }) {
   const element = useRef<HTMLButtonElement>(null);
@@ -121,6 +125,7 @@ export function GameCard({
       release();
     };
   }, [game.id]);
+  const compatibility = officialCompatibilityForGame(game, officialCompatibilityIndex ?? null);
   return (
     <button
       ref={element}
@@ -128,6 +133,7 @@ export function GameCard({
       className={`game-card ${mode} ${selected ? "selected" : ""}`}
       onClick={onSelect}
       onContextMenu={(event) => onContextMenu?.(game, event)}
+      aria-label={compatibility ? `${game.title}, ${compatibilityBadgeLabel(compatibility)} compatibility` : game.title}
     >
       <div className="game-art">
         {icon ? (
@@ -136,7 +142,10 @@ export function GameCard({
           <Gamepad2 />
         )}
       </div>
-      <strong>{game.title}</strong>
+      <span className="game-card-title-row">
+        <strong>{game.title}</strong>
+        {mode === "list" && <GameCompatibilityBadge game={game} index={officialCompatibilityIndex} />}
+      </span>
       <small>
         {mode === "list"
           ? `${game.title_id || "No title ID"} · ${game.game_version ? `v${game.game_version}` : "Version unknown"} · ${formatBytes(game.install_size)} · ${Math.round(game.play_seconds / 60)} min · ${game.build_id ? `Build ${game.build_id}` : "Active build"} · ${game.file_status === "Missing" ? "Missing files" : game.last_played ? `Played ${date(game.last_played)}` : "Not played yet"}`
@@ -154,11 +163,13 @@ export function HomeGameTile({
   selected,
   onSelect,
   onContextMenu,
+  officialCompatibilityIndex,
 }: {
   game: Game;
   selected: boolean;
   onSelect: () => void;
   onContextMenu?: (game: Game, event: ReactMouseEvent<HTMLButtonElement>) => void;
+  officialCompatibilityIndex?: OfficialCompatibilityIndex | null;
 }) {
   const element = useRef<HTMLButtonElement>(null);
   const [icon, setIcon] = useState<string | null>(null);
@@ -194,6 +205,7 @@ export function HomeGameTile({
       release();
     };
   }, [game.id]);
+  const compatibility = officialCompatibilityForGame(game, officialCompatibilityIndex ?? null);
   return (
     <button
       ref={element}
@@ -202,7 +214,7 @@ export function HomeGameTile({
       onClick={onSelect}
       onContextMenu={(event) => onContextMenu?.(game, event)}
       aria-pressed={selected}
-      aria-label={game.title}
+      aria-label={compatibility ? `${game.title}, ${compatibilityBadgeLabel(compatibility)} compatibility` : game.title}
     >
       <span className="home-game-art">
         {icon ? (
@@ -222,12 +234,14 @@ export function VirtualHomeGameRow({
   onSelect,
   onActivate,
   onContextMenu,
+  officialCompatibilityIndex,
 }: {
   games: Game[];
   selectedId: number | undefined;
   onSelect: (id: number) => void;
   onActivate?: (id: number) => void;
   onContextMenu?: (game: Game, event: ReactMouseEvent<HTMLButtonElement>) => void;
+  officialCompatibilityIndex?: OfficialCompatibilityIndex | null;
 }) {
   const row = useRef<HTMLDivElement>(null);
   const [viewport, setViewport] = useState({
@@ -344,6 +358,7 @@ export function VirtualHomeGameRow({
           selected={selectedId === game.id}
           onSelect={() => onSelect(game.id)}
           onContextMenu={onContextMenu}
+          officialCompatibilityIndex={officialCompatibilityIndex}
         />
       ))}
       {end < games.length && (
@@ -362,12 +377,14 @@ export function VirtualGameGrid({
   selectedId,
   onSelect,
   onContextMenu,
+  officialCompatibilityIndex,
   mode,
 }: {
   games: Game[];
   selectedId: number | undefined;
   onSelect: (id: number) => void;
   onContextMenu?: (game: Game, event: ReactMouseEvent<HTMLButtonElement>) => void;
+  officialCompatibilityIndex?: OfficialCompatibilityIndex | null;
   mode: "grid" | "list";
 }) {
   const grid = useRef<HTMLDivElement>(null);
@@ -529,6 +546,7 @@ export function VirtualGameGrid({
           selected={selectedId === game.id}
           onSelect={() => onSelect(game.id)}
           onContextMenu={onContextMenu}
+          officialCompatibilityIndex={officialCompatibilityIndex}
           mode={mode}
         />
       ))}

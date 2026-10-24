@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Game } from "../../types/studio";
+import type { Game, OfficialCompatibilityIndex } from "../../types/studio";
 
 vi.mock("../../services/gameArtwork", () => ({
   loadGameIcon: vi.fn(async () => null),
@@ -25,6 +25,22 @@ const games: Game[] = Array.from({ length: 1000 }, (_, index) => ({
   install_size: null,
   file_status: "Available",
 }));
+
+const compatibilityIndex: OfficialCompatibilityIndex = {
+  available: true,
+  updated_at: null,
+  error: null,
+  games: [{
+    title_id: "PPSA12345",
+    title: "Game 1",
+    overall: "playable",
+    status: "playable",
+    preferred_os: "linux",
+    os: { linux: "playable" },
+    report_counts: {},
+    latest_tested: null,
+  }],
+};
 
 afterEach(() => {
   cleanup();
@@ -57,6 +73,24 @@ describe("VirtualHomeGameRow", () => {
 });
 
 describe("VirtualGameGrid", () => {
+  it("shows official compatibility beside the title in list mode, never on the poster", () => {
+    const [matchingGame, ...otherGames] = games;
+    render(
+      <VirtualGameGrid
+        games={[{ ...matchingGame, title_id: "PPSA12345" }, ...otherGames]}
+        selectedId={1}
+        onSelect={vi.fn()}
+        officialCompatibilityIndex={compatibilityIndex}
+        mode="list"
+      />,
+    );
+
+    const badge = screen.getByText("Playable");
+    expect(badge.closest(".game-card-title-row")).toBeTruthy();
+    expect(document.querySelector(".game-art .compatibility-status-badge")).toBeNull();
+    expect(screen.getByRole("button", { name: "Game 1, Linux · Playable compatibility" })).toBeTruthy();
+  });
+
   it("renders a bounded visible window and advances to the scrolled rows", () => {
     render(
       <VirtualGameGrid

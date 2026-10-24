@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { X } from "lucide-react";
 import type { Build, Game, Repo } from "../../types/studio";
 import { loadGameIcon, retainGameIcon } from "../../services/gameArtwork";
-import { short } from "../../utils/format";
+import { emulatorBuildName } from "../../utils/format";
 
 type Props = {
   game: Game;
@@ -77,7 +77,7 @@ export function SteamShortcutDialog({ game, builds, repos, selectedBuildId, busy
           <select value={selectedBuildId ?? ""} onChange={(event) => onSelectBuild(Number(event.target.value))} disabled={busy || !availableBuilds.length}>
             {availableBuilds.map((build) => {
               const repo = repos.find((item) => item.id === build.repo_id);
-              return <option key={build.id} value={build.id}>{repo ? `${repo.owner}/${repo.name}` : "Unknown fork"} · {build.build_type} · {short(build.commit_sha)}{build.active ? " · active" : ""}</option>;
+              return <option key={build.id} value={build.id}>{emulatorBuildName(repo, build)}{build.active ? " · Active" : ""}</option>;
             })}
           </select>
         </label>

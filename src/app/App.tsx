@@ -25,6 +25,7 @@ import {
   X,
 } from "lucide-react";
 import type {
+  Build,
   Repo,
   StorageReport,
   BuildSourceInfo,
@@ -41,6 +42,7 @@ import type {
   Session,
   ProcessMetric,
   ShaderPrecompileSupport,
+  ShaderPrecompileProgress,
   Job,
   GameScanEvent,
   GameScanResult,
@@ -170,8 +172,6 @@ export function App() {
   const [importMenuOpen, setImportMenuOpen] = useState(false);
   const importMenuRef = useRef<HTMLDivElement>(null);
   const appUpdateInFlight = useRef(false);
-  const repoUpdateCheckInFlight = useRef(false);
-  const pendingRepoUpdateCheck = useRef<(() => void) | null>(null);
   const [graphics, setGraphics] = useState<GraphicsDiagnostics | null>(null);
   const [repoUrl, setRepoUrl] = useState("");
   const [selectedRepo, setSelectedRepo] = useState<number | null>(() =>
@@ -186,7 +186,7 @@ export function App() {
     readUiId("game"),
   );
   const [gameDetailsTab, setGameDetailsTab] = useState<
-    "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Cheats"
+    "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Patches"
   >("Overview");
   const [homeSelection, setHomeSelection] = useState<number | null>(() =>
     readUiId("home_game"),
@@ -260,6 +260,8 @@ export function App() {
   const [shaderPrecompileSupport, setShaderPrecompileSupport] = useState<ShaderPrecompileSupport | null>(null);
   const [shaderPrecompileStatus, setShaderPrecompileStatus] = useState("");
   const [shaderPrecompileBusy, setShaderPrecompileBusy] = useState(false);
+  const [shaderPrecompileProgress, setShaderPrecompileProgress] = useState<ShaderPrecompileProgress | null>(null);
+  const shaderPrecompileStopRequested = useRef(false);
   const [gameIcon, setGameIcon] = useState<string | null>(null);
   const [gameLogo, setGameLogo] = useState<string | null>(null);
   const [gameBackground, setGameBackground] = useState<string | null>(null);
@@ -267,7 +269,6 @@ export function App() {
   const [featuredBackground, setFeaturedBackground] = useState<string | null>(
     null,
   );
-  const [updateInterval, setUpdateInterval] = useState("24");
   const [discordPresenceEnabled, setDiscordPresenceEnabled] = useState(true);
   const [processMetrics, setProcessMetrics] = useState<ProcessMetric[]>([]);
   const processMetricsRef = useRef<ProcessMetric[]>([]);
@@ -276,13 +277,7 @@ export function App() {
   const sessionPerformanceSamples = useRef(
     new Map<number, SessionPerformanceSamples>(),
   );
-  const [processMetricsReady, setProcessMetricsReady] = useState(false);
-  const [autoUpdateMode, setAutoUpdateMode] = useState<"notify" | "build">(
-    "notify",
-  );
-  const attemptedAutomaticUpdates = useRef(new Set<string>());
   const attemptedBuildValidation = useRef(new Set<number>());
-  const notifiedUpdates = useRef(new Set<string>());
   const [logFilter, setLogFilter] = useState<
     "All" | "Info" | "Warning" | "Error" | "Debug"
   >("All");
@@ -415,7 +410,7 @@ export function App() {
     const selected = await open({
       multiple: false,
       directory: false,
-      filters: [{ name: "GoldHEN JSON patch", extensions: ["json"] }],
+      filters: [{ name: "KytyPS5 JSON patch", extensions: ["json"] }],
     });
     if (typeof selected !== "string") return null;
     return call<{ path: string; content: string }>("import_game_patch", { gameId, path: selected });
@@ -425,6 +420,15 @@ export function App() {
       call<string>("save_custom_game_patch", { gameId, content }),
     [call],
   );
+  const setGamePatchModEnabled = useCallback(async (
+    gameId: number,
+    modIndex: number,
+    enabled: boolean,
+  ) => {
+    const patchJson = await call<string>("set_game_patch_mod_enabled", { gameId, modIndex, enabled });
+    const content = await call<GameContent>("inspect_game_content", { gameId });
+    return { content, patchJson };
+  }, [call]);
   useEffect(() => {
     for (const [key, value] of [
       ["page", page],
@@ -549,7 +553,13 @@ export function App() {
       j.kind === "install-tools";
     if (isJob) queueJobLog(`[${j.channel} · ${j.phase}] ${j.line}`);
     if (j.kind === "shader-precompile") {
-      setShaderPrecompileStatus(j.line);
+      if (j.progress) setShaderPrecompileProgress(j.progress);
+      if (j.done) {
+        setShaderPrecompileProgress((progress) => progress ? { ...progress, live_workers: 0 } : progress);
+        setShaderPrecompileStatus(j.phase === "Cancelled" ? "Paused. Finished shard caches are kept; start again to resume." : j.line);
+      } else if (j.line !== "Shader compilation progress") {
+        setShaderPrecompileStatus(j.line);
+      }
       setShaderPrecompileBusy(!j.done);
     }
     if ((j.kind === "build" || j.kind === "clone" || j.kind === "community-build" || j.kind === "install-tools") && !j.done)
@@ -633,16 +643,6 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [busy]);
   useEffect(() => {
-    invoke<string | null>("get_setting", { key: "update_interval" })
-      .then((v) =>
-        setUpdateInterval(
-          ["0", "6", "24", "168"].includes(v || "") ? v! : "24",
-        ),
-      )
-      .catch(() => setUpdateInterval("24"));
-    invoke<string | null>("get_setting", { key: "auto_update_mode" })
-      .then((v) => setAutoUpdateMode(v === "build" ? "build" : "notify"))
-      .catch(() => setAutoUpdateMode("notify"));
     invoke<string | null>("get_setting", { key: "discord_presence_enabled" })
       .then((v) => setDiscordPresenceEnabled(v !== "false"))
       .catch(() => setDiscordPresenceEnabled(true));
@@ -808,7 +808,6 @@ export function App() {
       return metrics;
     });
     processMetricsRef.current = metrics;
-    setProcessMetricsReady(true);
     const completed = wasActive
       .filter((metric) => !activeIds.has(metric.session_id))
       .at(-1);
@@ -836,122 +835,6 @@ export function App() {
     (metric) => !/(ended|interrupted)/i.test(metric.status),
   );
   gamepadGameRunning.current = gameRunning;
-  useEffect(() => {
-    let disposed = false;
-    let timer: number | undefined;
-    const check = async () => {
-      if (repoUpdateCheckInFlight.current) {
-        pendingRepoUpdateCheck.current = () => void check();
-        return;
-      }
-      repoUpdateCheckInFlight.current = true;
-      try {
-        const tracked = (await invoke<Repo[]>("list_repos")).filter(
-          (repo) => repo.source_path,
-        );
-        for (const repo of tracked) {
-          if (disposed) return;
-          try {
-            const status = await invoke<string>("check_updates", {
-              id: repo.id,
-            });
-            if (disposed || !status.startsWith("Update available:")) continue;
-            const label = `${repo.owner}/${repo.name}`;
-            const notificationKey = `${repo.id}:${status}`;
-            if (!notifiedUpdates.current.has(notificationKey)) {
-              notifiedUpdates.current.add(notificationKey);
-              void invoke("desktop_notification", {
-                title: "KytyPS5 emulator update available",
-                body: `${label}: ${status}`,
-              }).catch(() => {});
-            }
-            if (autoUpdateMode !== "build") {
-              setMessage(`${label}: ${status}`);
-              continue;
-            }
-            if (!["official", "kyty-cmake"].includes(repo.adapter)) {
-              setMessage(
-                `${label}: ${status}. Automatic build is unavailable until the supported Kyty CMake adapter is verified.`,
-              );
-              continue;
-            }
-            const attemptKey = `${repo.id}:${status}`;
-            if (attemptedAutomaticUpdates.current.has(attemptKey)) {
-              setMessage(
-                `${label}: automatic build was already attempted this session; review Build Studio logs.`,
-              );
-              continue;
-            }
-            if (!processMetricsReady || gameRunning) {
-              setMessage(
-                `${label}: ${status}. Automatic build is waiting for emulator sessions to finish.`,
-              );
-              continue;
-            }
-            attemptedAutomaticUpdates.current.add(attemptKey);
-            beginJob();
-            pendingJobLogs.current = [];
-            setLogs([]);
-            setBusy(true);
-            setMessage(
-              `${label}: update found; building a verified installation in the background.`,
-            );
-            try {
-              const jobId = await invoke<number>("start_update_build", {
-                id: repo.id,
-                activateAfterBuild: false,
-                options: {
-                  build_type: "Release",
-                  jobs: Math.min(
-                    128,
-                    Math.max(1, (navigator.hardwareConcurrency || 4) - 1),
-                  ),
-                  clean: false,
-                },
-              });
-              activateJob(jobId);
-              return;
-            } catch (error) {
-              jobEventGate.current.reset();
-              setBusy(false);
-              setCurrentBuildPhase("Failed");
-              if (jobStartedAt.current !== null)
-                setElapsedSeconds(
-                  Math.floor((Date.now() - jobStartedAt.current) / 1000),
-                );
-              jobStartedAt.current = null;
-              setMessage(
-                `${label}: automatic update build could not start: ${String(error)}`,
-              );
-            }
-          } catch (error) {
-            const message = String(error);
-            if (
-              !disposed &&
-              !/already running|preparing an application update/i.test(message)
-            )
-              setMessage(
-                `${repo.owner}/${repo.name}: update check failed: ${message}`,
-              );
-          }
-        }
-      } catch (error) {
-        if (!disposed) setMessage(`Update checks failed: ${String(error)}`);
-      } finally {
-        repoUpdateCheckInFlight.current = false;
-        const pending = pendingRepoUpdateCheck.current;
-        pendingRepoUpdateCheck.current = null;
-        pending?.();
-      }
-    };
-    check();
-    const hours = Number(updateInterval);
-    if (hours > 0) timer = window.setInterval(check, hours * 3600000);
-    return () => {
-      disposed = true;
-      if (timer) window.clearInterval(timer);
-    };
-  }, [updateInterval, autoUpdateMode, processMetricsReady, gameRunning]);
   useEffect(() => {
     const onFocus = () => {
       gamepadWindowFocused.current = true;
@@ -1238,12 +1121,28 @@ export function App() {
     const game = games.find((item) => item.id === gameId);
     const buildId = game?.build_id ?? active?.id ?? builds[0]?.id;
     if (buildId == null) throw new Error("Install an emulator build before precompiling shaders");
+    shaderPrecompileStopRequested.current = false;
     setShaderPrecompileBusy(true);
+    setShaderPrecompileProgress(null);
     setShaderPrecompileStatus("Starting shader precompile…");
     try {
       await call("precompile_game_shaders", { gameId, buildId });
     } catch (error) {
       setShaderPrecompileBusy(false);
+      setShaderPrecompileStatus(shaderPrecompileStopRequested.current
+        ? "Paused. Finished shard caches are kept; start again to resume."
+        : String(error));
+    } finally {
+      shaderPrecompileStopRequested.current = false;
+    }
+  };
+  const stopPrecompileGameShaders = async () => {
+    shaderPrecompileStopRequested.current = true;
+    setShaderPrecompileStatus("Stopping shader precompile safely…");
+    try {
+      await call("cancel_job");
+    } catch (error) {
+      shaderPrecompileStopRequested.current = false;
       setShaderPrecompileStatus(String(error));
     }
   };
@@ -1364,6 +1263,54 @@ export function App() {
       jobStartedAt.current = null;
     } finally {
       jobStartInFlight.current = false;
+    }
+  };
+  const checkEmulatorBuildUpdates = async (build: Build) => {
+    if (busy) return;
+    const repository = repos.find((repo) => repo.id === build.repo_id);
+    const label = repository
+      ? `${repository.owner}/${repository.name}`
+      : `Repository ${build.repo_id}`;
+    setMessage(`Checking ${label} for updates…`);
+    try {
+      const status = await call<string>("check_updates", { id: build.repo_id });
+      await refreshData();
+      if (!status.startsWith("Update available:")) {
+        setMessage(`${label}: ${status}`);
+        return;
+      }
+      if (!repository?.source_path) {
+        setMessage(`${label}: ${status}. Clone the source before building an update.`);
+        return;
+      }
+      if (!["official", "kyty-cmake"].includes(repository.adapter)) {
+        setMessage(`${label}: ${status}. This repository has no verified build adapter.`);
+        return;
+      }
+      const approved = await nativeConfirm(
+        `${label}: ${status}\n\nFetch the upstream commit and build a new verified installation now? The current active build will remain unchanged.`,
+        {
+          title: "Emulator update available",
+          kind: "info",
+          okLabel: "Build and install",
+          cancelLabel: "Not now",
+        },
+      );
+      if (!approved) {
+        setMessage(`${label}: update available; no source or build was changed.`);
+        return;
+      }
+      await runJob("start_update_build", {
+        id: build.repo_id,
+        activateAfterBuild: false,
+        options: {
+          build_type: build.build_type,
+          jobs: build.configuration.jobs ?? jobs,
+          clean: build.configuration.clean ?? false,
+        },
+      });
+    } catch (error) {
+      setMessage(`${label}: update check failed: ${String(error)}`);
     }
   };
   const saveControllerMapping = (mapping: ControllerMapping) => {
@@ -1867,7 +1814,7 @@ export function App() {
   const gameProfileEditor = currentGame ? (
     <GameProfileEditor
       gameId={currentGame.id}
-      games={games}
+      games={publicGames}
       profile={profile}
       setProfile={setProfile}
       capabilities={profileCapabilities}
@@ -1974,13 +1921,14 @@ export function App() {
               </div>
             )}
           </div>
-          <span
+          <button
             className="title-game-count"
-            aria-label={`${games.length} games in library`}
+            aria-label={`${publicGames.length} games in library; open game library`}
             title="Games in library"
+            onClick={() => setPage("library")}
           >
-            Games ({games.length})
-          </span>
+            Games ({publicGames.length})
+          </button>
           <button
             onClick={() => refreshSystem()}
             className="title-icon refresh-button"
@@ -2504,13 +2452,7 @@ export function App() {
                   .catch(() => {})
                   .finally(() => refreshData().catch(() => {}));
               }}
-              onCheckUpdates={(repoId) =>
-                action(() =>
-                  call<string>("check_updates", { id: repoId }).then(
-                    setMessage,
-                  ),
-                )
-              }
+              onCheckUpdates={checkEmulatorBuildUpdates}
               onRebuild={(build) =>
                 runJob("start_build", {
                   id: build.repo_id,
@@ -2544,7 +2486,6 @@ export function App() {
               gameBackground={gameBackground}
               gameIcon={gameIcon}
               gameScan={gameScan}
-              gameCompatibility={gameCompatibility}
               officialCompatibilityIndex={officialCompatibilityIndex}
               inspectGameContent={inspectGameContent}
               query={query}
@@ -2579,14 +2520,6 @@ export function App() {
               }
               onOpenFolderForGame={(game) =>
                 action(() => call("open_game_folder", { gameId: game.id }))
-              }
-              onOpenLatestSessionLog={() =>
-                action(async () => {
-                  const path = gameCompatibility!.latest_log_path!;
-                  setSelectedLogPath(path);
-                  setSelectedLog(await call<string>("read_log", { path }));
-                  setPage("diagnostics");
-                })
               }
               onLaunch={(id) => void launchGame(id)}
               onAddToSteam={addGameToSteam}
@@ -2665,7 +2598,9 @@ export function App() {
               }}
               shaderPrecompileStatus={shaderPrecompileStatus}
               shaderPrecompileBusy={shaderPrecompileBusy}
+              shaderPrecompileProgress={shaderPrecompileProgress}
               onPrecompileShaders={precompileGameShaders}
+              onStopPrecompileShaders={stopPrecompileGameShaders}
               onLaunchBuildAB={(gameId, buildId, settingsBuildId) =>
                 launchGameAB(gameId, buildId, settingsBuildId)
               }
@@ -2742,12 +2677,7 @@ export function App() {
               onDownloadOnlineCheat={downloadGameCheat}
               onImportCustomPatch={importCustomGamePatch}
               onSaveCustomPatch={saveCustomGamePatch}
-              onSelectCustomPatch={(path) =>
-                setProfile((current) => ({
-                  ...current,
-                  options: { ...current.options, "--game-patch": path },
-                }))
-              }
+              onSetGamePatchModEnabled={setGamePatchModEnabled}
             />
           )}
           {page === "game-details" && !currentGame && (
@@ -2780,9 +2710,7 @@ export function App() {
               githubTokenError={githubTokenError}
               githubTokenInput={githubTokenInput}
               setGithubTokenInput={setGithubTokenInput}
-              updateInterval={updateInterval}
               discordPresenceEnabled={discordPresenceEnabled}
-              autoUpdateMode={autoUpdateMode}
               storageReport={storageReport}
               appUpdate={appUpdateInfo}
               appUpdateStatus={appUpdateStatus}
@@ -2825,24 +2753,12 @@ export function App() {
                   setMessage("Stored GitHub token removed");
                 })
               }
-              onUpdateIntervalChange={(value) => {
-                setUpdateInterval(value);
-                action(() =>
-                  call("set_setting", { key: "update_interval", value }),
-                );
-              }}
               onDiscordPresenceEnabledChange={(enabled) => {
                 setDiscordPresenceEnabled(enabled);
                 action(() => call("set_setting", {
                   key: "discord_presence_enabled",
                   value: enabled ? "true" : "false",
                 }));
-              }}
-              onAutoUpdateModeChange={(value) => {
-                setAutoUpdateMode(value);
-                action(() =>
-                  call("set_setting", { key: "auto_update_mode", value }),
-                );
               }}
               onRefreshStorage={refreshStorageReport}
               onCleanIncompleteBuilds={() =>

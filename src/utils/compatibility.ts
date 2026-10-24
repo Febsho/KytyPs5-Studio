@@ -125,7 +125,12 @@ export function compatibilityStatusLabel(status: string | null | undefined): str
   switch (status?.toLowerCase()) {
     case "doesnt-boot":
     case "doesntboot":
+    case "does-not-boot":
+    case "doesnotboot":
     case "doesn't boot":
+    case "not-booting":
+    case "not booting":
+    case "unplayable":
       return "Not Booting";
     case "logo":
       return "Logo";

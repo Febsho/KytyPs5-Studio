@@ -1,8 +1,14 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Game, OfficialCompatibilityIndex } from "../types/studio";
 import type { HomePageProps } from "./HomePage";
 import { HomePage } from "./HomePage";
+
+vi.mock("../services/gameArtwork", () => ({
+  loadGameIcon: vi.fn(async () => null),
+  retainGameIcon: vi.fn(() => vi.fn()),
+}));
 
 function props(overrides: Partial<HomePageProps> = {}): HomePageProps {
   return {
@@ -48,5 +54,34 @@ describe("HomePage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open Diagnostics" }));
     expect(page.setSpecsOpen).toHaveBeenCalledWith(false);
     expect(page.setPage).toHaveBeenCalledWith("diagnostics");
+  });
+
+  it("shows the compatibility status in the bottom game details, not on its cover", () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const game: Game = {
+      id: 3, path: "/games/example", title: "Example", favorite: false,
+      build_id: null, play_seconds: 0, last_played: null,
+      title_id: "PPSA12345", game_version: "01.001.000", icon_path: null,
+      install_size: null, file_status: "Available",
+    };
+    const officialCompatibilityIndex: OfficialCompatibilityIndex = {
+      available: true, updated_at: null, error: null,
+      games: [{
+        title_id: "PPSA12345", title: "Example", overall: "in-game", status: "in-game",
+        preferred_os: "linux", os: { linux: "in-game" }, report_counts: {}, latest_tested: null,
+      }],
+    };
+    render(<HomePage {...props({ games: [game], featuredGame: game, officialCompatibilityIndex })} />);
+
+    const badge = screen.getByText("In-Game");
+    expect(badge.classList.contains("tone-in-game")).toBe(true);
+    expect(badge.closest(".home-feature")).toBeTruthy();
+    expect(document.querySelector(".home-game-art .compatibility-status-badge")).toBeNull();
   });
 });

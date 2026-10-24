@@ -1,4 +1,5 @@
 import type { Game } from '../../types/studio';
+import { isPubliclyRecognizedGame } from '../games/libraryModel';
 
 type Props = {
   games: Game[];
@@ -13,7 +14,11 @@ type Props = {
 };
 
 export function ProfileActions({ games, currentGameId, sourceGameId, loading, dirty, canRestore, onSourceChange, onCopy, onRestore }: Props) {
-  const sources = games.filter(game => game.id !== currentGameId);
+  const sources = games.filter(game =>
+    game.id !== currentGameId
+    && game.file_status === 'Available'
+    && isPubliclyRecognizedGame(game),
+  );
   return <div className="profile-actions">
     <label>Copy profile from another game
       <select aria-label="Copy profile from another game" value={sourceGameId ?? ''} onChange={event => onSourceChange(event.target.value ? Number(event.target.value) : null)}>

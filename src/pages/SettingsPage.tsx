@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Database, Gamepad2, Github, RefreshCw, Settings } from "lucide-react";
 import type { AppUpdateInfo, Build, ProfileCapabilities, Repo, StorageReport } from "../types/studio";
 import { ProfileOptionFields } from "../components/settings/ProfileOptionFields";
-import { formatBytes } from "../utils/format";
+import { emulatorBuildName, formatBytes } from "../utils/format";
 import { currentCompatibilityOS } from "../utils/compatibility";
 
 const primaryEmulatorFlags = [
@@ -30,9 +30,7 @@ export type SettingsPageProps = {
   githubTokenError?: string | null;
   githubTokenInput: string;
   setGithubTokenInput: Dispatch<SetStateAction<string>>;
-  updateInterval: string;
   discordPresenceEnabled?: boolean;
-  autoUpdateMode: "notify" | "build";
   storageReport: StorageReport | null;
   appUpdate?: AppUpdateInfo | null;
   appUpdateStatus?: string;
@@ -42,9 +40,7 @@ export type SettingsPageProps = {
   onSaveGlobalDefaults: () => void | Promise<void>;
   onSaveGithubToken: (token: string) => void;
   onDeleteGithubToken: () => void;
-  onUpdateIntervalChange: (value: string) => void;
   onDiscordPresenceEnabledChange?: (enabled: boolean) => void;
-  onAutoUpdateModeChange: (value: "notify" | "build") => void;
   onRefreshStorage: () => void | Promise<void>;
   onCleanIncompleteBuilds: () => void | Promise<void>;
   onClearCompilerCache: () => void | Promise<void>;
@@ -68,9 +64,7 @@ export function SettingsPage({
   githubTokenError,
   githubTokenInput,
   setGithubTokenInput,
-  updateInterval,
   discordPresenceEnabled = true,
-  autoUpdateMode,
   storageReport,
   appUpdate,
   appUpdateStatus,
@@ -80,9 +74,7 @@ export function SettingsPage({
   onSaveGlobalDefaults,
   onSaveGithubToken,
   onDeleteGithubToken,
-  onUpdateIntervalChange,
   onDiscordPresenceEnabledChange,
-  onAutoUpdateModeChange,
   onRefreshStorage,
   onCleanIncompleteBuilds,
   onClearCompilerCache,
@@ -240,10 +232,9 @@ export function SettingsPage({
               </option>
               {builds.map((build) => {
                 const repo = repos.find((item) => item.id === build.repo_id);
-                const repository = repo ? `${repo.owner}/${repo.name}` : "Unknown repository";
                 return (
                   <option value={build.id} key={build.id}>
-                    {repository} · {build.build_type} · {build.commit_sha.slice(0, 8)}
+                    {emulatorBuildName(repo, build)} · {build.build_type}
                     {build.active ? " · Active" : ""}
                   </option>
                 );
@@ -253,9 +244,9 @@ export function SettingsPage({
         </div>
         {selectedBuild && (
           <div className="settings-emulator-summary">
-            <strong>{selectedRepo ? `${selectedRepo.owner}/${selectedRepo.name}` : "Selected emulator"}</strong>
+            <strong>{emulatorBuildName(selectedRepo, selectedBuild)}</strong>
             <span>
-              {selectedBuild.build_type} build · {selectedBuild.commit_sha.slice(0, 8)}
+              {selectedBuild.build_type} build
               {selectedBuild.active ? " · currently active" : ""}
             </span>
           </div>
@@ -438,37 +429,13 @@ export function SettingsPage({
         </div>
       </div>
       <div className="panel settings-section" id="settings-emulator-updates">
-        <h3>Emulator update checks</h3>
+        <h3>Emulator updates</h3>
         <p>
-          Checks compare each tracked source and newest verified build with its
-          upstream branch. Automatic builds use the Release configuration, wait
-          until no emulator sessions are running, install and verify into a new
-          versioned directory, retain previous builds, and never activate
-          automatically.
-        </p>
-        <label>Repeat checks</label>
-        <select
-          value={updateInterval}
-          onChange={(event) => onUpdateIntervalChange(event.target.value)}
-        >
-          <option value="0">Startup only</option>
-          <option value="6">Every 6 hours</option>
-          <option value="24">Every 24 hours</option>
-          <option value="168">Weekly</option>
-        </select>
-        <label>Update behavior</label>
-        <select
-          value={autoUpdateMode}
-          onChange={(event) =>
-            onAutoUpdateModeChange(event.target.value as "notify" | "build")
-          }
-        >
-          <option value="notify">Notify only</option>
-          <option value="build">Automatically fetch and build updates</option>
-        </select>
-        <p className="hint">
-          Automatic builds wait for active emulator sessions to end. You choose
-          when to activate the verified build.
+          Emulator forks are never checked, fetched, or built automatically.
+          Use Check updates on an installed build to compare it with upstream.
+          If an update is available, the app asks before fetching and building
+          a new verified installation. Existing builds remain installed and
+          active until you choose another build.
         </p>
       </div>
       <div className="panel settings-section" id="settings-storage">
@@ -631,9 +598,9 @@ export function SettingsPage({
             Version {appUpdate.latest_version} is available
             {appUpdate.asset_name ? ` · ${appUpdate.asset_name}` : ""}.
             {appUpdate.asset_name?.toLowerCase().endsWith(".exe")
-              ? " The verified NSIS installer opens only after you choose to install it."
+              ? " Studio closes during installation and restarts automatically when the verified NSIS update finishes."
               : appUpdate.running_appimage
-              ? " The verified AppImage will replace this one after download. Restart Studio to use it."
+              ? " Studio installs the verified AppImage and restarts automatically to use the new version."
               : " In-place installation is available when Studio runs from an AppImage."}
           </p>
         )}

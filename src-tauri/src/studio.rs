@@ -1680,6 +1680,13 @@ struct Dependency {
     name: String,
     present: bool,
 }
+#[derive(Serialize, Clone, PartialEq, Eq)]
+struct ShaderPrecompileProgress {
+    shaders_total: Option<u64>,
+    pipelines_compiled: u64,
+    pipelines_total: Option<u64>,
+    live_workers: u64,
+}
 #[derive(Serialize, Clone)]
 struct JobEvent {
     job_id: u64,
@@ -1690,6 +1697,8 @@ struct JobEvent {
     line: String,
     done: bool,
     success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<ShaderPrecompileProgress>,
 }
 #[derive(Serialize, Clone)]
 struct GameScanEvent {
@@ -2600,7 +2609,7 @@ fn storage_report(app: tauri::AppHandle) -> Result<StorageReport, String> {
 #[tauri::command]
 fn clean_incomplete_builds(
     app: tauri::AppHandle,
-    jobs: tauri::State<'_, Jobs>,
+    jobs: tauri::State<'_, Arc<Jobs>>,
 ) -> Result<u64, String> {
     let _control = jobs.control.lock().map_err(|error| error.to_string())?;
     if jobs.active.load(Ordering::SeqCst) {
@@ -2712,7 +2721,7 @@ impl Drop for ManagedTemporaryDirectory {
 #[tauri::command]
 fn clean_compiler_cache(
     app: tauri::AppHandle,
-    jobs: tauri::State<'_, Jobs>,
+    jobs: tauri::State<'_, Arc<Jobs>>,
 ) -> Result<u64, String> {
     let _control = jobs.control.lock().map_err(|error| error.to_string())?;
     if jobs.active.load(Ordering::SeqCst) {
@@ -2735,7 +2744,7 @@ fn clean_compiler_cache(
 #[tauri::command]
 fn clean_community_worktrees(
     app: tauri::AppHandle,
-    jobs: tauri::State<'_, Jobs>,
+    jobs: tauri::State<'_, Arc<Jobs>>,
 ) -> Result<u64, String> {
     let _control = jobs.control.lock().map_err(|error| error.to_string())?;
     if jobs.active.load(Ordering::SeqCst) {
@@ -2745,7 +2754,10 @@ fn clean_community_worktrees(
     remove_managed_temp_directory(&cache_root.join("community-worktrees"), &cache_root)
 }
 #[tauri::command]
-fn clean_session_logs(app: tauri::AppHandle, jobs: tauri::State<'_, Jobs>) -> Result<u64, String> {
+fn clean_session_logs(
+    app: tauri::AppHandle,
+    jobs: tauri::State<'_, Arc<Jobs>>,
+) -> Result<u64, String> {
     let _control = jobs.control.lock().map_err(|error| error.to_string())?;
     if jobs.active.load(Ordering::SeqCst) {
         return Err(
@@ -3681,27 +3693,31 @@ fn shader_precompile_support(
 #[tauri::command]
 async fn precompile_game_shaders(
     app: tauri::AppHandle,
+    jobs: tauri::State<'_, Arc<Jobs>>,
     game_id: i64,
     build_id: i64,
 ) -> Result<(), String> {
     let worker_app = app.clone();
+    let worker_jobs = jobs.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        precompile_game_shaders_sync(worker_app, game_id, build_id)
+        precompile_game_shaders_sync(worker_app, worker_jobs, game_id, build_id)
     })
     .await
     .map_err(|error| format!("Shader precompile task failed: {error}"))?
 }
 fn precompile_game_shaders_sync(
     app: tauri::AppHandle,
+    jobs: Arc<Jobs>,
     game_id: i64,
     build_id: i64,
 ) -> Result<(), String> {
-    if SHADER_PRECOMPILE_ACTIVE
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Err("A shader precompile is already running".into());
-    }
+    begin_job(
+        &jobs,
+        "A build, update, or shader precompile job is already running",
+        true,
+        "shader-precompile",
+    )?;
+    SHADER_PRECOMPILE_ACTIVE.store(true, Ordering::Release);
     let result = (|| {
         let (game_info, installation, repository) = {
             let _session_lifecycle = SESSION_LIFECYCLE_LOCK
@@ -3756,10 +3772,18 @@ fn precompile_game_shaders_sync(
         command
             .current_dir(&installation.path)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .process_group(0);
+        prepare_owned_child(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| format!("Could not start the shader precompile tool: {error}"))?;
+        attach_owned_child(&mut child)?;
+        let pid = child.id() as i32;
+        jobs.pid.store(pid, Ordering::SeqCst);
+        if jobs.cancel_requested.load(Ordering::SeqCst) {
+            let _ = stop_process_group(pid);
+        }
         emit(
             &app,
             "shader-precompile",
@@ -3768,37 +3792,80 @@ fn precompile_game_shaders_sync(
             false,
             true,
         );
+        emit_shader_progress(
+            &app,
+            ShaderPrecompileProgress {
+                shaders_total: None,
+                pipelines_compiled: 0,
+                pipelines_total: None,
+                live_workers: 0,
+            },
+        );
+        let installation_root = PathBuf::from(&installation.path);
+        let log_directory = Arc::new(Mutex::new(None::<PathBuf>));
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdout_app = app.clone();
+        let stdout_root = installation_root.clone();
+        let stdout_log_directory = log_directory.clone();
         let stdout_reader = thread::spawn(move || {
             if let Some(stdout) = stdout {
-                drain_job_output(
+                drain_shader_precompile_output(
                     stdout,
                     "stdout",
                     &stdout_app,
-                    "shader-precompile",
-                    "Precompiling",
-                    None,
-                    None,
+                    &stdout_root,
+                    &stdout_log_directory,
                 );
             }
         });
         let stderr_app = app.clone();
+        let stderr_root = installation_root.clone();
+        let stderr_log_directory = log_directory.clone();
         let stderr_reader = thread::spawn(move || {
             if let Some(stderr) = stderr {
-                drain_job_output(
+                drain_shader_precompile_output(
                     stderr,
                     "stderr",
                     &stderr_app,
-                    "shader-precompile",
-                    "Precompiling",
-                    None,
-                    None,
+                    &stderr_root,
+                    &stderr_log_directory,
                 );
             }
         });
-        let status = child.wait().map_err(|error| error.to_string())?;
+        let wait_jobs = jobs.clone();
+        let wait_thread = thread::spawn(move || {
+            wait_for_child_and_cleanup_group(&mut child, || {
+                wait_jobs.pid.store(0, Ordering::SeqCst);
+            })
+        });
+        let mut previous_progress = None;
+        while !wait_thread.is_finished() {
+            let directory = log_directory
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some(directory) = directory {
+                let progress = read_shader_precompile_progress(&directory);
+                if previous_progress.as_ref() != Some(&progress) {
+                    emit_shader_progress(&app, progress.clone());
+                    previous_progress = Some(progress);
+                }
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        let waited = wait_thread
+            .join()
+            .map_err(|_| "Shader precompile process waiter panicked".to_string())??;
+        let (status, cleanup) = waited;
+        cleanup?;
+        if let Some(directory) = log_directory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            emit_shader_progress(&app, read_shader_precompile_progress(&directory));
+        }
         let _ = stdout_reader.join();
         let _ = stderr_reader.join();
         if !status.success() {
@@ -3809,28 +3876,160 @@ fn precompile_game_shaders_sync(
     SHADER_PRECOMPILE_ACTIVE.store(false, Ordering::Release);
     match result {
         Ok(()) => {
-            emit(
+            finish_job(
                 &app,
+                &jobs,
                 "shader-precompile",
-                "Completed",
-                "Shader precompile completed",
-                true,
-                true,
+                Ok("Shader precompile completed".into()),
             );
             Ok(())
         }
         Err(error) => {
-            emit(
-                &app,
-                "shader-precompile",
-                "Failed",
-                error.clone(),
-                true,
-                false,
-            );
+            finish_job(&app, &jobs, "shader-precompile", Err(error.clone()));
             Err(error)
         }
     }
+}
+
+fn emit_shader_progress(app: &tauri::AppHandle, progress: ShaderPrecompileProgress) {
+    let _ = app.emit(
+        "studio-job",
+        JobEvent {
+            job_id: ACTIVE_JOB_ID.load(Ordering::SeqCst),
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            channel: "shader-precompile".into(),
+            kind: "shader-precompile".into(),
+            phase: "Precompiling".into(),
+            line: "Shader compilation progress".into(),
+            done: false,
+            success: true,
+            progress: Some(progress),
+        },
+    );
+}
+
+fn drain_shader_precompile_output<R: Read>(
+    stream: R,
+    label: &str,
+    app: &tauri::AppHandle,
+    installation_root: &Path,
+    log_directory: &Arc<Mutex<Option<PathBuf>>>,
+) {
+    let mut reader = CappedOutputReader::new(stream);
+    loop {
+        match reader.next_line() {
+            Ok(Some(output)) => {
+                let line = output.text();
+                if let Some((_, path)) = line.rsplit_once("; logs ") {
+                    let path = PathBuf::from(path.trim());
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        installation_root.join(path)
+                    };
+                    *log_directory
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(path);
+                }
+                emit(app, "shader-precompile", "Precompiling", line, false, true);
+            }
+            Ok(None) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                emit(
+                    app,
+                    "shader-precompile",
+                    "Precompiling",
+                    format!("{label} output reader error: {error}"),
+                    false,
+                    false,
+                );
+                break;
+            }
+        }
+    }
+}
+
+fn read_shader_precompile_progress(log_directory: &Path) -> ShaderPrecompileProgress {
+    let mut progress = ShaderPrecompileProgress {
+        shaders_total: None,
+        pipelines_compiled: 0,
+        pipelines_total: None,
+        live_workers: 0,
+    };
+    let mut total_pipelines = 0_u64;
+    let mut saw_plan = false;
+    for plan_name in ["plan-recorded.out.log", "plan-seeds.out.log"] {
+        let path = log_directory.join(plan_name);
+        let Ok(contents) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in contents.lines() {
+            if line.contains(" of them this seed file's") {
+                if let Some((_, count)) = line.split_once(" pipelines,") {
+                    if let Some(value) = count
+                        .split_whitespace()
+                        .next()
+                        .and_then(|value| value.parse::<u64>().ok())
+                    {
+                        total_pipelines = total_pipelines.saturating_add(value);
+                        saw_plan = true;
+                    }
+                }
+            }
+            if plan_name == "plan-seeds.out.log" {
+                if let Some(value) = line
+                    .strip_prefix("Shader seeds: ")
+                    .and_then(|line| line.split_once(" programs"))
+                    .and_then(|(value, _)| value.parse::<u64>().ok())
+                {
+                    progress.shaders_total = Some(value);
+                }
+            }
+        }
+    }
+    if saw_plan {
+        progress.pipelines_total = Some(total_pipelines);
+    }
+
+    let Ok(entries) = fs::read_dir(log_directory) else {
+        return progress;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+            continue;
+        };
+        if !name.starts_with("shard") || !name.ends_with(".out.log") {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(path) else {
+            continue;
+        };
+        if !contents.contains("Shader precompile: complete") {
+            progress.live_workers = progress.live_workers.saturating_add(1);
+            continue;
+        }
+        for line in contents.lines() {
+            if let Some((_, saved)) = line.split_once("Static pipeline binaries: saved ") {
+                if let Some(value) = saved
+                    .split_whitespace()
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                {
+                    progress.pipelines_compiled = progress.pipelines_compiled.saturating_add(value);
+                }
+            }
+        }
+    }
+    progress
 }
 fn build(conn: &Connection, id: i64) -> Result<Build, String> {
     let mut result = conn.query_row(
@@ -4929,14 +5128,19 @@ fn nsis_asset(release: &GithubAppRelease) -> Option<&GithubAppReleaseAsset> {
 }
 
 #[cfg(any(windows, test))]
-fn nsis_update_arguments(current_executable: &Path) -> Result<[OsString; 2], String> {
+fn nsis_update_arguments(current_executable: &Path) -> Result<[OsString; 4], String> {
     let install_directory = current_executable
         .parent()
         .filter(|directory| directory.is_absolute())
         .ok_or("Could not determine the absolute application install directory")?;
     let mut install_directory_argument = OsString::from("/D=");
     install_directory_argument.push(install_directory.as_os_str());
-    Ok([OsString::from("/UPDATE"), install_directory_argument])
+    Ok([
+        OsString::from("/UPDATE"),
+        OsString::from("/P"),
+        OsString::from("/R"),
+        install_directory_argument,
+    ])
 }
 
 #[tauri::command]
@@ -5130,7 +5334,7 @@ fn download_and_install_app_update() -> Result<String, String> {
             let _ = directory.sync_all();
         }
         Ok(format!(
-            "Updated KytyPS5 Studio to {}. Restart the app to use the new version.",
+            "Updated KytyPS5 Studio to {}. Restarting Studio now.",
             release.tag_name
         ))
     })();
@@ -5304,7 +5508,7 @@ fn download_and_install_app_update(app: tauri::AppHandle) -> Result<String, Stri
         app.exit(0);
     });
     Ok(format!(
-        "Verified KytyPS5 Studio {} installer started. Studio will close while the installer updates the application.",
+        "Verified KytyPS5 Studio {} installer started. Studio will close, install the update, and restart automatically.",
         release.tag_name
     ))
 }
@@ -5322,10 +5526,15 @@ fn has_active_game_sessions(connection: &Connection) -> Result<bool, String> {
 
 #[tauri::command]
 #[cfg(unix)]
-async fn install_app_update() -> Result<String, String> {
-    tauri::async_runtime::spawn_blocking(download_and_install_app_update)
+async fn install_app_update(app: tauri::AppHandle) -> Result<String, String> {
+    let result = tauri::async_runtime::spawn_blocking(download_and_install_app_update)
         .await
-        .map_err(|error| format!("AppImage update worker failed: {error}"))?
+        .map_err(|error| format!("AppImage update worker failed: {error}"))??;
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(500));
+        app.restart();
+    });
+    Ok(result)
 }
 #[tauri::command]
 #[cfg(windows)]
@@ -6321,6 +6530,7 @@ fn emit(
                 || kind == "clone"
                 || kind == "community-build"
                 || kind == "install-tools"
+                || kind == "shader-precompile"
             {
                 ACTIVE_JOB_ID.load(Ordering::SeqCst)
             } else {
@@ -6337,6 +6547,7 @@ fn emit(
             line: line.into(),
             done,
             success,
+            progress: None,
         },
     );
 }
@@ -9528,7 +9739,7 @@ fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_jso
         }
     }
     let mut unlock_data_available = false;
-    if let (Some(title_id), Some(build)) = (selected.title_id.as_deref(), selected_build) {
+    if let (Some(title_id), Some(build)) = (selected.title_id.as_deref(), selected_build.as_ref()) {
         let unlock_dir = Path::new(&build.path).join("_Trophies").join(title_id);
         if let Ok(entries) = fs::read_dir(unlock_dir) {
             let mut unlocked = HashSet::new();
@@ -9571,10 +9782,22 @@ fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_jso
         }
     }
     let options = game_options;
-    let patch_path = options
+    let installed_patch = selected_build
+        .as_ref()
+        .and_then(|build| {
+            selected
+                .title_id
+                .as_deref()
+                .map(|id| build_patch_path(build, id))
+        })
+        .filter(|path| path.is_file());
+    let configured_patch = options
         .get("--game-patch")
         .or_else(|| global_options.get("--game-patch"))
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let patch_path = installed_patch.as_ref().or(configured_patch.as_ref());
+    let patch_source = patch_path.map(|path| path.to_string_lossy().into_owned());
     let mut cheats = Vec::new();
     let mut cheat_error = None;
     if let Some(path) = patch_path {
@@ -9600,7 +9823,7 @@ fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_jso
         }
     }
     Ok(
-        serde_json::json!({"trophies":trophies,"trophy_unlock_state":if unlock_data_available {"available"} else {"unavailable"},"cheats":cheats,"cheat_source":patch_path,"cheat_error":cheat_error}),
+        serde_json::json!({"trophies":trophies,"trophy_unlock_state":if unlock_data_available {"available"} else {"unavailable"},"patches":cheats,"patch_source":patch_source,"patch_error":cheat_error}),
     )
 }
 const PS5_CHEAT_INDEX: &str =
@@ -9764,26 +9987,114 @@ fn download_game_cheat(
         return Err("Cheat file does not belong to this game".into());
     }
     let source = read_remote_text(&format!("{PS5_CHEAT_FILE_BASE}{filename}"), 8 * 1024 * 1024)?;
-    let document: serde_json::Value = serde_json::from_str(&source)
-        .map_err(|error| format!("Cheat file is invalid JSON: {error}"))?;
+    validate_game_patch_document(&selected, source.as_bytes())?;
+    let selected_build = build_for_game(&connection, game_id)?;
+    let directory = Path::new(&selected_build.path).join("_Patches");
+    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    let destination = directory.join(format!("{title_id}.json"));
+    write_patch_file(&destination, source.as_bytes())?;
+    Ok(destination.display().to_string())
+}
+
+fn build_patch_path(build: &Build, title_id: &str) -> PathBuf {
+    Path::new(&build.path)
+        .join("_Patches")
+        .join(format!("{}.json", title_id.trim().to_ascii_uppercase()))
+}
+
+fn validate_game_patch_document(
+    selected: &Game,
+    content: &[u8],
+) -> Result<serde_json::Value, String> {
+    let expected_id = selected
+        .title_id
+        .as_deref()
+        .and_then(normalize_cheat_title_id)
+        .ok_or("This game needs a recognized title ID before a patch can be added")?;
+    let document: serde_json::Value = serde_json::from_slice(content)
+        .map_err(|error| format!("Patch is not valid JSON: {error}"))?;
     if document
         .get("id")
         .and_then(|value| value.as_str())
         .and_then(normalize_cheat_title_id)
         .as_deref()
-        != Some(title_id.as_str())
-        || document
-            .get("mods")
-            .and_then(|value| value.as_array())
-            .is_none()
+        != Some(expected_id.as_str())
     {
-        return Err("Downloaded cheat file failed game ID or format validation".into());
+        return Err(format!(
+            "Patch title ID must match this game ({expected_id})"
+        ));
     }
-    let directory = state_paths(&app)?.data.join("cheats").join(title_id);
-    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    let destination = directory.join(&filename);
-    fs::write(&destination, source.as_bytes()).map_err(|error| error.to_string())?;
-    Ok(destination.display().to_string())
+    let version = document
+        .get("version")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("Patch must include its exact game version")?;
+    if let Some(game_version) = selected.game_version.as_deref() {
+        if version.trim() != game_version.trim() {
+            return Err(format!(
+                "Patch is for game version {version}, but this game is version {game_version}. Import the matching patch file."
+            ));
+        }
+    }
+    if document
+        .get("process")
+        .and_then(|value| value.as_str())
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err("Patch must include the game process name (normally eboot.bin)".into());
+    }
+    let mods = document
+        .get("mods")
+        .and_then(|value| value.as_array())
+        .filter(|mods| !mods.is_empty())
+        .ok_or("Patch must contain a non-empty GoldHEN-style mods array")?;
+    if mods.iter().any(|item| {
+        !item.is_object()
+            || item.get("name").and_then(|value| value.as_str()).is_none()
+            || item.get("enabled").is_some_and(|value| !value.is_boolean())
+            || item
+                .get("memory")
+                .and_then(|value| value.as_array())
+                .is_none()
+    }) {
+        return Err(
+            "Each patch entry must have a name, a memory array and an optional boolean enabled field"
+                .into(),
+        );
+    }
+    Ok(document)
+}
+
+fn write_patch_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Patch path has no parent folder".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create _Patches folder: {error}"))?;
+    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    fs::write(&temporary, content)
+        .map_err(|error| format!("Could not write patch file: {error}"))?;
+    if let Err(error) = replace_file(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("Could not install patch file: {error}"));
+    }
+    Ok(())
+}
+
+fn set_patch_mod_enabled(
+    document: &mut serde_json::Value,
+    mod_index: usize,
+    enabled: bool,
+) -> Result<(), String> {
+    let mods = document
+        .get_mut("mods")
+        .and_then(|value| value.as_array_mut())
+        .ok_or("Installed patch has no mods list")?;
+    let patch_mod = mods
+        .get_mut(mod_index)
+        .ok_or("Patch list changed. Refresh the Patches tab and try again")?;
+    patch_mod["enabled"] = serde_json::Value::Bool(enabled);
+    Ok(())
 }
 
 fn store_custom_game_patch(
@@ -9797,42 +10108,38 @@ fn store_custom_game_patch(
     }
     let conn = db(app)?;
     let selected = game(&conn, game_id)?;
-    let title_id = selected
-        .title_id
-        .as_deref()
-        .and_then(normalize_cheat_title_id)
-        .ok_or("This game needs a recognized title ID before a patch can be added")?;
-    let document: serde_json::Value = serde_json::from_slice(content)
-        .map_err(|error| format!("Patch is not valid JSON: {error}"))?;
-    if document
-        .get("id")
-        .and_then(|value| value.as_str())
-        .and_then(normalize_cheat_title_id)
-        .as_deref()
-        != Some(title_id.as_str())
-    {
-        return Err(format!("Patch title ID must match this game ({title_id})"));
-    }
-    let mods = document
-        .get("mods")
-        .and_then(|value| value.as_array())
-        .filter(|mods| !mods.is_empty())
-        .ok_or("Patch must contain a non-empty GoldHEN-style mods array")?;
-    if mods.iter().any(|item| {
-        !item.is_object()
-            || item.get("name").and_then(|value| value.as_str()).is_none()
-            || item.get("enabled").is_some_and(|value| !value.is_boolean())
-    }) {
-        return Err(
-            "Each patch mod must be an object with a name and an optional boolean enabled field"
-                .into(),
-        );
-    }
-    let directory = state_paths(app)?.data.join("cheats").join(&title_id);
-    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    let destination = directory.join(format!("custom-{}-{}.json", now(), std::process::id()));
-    fs::write(&destination, content).map_err(|error| error.to_string())?;
+    let document = validate_game_patch_document(&selected, content)?;
+    let selected_build = build_for_game(&conn, game_id)?;
+    let destination = build_patch_path(
+        &selected_build,
+        selected.title_id.as_deref().unwrap_or_default(),
+    );
+    let bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
+    write_patch_file(&destination, &bytes)?;
     Ok(destination.display().to_string())
+}
+
+#[tauri::command]
+fn set_game_patch_mod_enabled(
+    app: tauri::AppHandle,
+    game_id: i64,
+    mod_index: usize,
+    enabled: bool,
+) -> Result<String, String> {
+    let conn = db(&app)?;
+    let selected = game(&conn, game_id)?;
+    let selected_build = build_for_game(&conn, game_id)?;
+    let path = build_patch_path(
+        &selected_build,
+        selected.title_id.as_deref().unwrap_or_default(),
+    );
+    let bytes =
+        fs::read(&path).map_err(|error| format!("Could not read installed patch: {error}"))?;
+    let mut document = validate_game_patch_document(&selected, &bytes)?;
+    set_patch_mod_enabled(&mut document, mod_index, enabled)?;
+    let bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
+    write_patch_file(&path, &bytes)?;
+    String::from_utf8(bytes).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -10322,6 +10629,31 @@ fn launch_game_impl(
         .contains(&flag.as_str())
         {
             *value = canonicalize_option_path(flag, value)?;
+        }
+    }
+    if let Some(title_id) = g.title_id.as_deref().and_then(normalize_cheat_title_id) {
+        let installed_patch = build_patch_path(&b, &title_id);
+        if installed_patch.is_file() {
+            let metadata = fs::metadata(&installed_patch).map_err(|error| error.to_string())?;
+            if metadata.len() > 8 * 1024 * 1024 {
+                return Err("Installed game patch exceeds the 8 MiB safety limit".into());
+            }
+            let patch_bytes = fs::read(&installed_patch).map_err(|error| error.to_string())?;
+            validate_game_patch_document(&g, &patch_bytes)?;
+            if !capabilities
+                .options
+                .iter()
+                .any(|option| option == "--game-patch")
+            {
+                return Err("The selected emulator build does not support game patches".into());
+            }
+            effective_options.insert(
+                "--game-patch".into(),
+                fs::canonicalize(&installed_patch)
+                    .map_err(|error| format!("Could not resolve installed game patch: {error}"))?
+                    .display()
+                    .to_string(),
+            );
         }
     }
     if game_profile.screen_width.is_some() && !capabilities.screen_width
@@ -11673,6 +12005,7 @@ pub fn run() {
             download_game_cheat,
             import_game_patch,
             save_custom_game_patch,
+            set_game_patch_mod_enabled,
             get_profile_capabilities,
             set_profile,
             get_global_profile_options,
@@ -11701,6 +12034,73 @@ pub fn run() {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shader_precompile_progress_counts_completed_pipeline_shards_and_live_workers() {
+        let root = std::env::temp_dir().join(format!(
+            "kyty-shader-progress-test-{}-{}",
+            std::process::id(),
+            super::now()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("plan-recorded.out.log"),
+            "Shader seeds: plan saved to plan.bin (200 pipelines, 120 of them this seed file's)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("plan-seeds.out.log"),
+            "Shader seeds: plan saved to plan.bin (500 pipelines, 400 of them this seed file's)\nShader seeds: 30 programs (0 indirect image tables)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("shard0of10.out.log"),
+            "Static pipeline binaries: saved 17 pipelines (17 captured)\nShader precompile: complete\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("shard1of10.out.log"),
+            "Static pipeline binaries: saved 23 pipelines (23 captured)\n",
+        )
+        .unwrap();
+
+        let progress = super::read_shader_precompile_progress(&root);
+        assert_eq!(progress.shaders_total, Some(30));
+        assert_eq!(progress.pipelines_compiled, 17);
+        assert_eq!(progress.pipelines_total, Some(520));
+        assert_eq!(progress.live_workers, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn game_patch_import_requires_matching_title_and_version_and_installs_enabled_flags_in_order() {
+        let game = super::Game {
+            id: 7,
+            path: "/games/astro".into(),
+            title: "ASTRO BOT".into(),
+            favorite: false,
+            build_id: None,
+            play_seconds: 0,
+            last_played: None,
+            title_id: Some("PPSA21567".into()),
+            game_version: Some("01.019.000".into()),
+            icon_path: None,
+            install_size: None,
+            file_status: "Available".into(),
+        };
+        let source = br#"{"id":"PPSA21567","version":"01.019.000","process":"eboot.bin","mods":[{"name":"First","enabled":true,"memory":[]},{"name":"Second","enabled":false,"memory":[]}] }"#;
+        let mut patch = super::validate_game_patch_document(&game, source).unwrap();
+        super::set_patch_mod_enabled(&mut patch, 1, true).unwrap();
+        let mods = patch["mods"].as_array().unwrap();
+        assert_eq!(mods[0]["name"], "First");
+        assert_eq!(mods[1]["name"], "Second");
+        assert_eq!(mods[1]["enabled"], true);
+
+        let wrong_version = br#"{"id":"PPSA21567","version":"01.018.000","process":"eboot.bin","mods":[{"name":"Fix","memory":[]}] }"#;
+        assert!(super::validate_game_patch_document(&game, wrong_version)
+            .unwrap_err()
+            .contains("version 01.018.000"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_path_containment_uses_case_folding_and_component_boundaries() {
@@ -13923,8 +14323,10 @@ mod tests {
         let arguments = nsis_update_arguments(&executable).unwrap();
 
         assert_eq!(arguments[0], "/UPDATE");
-        assert_eq!(arguments[1], expected_install_argument);
-        assert!(arguments[1].to_string_lossy().contains("保存したゲーム"));
+        assert_eq!(arguments[1], "/P");
+        assert_eq!(arguments[2], "/R");
+        assert_eq!(arguments[3], expected_install_argument);
+        assert!(arguments[3].to_string_lossy().contains("保存したゲーム"));
     }
     #[cfg(windows)]
     #[test]

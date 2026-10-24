@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.2
+
+### Game library and trophies
+
+- Show official compatibility status consistently across game cards, the library, and the game overview, and simplify the selected-game sidebar.
+- Organize trophy progress into Bronze, Silver, Gold, and Platinum counts on the Home screen and in the library.
+- Improve game overview details and emulator build naming.
+
+### Emulator builds and shaders
+
+- Make emulator update checks actionable and keep fork updates under the user's control.
+- Show shader precompile progress and support safely stopping and resuming work.
+- Improve storage cleanup and app update/restart handling.
+
+### Game patches
+
+- Import and manage game patch files, including enabling or disabling patch options for supported games.
+
 ## 0.9.1
 
 ### Build reliability

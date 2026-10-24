@@ -4,7 +4,10 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { open } from "@tauri-apps/plugin-dialog";
 
-const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+const { invokeMock, confirmMock } = vi.hoisted(() => ({
+  invokeMock: vi.fn(),
+  confirmMock: vi.fn().mockResolvedValue(true),
+}));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -22,14 +25,17 @@ vi.mock("@tauri-apps/api/window", () => ({
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn().mockResolvedValue(null),
   save: vi.fn().mockResolvedValue(null),
+  confirm: confirmMock,
 }));
 
 import { App } from "./App";
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   vi.unstubAllGlobals();
   invokeMock.mockReset();
+  confirmMock.mockReset().mockResolvedValue(true);
 });
 
 describe("App startup", () => {
@@ -48,6 +54,60 @@ describe("App startup", () => {
     expect(await screen.findByRole("button", { name: /import game folder/i })).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Library" }));
     await waitFor(() => expect(screen.getByText("Your library is empty")).toBeTruthy());
+  });
+
+  it("checks a fork only after a manual click and asks before building its update", async () => {
+    const repo = {
+      id: 9,
+      owner: "example",
+      name: "kyty-fork",
+      url: "https://github.com/example/kyty-fork",
+      branch: "main",
+      source_path: "/tmp/kyty-fork",
+      adapter: "kyty-cmake",
+      installed_commit: "abc123",
+    };
+    const build = {
+      id: 12,
+      repo_id: repo.id,
+      commit_sha: "abc123456789",
+      build_type: "Release",
+      path: "/managed/builds/12",
+      created_at: 1_700_000_000,
+      active: true,
+      install_size_bytes: 1024,
+      validation_status: "verified",
+      executable_status: "present",
+      configuration: { compiler: "clang", jobs: 4, clean: false, cmake_arguments: [] },
+      last_session_at: null,
+      last_session_outcome: null,
+      last_session_exit_code: null,
+    };
+    invokeMock.mockImplementation(async (command: string) => {
+      if (["list_repos"].includes(command)) return [repo];
+      if (["list_builds"].includes(command)) return [build];
+      if (["list_games", "recent_sessions", "process_metrics"].includes(command)) return [];
+      if (["system_info", "get_setting", "inspect_graphics"].includes(command)) return null;
+      if (command === "check_updates") return "Update available: abc123 → def456";
+      if (command === "start_update_build") return 77;
+      return null;
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: "Emulators" }));
+    expect(invokeMock).not.toHaveBeenCalledWith("check_updates", expect.anything());
+    await user.click(await screen.findByRole("button", { name: "Check updates" }));
+
+    await waitFor(() => expect(confirmMock).toHaveBeenCalledOnce());
+    expect(confirmMock.mock.calls[0][0]).toContain("Fetch the upstream commit");
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("start_update_build", {
+        id: repo.id,
+        activateAfterBuild: false,
+        options: { build_type: "Release", jobs: 4, clean: false },
+      });
+    });
   });
 
   it("checks for Windows updates at startup without starting the installer", async () => {

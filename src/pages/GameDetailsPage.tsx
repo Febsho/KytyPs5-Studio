@@ -11,14 +11,15 @@ import type {
   Repo,
   Session,
   ShaderPrecompileSupport,
+  ShaderPrecompileProgress,
   OfficialCompatibilityDetails,
   OfficialCompatibilityIndex,
 } from "../types/studio";
-import { date, formatBytes, short } from "../utils/format";
+import { date, emulatorBuildName, formatBytes, short } from "../utils/format";
 import { trophyGrade, trophyGrades } from "../utils/trophies";
 import { compatibilityOsLabel, compatibilityStatusLabel, currentCompatibilityOS, normalizeTitleId, officialCompatibilityForGame, recommendVerifiedBuild } from "../utils/compatibility";
 
-type Tab = "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Cheats";
+type Tab = "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Patches";
 export type GameDetailsPageProps = {
   game: Game;
   gameLogo?: string | null;
@@ -58,11 +59,13 @@ export type GameDetailsPageProps = {
   onSetShaderPrecompileEnabled?: (enabled: boolean) => void;
   shaderPrecompileStatus?: string;
   shaderPrecompileBusy?: boolean;
+  shaderPrecompileProgress?: ShaderPrecompileProgress | null;
   onPrecompileShaders?: (gameId: number) => Promise<void>;
+  onStopPrecompileShaders?: () => Promise<void>;
   onDownloadOnlineCheat?: (gameId:number, filename:string) => Promise<string>;
   onImportCustomPatch?: (gameId:number) => Promise<{path:string;content:string} | null>;
   onSaveCustomPatch?: (gameId:number, content:string) => Promise<string>;
-  onSelectCustomPatch?: (path:string) => void;
+  onSetGamePatchModEnabled?: (gameId:number, modIndex:number, enabled:boolean) => Promise<{content:GameContent;patchJson:string}>;
 };
 
 export function GameDetailsPage({
@@ -104,11 +107,13 @@ export function GameDetailsPage({
   onSetShaderPrecompileEnabled,
   shaderPrecompileStatus = "",
   shaderPrecompileBusy = false,
+  shaderPrecompileProgress = null,
   onPrecompileShaders,
+  onStopPrecompileShaders,
   onDownloadOnlineCheat,
   onImportCustomPatch,
   onSaveCustomPatch,
-  onSelectCustomPatch,
+  onSetGamePatchModEnabled,
 }: GameDetailsPageProps) {
   const [content, setContent] = useState<GameContent | null>(null);
   const [contentError, setContentError] = useState("");
@@ -120,6 +125,8 @@ export function GameDetailsPage({
   const [customPatchDraft, setCustomPatchDraft] = useState("");
   const [customPatchError, setCustomPatchError] = useState("");
   const [customPatchBusy, setCustomPatchBusy] = useState(false);
+  const [patchToggleBusy, setPatchToggleBusy] = useState(false);
+  const [patchToggleError, setPatchToggleError] = useState("");
   const [customPatchPath, setCustomPatchPath] = useState("");
   const [abSettingsBuildId, setAbSettingsBuildId] = useState<number | null>(
     currentGame.build_id ?? builds.find((build) => build.active)?.id ?? builds[0]?.id ?? null,
@@ -127,6 +134,19 @@ export function GameDetailsPage({
   const [abLaunchingBuildId, setAbLaunchingBuildId] = useState<number | null>(null);
   const gameSettingsBuild = builds.find((build) => build.id === currentGame.build_id) ??
     builds.find((build) => build.active) ?? builds[0] ?? null;
+  const shaderPipelinePercent = shaderPrecompileProgress?.pipelines_total
+    ? Math.min(100, Math.round(shaderPrecompileProgress.pipelines_compiled / shaderPrecompileProgress.pipelines_total * 100))
+    : null;
+  const shaderProgressView = shaderPrecompileProgress && (
+    <div className="shader-precompile-progress" aria-live="polite">
+      <div className="shader-precompile-progress-stats">
+        {shaderPrecompileProgress.shaders_total !== null && <span><strong>{shaderPrecompileProgress.shaders_total.toLocaleString()}</strong> game shader programs</span>}
+        <span><strong>{shaderPrecompileProgress.pipelines_compiled.toLocaleString()}{shaderPrecompileProgress.pipelines_total !== null ? ` / ${shaderPrecompileProgress.pipelines_total.toLocaleString()}` : ""}</strong> pipelines compiled</span>
+        <span><strong>{shaderPrecompileProgress.live_workers.toLocaleString()}</strong> live compiler workers</span>
+      </div>
+      {shaderPipelinePercent !== null && <div className="shader-precompile-progress-track" role="progressbar" aria-label="Shader pipeline compilation" aria-valuemin={0} aria-valuemax={shaderPrecompileProgress.pipelines_total ?? 0} aria-valuenow={shaderPrecompileProgress.pipelines_compiled}><span style={{ width: `${shaderPipelinePercent}%` }} /></div>}
+    </div>
+  );
   useEffect(() => {
     setAbSettingsBuildId(
       currentGame.build_id ?? builds.find((build) => build.active)?.id ?? builds[0]?.id ?? null,
@@ -137,19 +157,20 @@ export function GameDetailsPage({
       id: currentGame.title_id || "TITLE_ID_REQUIRED",
       name: currentGame.title,
       version: currentGame.game_version || "1.0.0",
+      process: "eboot.bin",
       mods: [],
     }, null, 2));
     setCustomPatchError("");
     setCustomPatchPath("");
   }, [currentGame.id, currentGame.title_id, currentGame.game_version, currentGame.title]);
   useEffect(() => {
-    if ((gameDetailsTab !== "Trophies" && gameDetailsTab !== "Cheats") || !onInspectContent) return;
+    if ((gameDetailsTab !== "Trophies" && gameDetailsTab !== "Patches") || !onInspectContent) return;
     let current = true;
     void onInspectContent(currentGame.id).then((result) => { if (current) { setContent(result); setContentError(""); } }).catch((error) => { if (current) setContentError(String(error)); });
     return () => { current = false; };
-  }, [gameDetailsTab, currentGame.id, onInspectContent]);
+  }, [gameDetailsTab, currentGame.id, currentGame.build_id, onInspectContent]);
   useEffect(() => {
-    if (gameDetailsTab !== "Cheats" || !onFetchOnlineCheats) return;
+    if (gameDetailsTab !== "Patches" || !onFetchOnlineCheats) return;
     let current = true;
     setRemoteCheats(null);
     setRemoteCheatError("");
@@ -168,7 +189,7 @@ export function GameDetailsPage({
       if (!imported) return;
       setCustomPatchPath(imported.path);
       setCustomPatchDraft(imported.content);
-      onSelectCustomPatch?.(imported.path);
+      if (onInspectContent) setContent(await onInspectContent(currentGame.id));
     } catch (error) {
       setCustomPatchError(String(error));
     } finally {
@@ -182,11 +203,25 @@ export function GameDetailsPage({
     try {
       const path = await onSaveCustomPatch(currentGame.id, customPatchDraft);
       setCustomPatchPath(path);
-      onSelectCustomPatch?.(path);
+      if (onInspectContent) setContent(await onInspectContent(currentGame.id));
     } catch (error) {
       setCustomPatchError(String(error));
     } finally {
       setCustomPatchBusy(false);
+    }
+  };
+  const setPatchEnabled = async (modIndex: number, enabled: boolean) => {
+    if (!onSetGamePatchModEnabled) return;
+    setPatchToggleBusy(true);
+    setPatchToggleError("");
+    try {
+      const updated = await onSetGamePatchModEnabled(currentGame.id, modIndex, enabled);
+      setContent(updated.content);
+      setCustomPatchDraft(updated.patchJson);
+    } catch (error) {
+      setPatchToggleError(String(error));
+    } finally {
+      setPatchToggleBusy(false);
     }
   };
   const recommendation = recommendVerifiedBuild(
@@ -245,7 +280,7 @@ export function GameDetailsPage({
         </div>
       </div>
       <nav className="details-tabs" aria-label="Game details tabs">
-        {(["Overview", "Settings", "Compatibility", "Logs", "Trophies", "Cheats"] as const).map(
+        {(["Overview", "Settings", "Compatibility", "Logs", "Trophies", "Patches"] as const).map(
           (tab) => (
             <button
               key={tab}
@@ -259,8 +294,15 @@ export function GameDetailsPage({
       </nav>
       {gameDetailsTab === "Overview" && (
         <div className="details-overview">
-          <div className="panel">
-            <h2>Game overview</h2>
+          <div className="panel game-overview-panel">
+            <div className="game-overview-heading">
+              <div>
+                <span className="eyebrow">LIBRARY DETAILS</span>
+                <h2>Game overview</h2>
+                <p>Installation, playtime and launch settings for this game.</p>
+              </div>
+              {gameSettingsBuild && <span className="overview-build-chip">{emulatorBuildName(repos.find((repo) => repo.id === gameSettingsBuild.repo_id), gameSettingsBuild)}</span>}
+            </div>
             <div className="game-meta">
               {currentGame.title_id && <span>{currentGame.title_id}</span>}
               {currentGame.game_version && (
@@ -288,7 +330,7 @@ export function GameDetailsPage({
                   <strong>Precompile shaders for this game</strong>
                   <p>
                     {shaderPrecompileSupport?.full_precompile
-                      ? "Run the selected emulator build’s shader tool now. It can take a while; the cache is specific to this game and graphics driver."
+                      ? "Run the selected emulator build’s shader tool now. Completed shards are kept if you stop; run it again later to continue the missing work."
                       : shaderPrecompileSupport?.background_precompile
                         ? "This fork records shaders while you play and compiles known shaders in the background on later launches. The first playthrough discovers them."
                       : shaderPrecompileSupport
@@ -297,11 +339,14 @@ export function GameDetailsPage({
                           ? "Checking whether the selected emulator build includes a shader precompile tool…"
                           : "Install an emulator build to check shader precompile support."}
                   </p>
-                  {gameSettingsBuild && <small>Build: {gameSettingsBuild.commit_sha.slice(0, 8)} · {gameSettingsBuild.build_type}</small>}
+                  {gameSettingsBuild && <small>Build: {emulatorBuildName(repos.find((repo) => repo.id === gameSettingsBuild.repo_id), gameSettingsBuild)}</small>}
                   {shaderPrecompileSupport?.cache_directory && <small>Cache: {shaderPrecompileSupport.cache_directory}</small>}
                   {shaderPrecompileStatus && <small role="status">{shaderPrecompileStatus}</small>}
+                  {shaderProgressView}
                 </div>
-                {shaderPrecompileSupport?.background_precompile && !shaderPrecompileSupport.full_precompile ? (
+                {shaderPrecompileBusy ? (
+                  <button className="outline danger" onClick={() => void onStopPrecompileShaders?.()}>Stop precompile</button>
+                ) : shaderPrecompileSupport?.background_precompile && !shaderPrecompileSupport.full_precompile ? (
                   <label className="shader-precompile-game-toggle">
                     <input
                       type="checkbox"
@@ -314,15 +359,15 @@ export function GameDetailsPage({
                 ) : (
                   <button
                     className="outline"
-                    disabled={currentGame.file_status === "Missing" || activeSessions || shaderPrecompileBusy || !shaderPrecompileSupport?.full_precompile}
+                    disabled={currentGame.file_status === "Missing" || activeSessions || !shaderPrecompileSupport?.full_precompile}
                     onClick={() => void onPrecompileShaders?.(currentGame.id)}
                   >
-                    {shaderPrecompileBusy ? "Precompiling…" : shaderPrecompileSupport?.full_precompile ? "Precompile now" : "Precompile unavailable"}
+                    {shaderPrecompileSupport?.full_precompile ? "Precompile now" : "Precompile unavailable"}
                   </button>
                 )}
               </div>
             )}
-            <div className="buttonrow">
+            <div className="buttonrow game-overview-actions">
               <button
                 className="outline"
                 disabled={currentGame.file_status === "Missing"}
@@ -363,8 +408,7 @@ export function GameDetailsPage({
                   <option value="">Use active build</option>
                   {builds.map((b) => (
                     <option value={b.id} key={b.id}>
-                      {repos.find((r) => r.id === b.repo_id)?.name} ·{" "}
-                      {short(b.commit_sha)} · {b.build_type}
+                      {emulatorBuildName(repos.find((r) => r.id === b.repo_id), b)}
                     </option>
                   ))}
                 </select>
@@ -390,10 +434,10 @@ export function GameDetailsPage({
                   onSetPreferredBuild(event.target.value ? Number(event.target.value) : null);
                 }}
               >
-                <option value="">Use active build{gameSettingsBuild ? ` · ${gameSettingsBuild.commit_sha.slice(0, 8)}` : ""}</option>
+                <option value="">{gameSettingsBuild ? `Use active build · ${emulatorBuildName(repos.find((repo) => repo.id === gameSettingsBuild.repo_id), gameSettingsBuild)}` : "Use active build"}</option>
                 {builds.map((build) => (
                   <option value={build.id} key={build.id}>
-                    {repos.find((repo) => repo.id === build.repo_id)?.name ?? "Emulator"} · {build.commit_sha.slice(0, 8)} · {build.build_type}
+                    {emulatorBuildName(repos.find((repo) => repo.id === build.repo_id), build)}
                   </option>
                 ))}
               </select>
@@ -406,7 +450,7 @@ export function GameDetailsPage({
                 <h3>Precompile shaders</h3>
                 <p>
                   {shaderPrecompileSupport?.full_precompile
-                    ? "Build the shader cache for this game with the selected emulator fork. This can take a while."
+                    ? "Build the shader cache for this game with the selected emulator fork. Completed shards are kept if you stop; run it again later to continue the missing work."
                     : shaderPrecompileSupport?.background_precompile
                       ? "This fork records shaders during play, then compiles those known shaders in the background on later launches."
                     : shaderPrecompileSupport
@@ -414,8 +458,11 @@ export function GameDetailsPage({
                       : "Checking precompile support for the selected emulator…"}
                 </p>
                 {shaderPrecompileStatus && <small role="status">{shaderPrecompileStatus}</small>}
+                {shaderProgressView}
               </div>
-              {shaderPrecompileSupport?.background_precompile && !shaderPrecompileSupport.full_precompile ? (
+              {shaderPrecompileBusy ? (
+                <button className="outline danger" onClick={() => void onStopPrecompileShaders?.()}>Stop precompile</button>
+              ) : shaderPrecompileSupport?.background_precompile && !shaderPrecompileSupport.full_precompile ? (
                 <label className="shader-precompile-game-toggle">
                   <input
                     type="checkbox"
@@ -428,10 +475,10 @@ export function GameDetailsPage({
               ) : (
                 <button
                   className="primary"
-                  disabled={currentGame.file_status === "Missing" || activeSessions || shaderPrecompileBusy || !shaderPrecompileSupport?.full_precompile}
+                  disabled={currentGame.file_status === "Missing" || activeSessions || !shaderPrecompileSupport?.full_precompile}
                   onClick={() => void onPrecompileShaders?.(currentGame.id)}
                 >
-                  {shaderPrecompileBusy ? "Precompiling…" : "Precompile for this game"}
+                  Precompile for this game
                 </button>
               )}
             </section>
@@ -439,7 +486,7 @@ export function GameDetailsPage({
           {gameProfileEditor}
         </div>
       )}
-      {(gameDetailsTab === "Trophies" || gameDetailsTab === "Cheats") && <div className="panel game-content-panel">
+      {(gameDetailsTab === "Trophies" || gameDetailsTab === "Patches") && <div className="panel game-content-panel">
         {gameDetailsTab === "Trophies" ? <>
           <h2>Trophies</h2>
           <p>All trophies from the game package, grouped by grade. Earned status comes from this emulator build’s local trophy progress.</p>
@@ -466,23 +513,30 @@ export function GameDetailsPage({
             })}
           </> : content && <p>No readable trophy definitions were found in the game's <code>sce_sys/trophy2</code> or <code>sce_sys/trophy</code> packages.</p>}
         </> : <>
-          <h2>Cheats</h2>
-          <p>Choose a matching patch file and use it for this game. Save the game profile in Settings to apply it on the next launch.</p>
-          <label className="cheat-search">Search cheats<input value={cheatQuery} onChange={(e)=>setCheatQuery(e.target.value)} placeholder="Search by cheat name" /></label>
+          <h2>Patches</h2>
+          <p>Import the patch matching this game version. Patches are installed in the selected emulator build's <code>_Patches</code> folder and applied on the next game launch.</p>
+          <label className="cheat-search">Search patches<input value={cheatQuery} onChange={(e)=>setCheatQuery(e.target.value)} placeholder="Search by patch name" /></label>
           {contentError && <p className="error-note">{contentError}</p>}
-          {content?.cheat_error && <p className="error-note">{content.cheat_error}</p>}
-          {content?.cheat_source && <p className="hint">Source: {content.cheat_source}</p>}
-          {content?.cheats.filter((c)=>c.name.toLowerCase().includes(cheatQuery.trim().toLowerCase())).map((c,i)=><div className="kv cheat-row" key={`${c.name}-${i}`}><strong>{c.name}</strong><span>{c.enabled ? "Enabled in file" : "Disabled in file"} · {c.title_id || "No title ID"} · v{c.version || "?"}</span></div>)}
-          {content && !content.cheats.length && !content.cheat_error && <p>No configured game patch file was found. Set one under Game settings.</p>}
+          {content?.patch_error && <p className="error-note">{content.patch_error}</p>}
+          {content?.patch_source && <p className="hint">Source: {content.patch_source}</p>}
+          {patchToggleError && <p className="error-note">{patchToggleError}</p>}
+          {content?.patches.map((patch, index) => {
+            if (!patch.name.toLowerCase().includes(cheatQuery.trim().toLowerCase())) return null;
+            return <label className="game-patch-toggle" key={`${patch.name}-${index}`}>
+              <input type="checkbox" checked={patch.enabled} disabled={!onSetGamePatchModEnabled || patchToggleBusy} onChange={(event) => void setPatchEnabled(index, event.target.checked)} />
+              <span><strong>{patch.name}</strong><small>{patch.enabled ? "On" : "Off"} · {patch.title_id || "No title ID"} · v{patch.version || "?"}</small></span>
+            </label>;
+          })}
+          {content && !content.patches.length && !content.patch_error && <p>No patch file is installed for this game and emulator build yet.</p>}
           <section className="custom-patch-editor">
             <div className="buttonrow">
               <h3>Custom game patch</h3>
               <button className="outline" disabled={!onImportCustomPatch || customPatchBusy} onClick={() => void importCustomPatch()}>
-                {customPatchBusy ? "Working…" : "Import JSON patch"}
+              {customPatchBusy ? "Working…" : "Import patch JSON"}
               </button>
             </div>
             <p className="hint">
-              Import validates, copies, and selects a GoldHEN-style JSON file. The editor below saves a separate custom patch. The patch title ID must match this game; ZIP archives are not applied directly.
+              Import validates the game ID and version, then installs the file as <code>_Patches/{currentGame.title_id || "TITLE_ID"}.json</code> beside the selected emulator. The JSON editor can create or edit this game's patch file.
             </p>
             <label className="cheat-search">
               Patch JSON
@@ -495,36 +549,37 @@ export function GameDetailsPage({
               {!currentGame.title_id && <small className="hint">Refresh game metadata first to detect its title ID.</small>}
             </div>
             {customPatchError && <p className="error-note">{customPatchError}</p>}
-            {customPatchPath && <p className="hint">Patch saved and selected for this game: <code>{customPatchPath}</code>. Open Game Settings and save the profile to apply it when launching.</p>}
+            {customPatchPath && <p className="hint">Patch installed for this game and emulator: <code>{customPatchPath}</code>. It will be passed to KytyPS5 on the next launch.</p>}
           </section>
-          <h3>Online PS5 cheat repository</h3>
-          <p className="hint">Source: TeeKay87/HEN-Cheats-Collection · files are matched by title ID and ordered with the closest game version first.</p>
+          <h3>Online PS5 patch repository</h3>
+          <p className="hint">Source: TeeKay87/HEN-Cheats-Collection · files are matched by title ID and game version.</p>
           {remoteCheatError && <p className="error-note">{remoteCheatError}</p>}
           {!remoteCheats && !remoteCheatError && <p>Searching repository…</p>}
-          {!currentGame.title_id && <p className="hint">No game title ID is available. Refresh game metadata to search for matching cheats.</p>}
-          {remoteCheats?.length === 0 && currentGame.title_id && <p>No matching PS5 cheat file was found for title ID {currentGame.title_id}.</p>}
+          {!currentGame.title_id && <p className="hint">No game title ID is available. Refresh game metadata to search for matching patches.</p>}
+          {remoteCheats?.length === 0 && currentGame.title_id && <p>No matching PS5 patch file was found for title ID {currentGame.title_id}.</p>}
           {remoteCheats?.map((file) => {
             const matchingMods = file.mods.filter((mod) => mod.name.toLowerCase().includes(cheatQuery.trim().toLowerCase()));
             if (cheatQuery.trim() && !matchingMods.length) return null;
+            const versionMismatch = Boolean(file.version && currentGame.game_version && file.version !== currentGame.game_version);
             return <article className="remote-cheat-file" key={file.filename}>
-              <div className="remote-cheat-heading"><div><strong>{file.title}</strong><small>{file.filename} · version {file.version || "unknown"} · {file.mods.length} cheats</small></div><button className="outline" disabled={!onDownloadOnlineCheat || downloadingCheat === file.filename} onClick={() => {
+              <div className="remote-cheat-heading"><div><strong>{file.title}</strong><small>{file.filename} · version {file.version || "unknown"} · {file.mods.length} patches</small></div><button className="outline" disabled={!onDownloadOnlineCheat || downloadingCheat === file.filename || versionMismatch} onClick={() => {
                 if (!onDownloadOnlineCheat) return;
                 setDownloadingCheat(file.filename);
                 void onDownloadOnlineCheat(currentGame.id, file.filename).then(async (path) => {
                   setDownloadedCheatPath(path);
                   setCustomPatchPath(path);
-                  onSelectCustomPatch?.(path);
                   if (onInspectContent) {
                     try { setContent(await onInspectContent(currentGame.id)); setContentError(""); }
                     catch (error) { setContentError(String(error)); }
                   }
                 }).catch((error) => setRemoteCheatError(String(error))).finally(() => setDownloadingCheat(""));
-              }}>{downloadingCheat === file.filename ? "Downloading…" : "Download & use"}</button></div>
+              }}>{downloadingCheat === file.filename ? "Installing…" : "Install patch"}</button></div>
+              {versionMismatch && <small className="error-note">This patch is for version {file.version}; this game is {currentGame.game_version}. Choose the matching version.</small>}
               {matchingMods.map((mod, index) => <div className="kv cheat-row" key={`${mod.name}-${index}`}><strong>{mod.name}</strong><span>{mod.type}</span></div>)}
               <a href={file.source} target="_blank" rel="noreferrer">View source file</a>
             </article>;
           })}
-          {downloadedCheatPath && <p className="hint">Patch selected for this game: <code>{downloadedCheatPath}</code>. Open Settings and save the game profile to apply it on the next launch.</p>}
+          {downloadedCheatPath && <p className="hint">Patch installed for this game: <code>{downloadedCheatPath}</code>. It will be applied on the next launch.</p>}
         </>}
       </div>}
       {gameDetailsTab === "Compatibility" && (
@@ -550,7 +605,7 @@ export function GameDetailsPage({
                       {builds.map((build) => {
                         const repo = repos.find((item) => item.id === build.repo_id);
                         return <option key={build.id} value={build.id}>
-                          {repo ? `${repo.owner}/${repo.name}` : "Unknown repository"} · {build.build_type} · {short(build.commit_sha)}
+                          {emulatorBuildName(repo, build)}
                         </option>;
                       })}
                     </select>
@@ -571,8 +626,8 @@ export function GameDetailsPage({
                         return (
                           <tr key={build.id}>
                             <th scope="row">
-                              <strong>{repo ? `${repo.owner}/${repo.name}` : "Unknown repository"}</strong>
-                              <small>{build.build_type} · {short(build.commit_sha)}{build.active ? " · Active" : ""}</small>
+                              <strong>{emulatorBuildName(repo, build)}</strong>
+                              <small>{build.build_type}{build.active ? " · Active" : ""}</small>
                             </th>
                             <td>{runs.length}</td>
                             <td>{runs.filter((session) => session.pid !== null).length} / {runs.length || 0}</td>

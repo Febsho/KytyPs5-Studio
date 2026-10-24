@@ -1,7 +1,7 @@
 import { Check, ChevronRight, Cpu, Terminal } from "lucide-react";
 import { useState } from "react";
 import type { Build, Game, Repo, Session } from "../types/studio";
-import { date, formatBytes, short } from "../utils/format";
+import { date, emulatorBuildName, formatBytes, short } from "../utils/format";
 
 export type EmulatorManagerPageProps = {
   builds: Build[];
@@ -14,7 +14,7 @@ export type EmulatorManagerPageProps = {
   onOpenForkManager: () => void;
   onOpenBuildFolder: (id: number) => void;
   onVerifyBuild: (id: number) => void;
-  onCheckUpdates: (repoId: number) => void;
+  onCheckUpdates: (build: Build) => Promise<void>;
   onRebuild: (build: Build) => void;
   onActivateBuild: (id: number) => void;
   onOpenBuildLog: (id: number) => void;
@@ -39,6 +39,7 @@ export function EmulatorManagerPage({
   onCopyLog,
 }: EmulatorManagerPageProps) {
   const [compareIds, setCompareIds] = useState<number[]>([]);
+  const [checkingBuildId, setCheckingBuildId] = useState<number | null>(null);
   const comparison = compareIds
     .map((id) => builds.find((build) => build.id === id))
     .filter((build): build is Build => !!build);
@@ -51,7 +52,7 @@ export function EmulatorManagerPage({
   const details = [
     ["Repository", (build: Build) => {
       const repo = repos.find((item) => item.id === build.repo_id);
-      return repo ? `${repo.name} · by ${repo.owner}` : "Unknown";
+      return emulatorBuildName(repo, build);
     }],
     ["Commit", (build: Build) => build.commit_sha],
     ["Build type", (build: Build) => build.build_type],
@@ -90,7 +91,7 @@ export function EmulatorManagerPage({
                 <strong>
                   {(() => {
                     const repo = repos.find((item) => item.id === b.repo_id);
-                    return repo ? `${repo.name} · by ${repo.owner}` : "Repository";
+                    return repo ? emulatorBuildName(repo, b) : emulatorBuildName(null, b);
                   })()} {" "}
                   <span className="subtle">{b.build_type}</span>
                 </strong>
@@ -147,10 +148,13 @@ export function EmulatorManagerPage({
               </button>
               <button
                 className="outline"
-                disabled={busy}
-                onClick={() => onCheckUpdates(b.repo_id)}
+                disabled={busy || checkingBuildId !== null}
+                onClick={() => {
+                  setCheckingBuildId(b.id);
+                  void onCheckUpdates(b).finally(() => setCheckingBuildId(null));
+                }}
               >
-                Check updates
+                {checkingBuildId === b.id ? "Checking…" : "Check updates"}
               </button>
               <button
                 className="outline"
@@ -221,7 +225,7 @@ export function EmulatorManagerPage({
                 <thead>
                   <tr><th scope="col">Property</th>{comparison.map((build) => {
                     const repo = repos.find((item) => item.id === build.repo_id);
-                    return <th scope="col" key={build.id}>{repo ? `${repo.name} · by ${repo.owner}` : "Repository"} · {short(build.commit_sha)}</th>;
+                    return <th scope="col" key={build.id}>{emulatorBuildName(repo, build)}</th>;
                   })}</tr>
                 </thead>
                 <tbody>

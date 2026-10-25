@@ -3743,13 +3743,11 @@ select,
 }
 .game-details-logo {
   display: block;
-  max-width: min(100%, 820px);
-  max-height: 170px;
-  margin: 4px 0 8px;
+  max-width: min(100%, 620px);
+  max-height: 96px;
+  margin: 2px 0 5px;
   object-fit: contain;
   object-position: left center;
-  transform: scale(2.15);
-  transform-origin: left center;
   filter: drop-shadow(0 3px 12px #000b);
 }
 .game-details-header h1 {
@@ -3843,7 +3841,7 @@ select,
     grid-template-columns: 1fr;
     align-items: start;
   }
-  .game-details-logo { transform: scale(1.55); }
+  .game-details-logo { max-height: 76px; }
   .game-details-header > .buttonrow {
     flex-wrap: wrap;
   }
@@ -4695,10 +4693,10 @@ main {
   position: absolute;
   z-index: 0;
   left: 0;
-  bottom: 175px;
+  bottom: clamp(245px, 26vh, 300px);
   display: block;
-  width: min(560px, 48vw);
-  height: clamp(170px, 23vh, 245px);
+  width: min(480px, 40vw);
+  height: clamp(100px, 15vh, 160px);
   object-fit: contain;
   object-position: left bottom;
   background: transparent;
@@ -5068,6 +5066,8 @@ textarea:focus {
 .save-data-entry > div:first-child { min-width: 0; }
 .save-data-entry p, .save-data-entry small { display: block; overflow-wrap: anywhere; color: var(--studio-muted, #aeb6c0); margin: 5px 0; }
 .save-data-entry .buttonrow { flex-shrink: 0; }
+.save-trophy-user { display: inline-flex; align-items: center; gap: 6px; color: var(--studio-muted, #aeb6c0); font-size: 12px; }
+.save-trophy-user select { min-width: 110px; max-width: 160px; }
 .save-data-settings { display: grid; gap: 10px; padding: 12px; border: 1px solid #303640; border-radius: 8px; }
 .save-data-settings .save-auto-backup { display: flex; align-items: center; justify-content: flex-start; gap: 10px; width: fit-content; max-width: 100%; cursor: pointer; text-transform: none; letter-spacing: 0; }
 .save-data-settings .save-auto-backup input[type="checkbox"] { position: static; display: inline-block; flex: 0 0 18px; width: 18px; min-width: 18px; height: 18px; margin: 0; opacity: 1; accent-color: var(--studio-accent); }

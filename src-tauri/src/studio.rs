@@ -8474,6 +8474,9 @@ fn build_and_register(
     ensure_job_not_cancelled(jobs)?;
     let connection = paths.db()?;
     let replaced_install = if reuse_repository_build {
+        let _lifecycle = SESSION_LIFECYCLE_LOCK
+            .lock()
+            .map_err(|_| "Session lifecycle is unavailable")?;
         let existing: Option<(i64, String)> = connection
             .query_row(
                 "SELECT id,path FROM builds WHERE repo_id=? AND build_type=? AND NOT EXISTS(SELECT 1 FROM community_build_results WHERE community_build_results.build_id=builds.id) ORDER BY active DESC,created_at DESC,id DESC LIMIT 1",
@@ -8495,6 +8498,13 @@ fn build_and_register(
                     "Stop the running emulator session before rebuilding this repository.".into(),
                 );
             }
+            save_data::preserve_user_data_for_build_replacement(
+                app,
+                existing_id,
+                Path::new(&existing_path),
+                &install,
+                &paths.data.join("builds"),
+            )?;
             let changed = connection
                 .execute(
                     "UPDATE builds SET commit_sha=?,path=?,created_at=?,install_size_bytes=?,validation_status='verified',configuration_json=?,removed_at=NULL WHERE id=?",
@@ -9809,6 +9819,117 @@ fn encode_rgba_png(width: u32, height: u32, pixels: &[u8]) -> Option<Vec<u8>> {
     drop(writer);
     Some(bytes)
 }
+fn crop_transparent_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    let limits = png::Limits {
+        bytes: MAX_ARTWORK_DECODED_BYTES,
+    };
+    let mut decoder = png::Decoder::new_with_limits(BufReader::new(Cursor::new(bytes)), limits);
+    let (width, height) = {
+        let header = decoder.read_header_info().ok()?;
+        (header.width, header.height)
+    };
+    let pixel_count = (width as usize).checked_mul(height as usize)?;
+    if width == 0 || height == 0 || pixel_count > MAX_ARTWORK_PIXELS {
+        return None;
+    }
+    decoder.set_transformations(
+        png::Transformations::normalize_to_color8() | png::Transformations::ALPHA,
+    );
+    let mut reader = decoder.read_info().ok()?;
+    let decoded_size = reader.output_buffer_size()?;
+    if decoded_size > MAX_ARTWORK_DECODED_BYTES {
+        return None;
+    }
+    let mut decoded = vec![0; decoded_size];
+    let frame = reader.next_frame(&mut decoded).ok()?;
+    if frame.bit_depth != png::BitDepth::Eight || frame.width != width || frame.height != height {
+        return None;
+    }
+    let pixels = &decoded[..frame.buffer_size()];
+    let channels = match frame.color_type {
+        png::ColorType::Rgba => 4,
+        png::ColorType::Rgb => 3,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Grayscale => 1,
+        png::ColorType::Indexed => return None,
+    };
+    let alpha_at = |x: u32, y: u32| {
+        let index = ((y * width + x) as usize) * channels;
+        match frame.color_type {
+            png::ColorType::Rgba => pixels[index + 3],
+            png::ColorType::GrayscaleAlpha => pixels[index + 1],
+            png::ColorType::Rgb | png::ColorType::Grayscale => 255,
+            png::ColorType::Indexed => 0,
+        }
+    };
+    let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
+    for y in 0..height {
+        for x in 0..width {
+            if alpha_at(x, y) > 8 {
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x);
+                bottom = bottom.max(y);
+            }
+        }
+    }
+    if left == width || top == height {
+        return None;
+    }
+    let padding_x = (width / 100).max(2);
+    let padding_y = (height / 100).max(2);
+    left = left.saturating_sub(padding_x);
+    top = top.saturating_sub(padding_y);
+    right = (right + 1 + padding_x).min(width);
+    bottom = (bottom + 1 + padding_y).min(height);
+    let output_width = right - left;
+    let output_height = bottom - top;
+    if output_width == width && output_height == height {
+        return Some(bytes.to_vec());
+    }
+    let output_len = (output_width as usize)
+        .checked_mul(output_height as usize)?
+        .checked_mul(4)?;
+    if output_len > MAX_ARTWORK_DECODED_BYTES {
+        return None;
+    }
+    let mut cropped = vec![0; output_len];
+    for y in 0..output_height {
+        for x in 0..output_width {
+            let source_index = (((top + y) * width + left + x) as usize) * channels;
+            let target_index = ((y * output_width + x) as usize) * 4;
+            let (red, green, blue, alpha) = match frame.color_type {
+                png::ColorType::Rgba => (
+                    pixels[source_index],
+                    pixels[source_index + 1],
+                    pixels[source_index + 2],
+                    pixels[source_index + 3],
+                ),
+                png::ColorType::Rgb => (
+                    pixels[source_index],
+                    pixels[source_index + 1],
+                    pixels[source_index + 2],
+                    255,
+                ),
+                png::ColorType::GrayscaleAlpha => (
+                    pixels[source_index],
+                    pixels[source_index],
+                    pixels[source_index],
+                    pixels[source_index + 1],
+                ),
+                png::ColorType::Grayscale => (
+                    pixels[source_index],
+                    pixels[source_index],
+                    pixels[source_index],
+                    255,
+                ),
+                png::ColorType::Indexed => return None,
+            };
+            cropped[target_index..target_index + 4].copy_from_slice(&[red, green, blue, alpha]);
+        }
+    }
+    encode_rgba_png(output_width, output_height, &cropped)
+}
 fn decode_dds_logo(bytes: &[u8]) -> Option<Vec<u8>> {
     let dds = image_dds::ddsfile::Dds::read(Cursor::new(bytes)).ok()?;
     let (width, height) = (dds.get_width(), dds.get_height());
@@ -9830,12 +9951,13 @@ fn decode_dds_logo(bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let png = encode_rgba_png(width, height, image.as_raw())?;
-    let thumbnail = resize_png(&png, 1200, 500)?;
+    let cropped = crop_transparent_png(&png)?;
+    let thumbnail = resize_png(&cropped, 1200, 500)?;
     (thumbnail.len() <= MAX_LOGO_OUTPUT_BYTES).then_some(thumbnail)
 }
 fn cache_game_logo(cache_root: &Path, game_id: i64, source: &[u8], logo: &[u8]) {
     let digest = format!("{:x}", Sha256::digest(source));
-    let path = cache_root.join(format!("game-{game_id}-{digest}.png"));
+    let path = cache_root.join(format!("game-{game_id}-{digest}-visible.png"));
     let temporary = cache_root.join(format!(".game-{game_id}-{}.tmp", std::process::id()));
     let _ = fs::remove_file(&temporary);
     let result = (|| -> std::io::Result<()> {
@@ -9859,7 +9981,7 @@ fn load_cached_game_logo(game_root: &Path, cache_root: &Path, game_id: i64) -> O
             continue;
         };
         let digest = format!("{:x}", Sha256::digest(&source));
-        let cached_path = cache_root.join(format!("game-{game_id}-{digest}.png"));
+        let cached_path = cache_root.join(format!("game-{game_id}-{digest}-visible.png"));
         if let Some(cached) = read_game_png(&cached_path, cache_root, MAX_LOGO_OUTPUT_BYTES as u64)
         {
             if png_has_transparent_logo(&cached) {
@@ -9869,7 +9991,8 @@ fn load_cached_game_logo(game_root: &Path, cache_root: &Path, game_id: i64) -> O
         let logo = if is_dds {
             decode_dds_logo(&source)
         } else if png_has_transparent_logo(&source) {
-            resize_png(&source, 1200, 500)
+            crop_transparent_png(&source)
+                .and_then(|cropped| resize_png(&cropped, 1200, 500))
                 .filter(|thumbnail| thumbnail.len() <= MAX_LOGO_OUTPUT_BYTES)
         } else {
             None
@@ -14586,6 +14709,33 @@ mod tests {
         assert_eq!(&output[..4], &[255, 0, 0, 255]);
         assert_eq!(&output[4..8], &[0, 0, 255, 255]);
         assert!(resize_png(&source_png, 0, 2).is_none());
+    }
+
+    #[test]
+    fn game_logo_crops_transparent_borders_before_display() {
+        let (width, height) = (40, 30);
+        let mut pixels = vec![0_u8; width * height * 4];
+        for y in 8..18 {
+            for x in 10..30 {
+                let index = (y * width + x) * 4;
+                pixels[index..index + 4].copy_from_slice(&[240, 230, 220, 255]);
+            }
+        }
+        let source = encode_rgba_png(width as u32, height as u32, &pixels).unwrap();
+        let cropped = crop_transparent_png(&source).unwrap();
+        let mut reader = png::Decoder::new(Cursor::new(&cropped))
+            .read_info()
+            .unwrap();
+        let mut output = vec![0; reader.output_buffer_size().unwrap()];
+        let frame = reader.next_frame(&mut output).unwrap();
+
+        assert_eq!((frame.width, frame.height), (24, 14));
+        let first_visible_pixel = ((2 * frame.width as usize) + 2) * 4;
+        assert_eq!(
+            &output[first_visible_pixel..first_visible_pixel + 4],
+            &[240, 230, 220, 255]
+        );
+        assert!(crop_transparent_png(&encode_rgba_png(4, 4, &[0; 64]).unwrap()).is_none());
     }
 
     #[test]

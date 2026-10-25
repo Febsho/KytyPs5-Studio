@@ -166,7 +166,7 @@ fn safe_copy_with_progress(
             } else if meta.is_file() {
                 bytes = bytes.checked_add(meta.len()).ok_or("Save size overflow")?;
                 if bytes > MAX_SAVE_BYTES {
-                    return Err("Save exceeds the 8 GiB safety limit".into());
+                    return Err("Data exceeds the 8 GiB transfer safety limit".into());
                 }
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -480,6 +480,68 @@ pub(super) fn backup_build_saves_locked(
     Ok(())
 }
 
+/// Keep emulator-owned save and trophy state when a repository build is replaced.
+/// The previous installation is left untouched until the replacement copies verify.
+pub(super) fn preserve_user_data_for_build_replacement(
+    app: &tauri::AppHandle,
+    build_id: i64,
+    previous: &Path,
+    replacement: &Path,
+    managed_root: &Path,
+) -> Result<(), String> {
+    let root = fs::canonicalize(managed_root).map_err(|e| e.to_string())?;
+    let old =
+        fs::canonicalize(previous).map_err(|e| format!("Previous build is unavailable: {e}"))?;
+    let new = fs::canonicalize(replacement)
+        .map_err(|e| format!("Replacement build is unavailable: {e}"))?;
+    if !path_is_within(&old, &root) || !path_is_within(&new, &root) || old == new {
+        return Err("Build save preservation was refused because an installation is outside Studio's managed build folder".into());
+    }
+
+    // These verified backups provide recovery independently of the raw directory copy.
+    backup_build_saves_locked(app, build_id)?;
+    super::trophies::backup_build_trophies(app, build_id)?;
+
+    for folder in ["_SaveData", "_Trophies", "_PipelineCache"] {
+        preserve_build_data_folder(&old, &new, folder)?;
+    }
+    Ok(())
+}
+
+fn preserve_build_data_folder(old: &Path, new: &Path, folder: &str) -> Result<(), String> {
+    let source = old.join(folder);
+    let metadata = match fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "{folder} is not a regular directory; refusing to replace the build"
+        ));
+    }
+    let target = new.join(folder);
+    if target.exists() {
+        return Err(format!(
+            "Replacement already contains {folder}; refusing to overwrite either build's data"
+        ));
+    }
+    let staging = new.join(format!(".{folder}.preserve-{}", nonce()));
+    safe_copy_with_progress(&source, &staging, |_, _| {})
+        .map_err(|e| format!("Could not preserve {folder}: {e}"))?;
+    if tree_hash(&source)? != tree_hash(&staging)? {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!(
+            "Copied {folder} failed checksum verification; previous build remains intact"
+        ));
+    }
+    if let Err(error) = fs::rename(&staging, &target) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!("Could not install preserved {folder}: {error}"));
+    }
+    Ok(())
+}
+
 fn assert_no_sessions(app: &tauri::AppHandle, game_id: i64) -> Result<(), String> {
     let conn = super::db(app)?;
     let active: i64 = conn
@@ -654,6 +716,8 @@ struct Manifest {
     label: String,
     #[serde(default)]
     trophy_files: Vec<TrophyBundleFile>,
+    #[serde(default)]
+    trophy_user_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -772,7 +836,7 @@ fn backup_entry(
     entry: &SaveEntry,
     label: Option<&str>,
 ) -> Result<String, String> {
-    backup_entry_internal(app, game_id, entry, label, false)
+    backup_entry_internal(app, game_id, entry, label, false, None)
 }
 
 fn backup_entry_internal(
@@ -781,6 +845,7 @@ fn backup_entry_internal(
     entry: &SaveEntry,
     label: Option<&str>,
     include_trophies: bool,
+    trophy_user_id: Option<&str>,
 ) -> Result<String, String> {
     let label = label
         .unwrap_or("backup")
@@ -827,7 +892,7 @@ fn backup_entry_internal(
                 game_id,
                 entry.build_id,
                 &entry.title_id,
-                entry.user_id.as_deref(),
+                trophy_user_id.or(entry.user_id.as_deref()),
                 &stage.join("trophies"),
             )?
         } else {
@@ -853,6 +918,13 @@ fn backup_entry_internal(
             format_version: 1,
             label,
             trophy_files,
+            trophy_user_id: include_trophies
+                .then(|| {
+                    trophy_user_id
+                        .or(entry.user_id.as_deref())
+                        .map(str::to_owned)
+                })
+                .flatten(),
         };
         fs::write(
             stage.join("manifest.json"),
@@ -875,6 +947,7 @@ pub(super) struct BackupRecord {
     path: String,
     title_id: String,
     user_id: Option<String>,
+    trophy_user_id: Option<String>,
     source_build: String,
     source_build_id: i64,
     source_fork: String,
@@ -927,6 +1000,7 @@ pub(super) fn list_save_backups(
                 path: path.display().to_string(),
                 title_id: manifest.title_id,
                 user_id: manifest.user_id,
+                trophy_user_id: manifest.trophy_user_id,
                 source_build: manifest.source_build,
                 source_build_id: manifest.source_build_id,
                 source_fork: manifest.source_fork,
@@ -980,6 +1054,7 @@ pub(super) fn backup_save_with_trophies(
     game_id: i64,
     save_path: String,
     label: Option<String>,
+    trophy_user_id: Option<String>,
 ) -> Result<String, String> {
     let _lifecycle = super::SESSION_LIFECYCLE_LOCK
         .lock()
@@ -990,7 +1065,15 @@ pub(super) fn backup_save_with_trophies(
         .into_iter()
         .find(|e| e.path == save_path)
         .ok_or("Save path is no longer verified")?;
-    let result = backup_entry_internal(&app, game_id, &entry, label.as_deref(), true);
+    let user = trophy_user_id.as_deref();
+    if entry
+        .user_id
+        .as_deref()
+        .is_some_and(|save_user| Some(save_user) != user)
+    {
+        return Err("Selected trophy user does not match the save user".into());
+    }
+    let result = backup_entry_internal(&app, game_id, &entry, label.as_deref(), true, user);
     emit_progress(
         &app,
         game_id,
@@ -1041,7 +1124,10 @@ pub(super) fn restore_save(
     if manifest.includes_trophies {
         super::trophies::validate_save_bundle_trophies(
             &backup.join("trophies"),
-            manifest.user_id.as_deref(),
+            manifest
+                .trophy_user_id
+                .as_deref()
+                .or(manifest.user_id.as_deref()),
             &manifest.trophy_files,
         )?;
     } else if !manifest.trophy_files.is_empty() {
@@ -1062,7 +1148,10 @@ pub(super) fn restore_save(
                 game_id,
                 manifest.source_build_id,
                 &manifest.title_id,
-                manifest.user_id.as_deref(),
+                manifest
+                    .trophy_user_id
+                    .as_deref()
+                    .or(manifest.user_id.as_deref()),
                 &backup.join("trophies"),
                 &manifest.trophy_files,
             )?;
@@ -1610,6 +1699,7 @@ mod tests {
             includes_trophies: true,
             format_version: 1,
             label: "manual".into(),
+            trophy_user_id: Some("1000".into()),
             trophy_files: vec![TrophyBundleFile {
                 filename: "trophies_1000_2.json".into(),
                 checksum_sha256: "trophyhash".into(),
@@ -1619,6 +1709,7 @@ mod tests {
         let decoded: Manifest = serde_json::from_slice(&encoded).unwrap();
         assert!(decoded.includes_trophies);
         assert_eq!(decoded.trophy_files.len(), 1);
+        assert_eq!(decoded.trophy_user_id.as_deref(), Some("1000"));
         assert_eq!(decoded.trophy_files[0].filename, "trophies_1000_2.json");
         assert_eq!(decoded.user_id.as_deref(), Some("1000"));
     }
@@ -1698,6 +1789,50 @@ mod tests {
         let target = base.join("target");
         assert!(safe_copy(&source, &target).is_err());
         assert!(!target.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn build_replacement_preserves_save_and_trophy_trees_without_overwriting() {
+        let base = std::env::temp_dir().join(format!("build-replace-{}", nonce()));
+        let old = base.join("old");
+        let new = base.join("new");
+        fs::create_dir_all(old.join("_SaveData/title/slot")).unwrap();
+        fs::create_dir_all(old.join("_Trophies/title")).unwrap();
+        fs::create_dir_all(old.join("_PipelineCache/shaders")).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(old.join("_SaveData/title/slot/USR-DATA"), b"save bytes").unwrap();
+        fs::write(
+            old.join("_Trophies/title/trophies_1_2.json"),
+            b"trophy bytes",
+        )
+        .unwrap();
+        fs::write(
+            old.join("_PipelineCache/shaders/pipeline.bin"),
+            b"cache bytes",
+        )
+        .unwrap();
+
+        preserve_build_data_folder(&old, &new, "_SaveData").unwrap();
+        preserve_build_data_folder(&old, &new, "_Trophies").unwrap();
+        preserve_build_data_folder(&old, &new, "_PipelineCache").unwrap();
+        assert_eq!(
+            tree_hash(&old.join("_SaveData")).unwrap(),
+            tree_hash(&new.join("_SaveData")).unwrap()
+        );
+        assert_eq!(
+            tree_hash(&old.join("_Trophies")).unwrap(),
+            tree_hash(&new.join("_Trophies")).unwrap()
+        );
+        assert_eq!(
+            tree_hash(&old.join("_PipelineCache")).unwrap(),
+            tree_hash(&new.join("_PipelineCache")).unwrap()
+        );
+        assert!(preserve_build_data_folder(&old, &new, "_SaveData").is_err());
+        assert_eq!(
+            fs::read(old.join("_SaveData/title/slot/USR-DATA")).unwrap(),
+            b"save bytes"
+        );
         let _ = fs::remove_dir_all(base);
     }
 

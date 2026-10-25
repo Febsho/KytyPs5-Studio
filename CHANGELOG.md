@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.0
+
+### Build updates and local data
+
+- Preserve each build's `_SaveData`, `_Trophies`, and `_PipelineCache` folders when updating a repository fork. The replacement copies are checksum-verified before the previous build is removed; existing destination data is never overwritten.
+- Create verified save and trophy backups before replacing a build installation.
+- Enable combined Save + Trophies backups for title-slot saves without an embedded user ID. Select a readable trophy user when more than one account is available; trophy data remains scoped to the same title and build.
+
+### Game details
+
+- Crop transparent margins from game logos so the visible artwork is larger without increasing the details banner height or intercepting controls.
+- Keep save and trophy actions' disabled states tied to active sessions and available matching data.
+
 ## 1.3.0
 
 ### Home and game details

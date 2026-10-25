@@ -22,11 +22,14 @@ The screenshots show the games home page, installed emulator builds, and the sou
 - Finds Community Pull Requests, reviews their changes, and can build compatible PR combinations while recording their exact commits.
 - Matches games to the official KytyPS5 compatibility database by PPSA title ID and shows published test reports.
 - Prioritizes compatibility reports for the current operating system and recommends a fork build only when a report can be matched to an exact verified source commit.
-- Stores per-game launch options, session history, playtime, and emulator logs.
+- Opens the official compatibility database in your system browser and prepares game status reports for GitHub. Studio searches for existing reports by title ID and fills in available game, build, host, and saved observation details. Add extra notes, review the generated issue body, and choose whether to include the latest session log before publishing. Creating an issue requires a GitHub token with Issues read and write access to KytyPS5/KytyPS5.
+- Lets each game use its own preferred emulator build, independently of the globally active build.
+- Shows settings supported by the selected executable and automatically removes stale or invalid saved game/build options at launch, with a notice explaining what was removed. Global defaults are kept for other builds.
+- Stores per-game launch options, session history, playtime, and emulator logs. Saves can be backed up and carried between builds; imported or edited patches persist across app restarts and build changes.
 - Adds games to Steam and shares the current game through Discord Rich Presence when enabled.
 - Shows host and Vulkan diagnostics to help troubleshoot build and launch problems.
 
-See the [0.8.0 release notes](CHANGELOG.md) for this release's changes.
+See the [1.3.0 release notes](CHANGELOG.md) for the latest changes.
 
 Successful compilation or CLI verification does **not** guarantee that a game will run. Compatibility depends on the emulator, game, drivers, and system configuration.
 
@@ -50,11 +53,11 @@ Manual testing on a Windows desktop has not yet been completed. Automated Window
 Download the Linux AppImage from the [GitHub Releases](https://github.com/Febsho/KytyPs5-Studio/releases) page, make it executable, and run it:
 
 ```sh
-chmod +x "KytyPS5.Studio_0.8.0_amd64.AppImage"
-./"KytyPS5.Studio_0.8.0_amd64.AppImage"
+chmod +x "KytyPS5.Studio_1.3.0_amd64.AppImage"
+./"KytyPS5.Studio_1.3.0_amd64.AppImage"
 ```
 
-The AppImage filename may change between releases. Linux application data, cache, and configuration follow XDG user directories. An optional GitHub token is stored in Linux Secret Service.
+The AppImage filename changes between releases. Linux application data, cache, and configuration follow XDG user directories. An optional GitHub token is stored in Linux Secret Service; it is required only to publish compatibility issues from Studio.
 
 KytyPS5 emulator builds on either platform require a working Vulkan driver. Building the emulator from Studio also requires the host development tools listed in the Build Studio dependency check.
 

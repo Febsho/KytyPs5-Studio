@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Game, OfficialCompatibilityIndex } from "../types/studio";
 import type { HomePageProps } from "./HomePage";
@@ -28,7 +28,7 @@ function props(overrides: Partial<HomePageProps> = {}): HomePageProps {
   };
 }
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 describe("HomePage", () => {
   it("offers game import and library navigation when the library is empty", () => {
@@ -89,5 +89,32 @@ describe("HomePage", () => {
     render(<HomePage {...props({ games: [game], featuredGame: game, active: activeBuild, builds: [activeBuild!, preferredBuild], repos })} />);
     expect(screen.getByText(/ExampleFork.*#preferre/i)).toBeTruthy();
     expect(screen.queryByText(/KytyPS5.*#active123/i)).toBeNull();
+  });
+
+  it("reuses trophy data when switching back to a previously selected game", async () => {
+    vi.useFakeTimers();
+    const firstGame: Game = {
+      id: 901, path: "/games/cache-a", title: "Cache A", favorite: false,
+      build_id: null, play_seconds: 0, last_played: null, title_id: null,
+      game_version: null, icon_path: null, install_size: null, file_status: "Available",
+    };
+    const secondGame: Game = { ...firstGame, id: 902, path: "/games/cache-b", title: "Cache B" };
+    const inspectGameContent = vi.fn().mockResolvedValue({
+      trophies: [], trophy_unlock_state: "available", patches: [], patch_source: null, patch_error: null,
+    });
+    const page = props({ games: [firstGame, secondGame], featuredGame: firstGame, inspectGameContent });
+    const view = render(<HomePage {...page} />);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(1200); });
+    expect(inspectGameContent).toHaveBeenCalledTimes(1);
+
+    view.rerender(<HomePage {...page} featuredGame={secondGame} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1200); });
+    expect(inspectGameContent).toHaveBeenCalledTimes(2);
+
+    view.rerender(<HomePage {...page} featuredGame={firstGame} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1200); });
+    expect(inspectGameContent).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
   });
 });

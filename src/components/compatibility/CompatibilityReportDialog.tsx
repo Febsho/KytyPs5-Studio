@@ -23,7 +23,7 @@ export function CompatibilityReportDialog(props: Props) {
     steps: "", expected: "", os: system ? `${system.os} ${system.arch}` : "", cpu: system?.cpu ?? "",
     gpu: [system?.gpu, ...(graphics?.drivers ?? [])].filter(Boolean).join("; "),
     memory: system ? `${(system.memory_total_bytes / 1024 ** 3).toFixed(1)} GiB RAM; VRAM not reported` : "",
-    patchConfig: latestObservation?.patch_config_json ?? "", relatedIssues: [], log: "",
+    patchConfig: latestObservation?.patch_config_json ?? "", extraNotes: "", relatedIssues: [], log: "",
   }));
   const [issues, setIssues] = useState<CompatibilityIssueLink[]>([]);
   const [error, setError] = useState("");
@@ -67,7 +67,7 @@ export function CompatibilityReportDialog(props: Props) {
           <label>Steps to reproduce<textarea value={draft.steps} onChange={(event) => update("steps", event.target.value)} placeholder="Describe the steps you performed" /></label>
           <label>Expected behavior<textarea value={draft.expected} onChange={(event) => update("expected", event.target.value)} /></label>
           <label>OS / CPU / GPU / RAM<input value={[draft.os, draft.cpu, draft.gpu, draft.memory].filter(Boolean).join(" · ")} readOnly /></label>
-          <label>Extra notes<textarea value={draft.patchConfig ? "Patch and build settings from the saved manual observation are included below." : "No saved patch configuration."} readOnly /></label>
+          <label>Extra notes<textarea value={draft.extraNotes} onChange={(event) => update("extraNotes", event.target.value)} placeholder="Add details that do not fit the fields above" /></label>
         </div>
         <div className="compat-report-issues"><strong>Possible existing reports for {game.title_id}</strong>{issues.length ? issues.map((issue) => <label key={issue.number}><input type="checkbox" checked={draft.relatedIssues.some((item) => item.number === issue.number)} onChange={(event) => setDraft((current) => ({ ...current, relatedIssues: event.target.checked ? [...current.relatedIssues, issue] : current.relatedIssues.filter((item) => item.number !== issue.number) }))} /><span>#{issue.number} · {issue.title} ({issue.state})</span><button type="button" onClick={() => void props.onOpenUrl(`https://github.com/KytyPS5/KytyPS5/issues/${issue.number}`)}>View</button></label>) : <small>No matching issues found, or the search is still loading.</small>}</div>
         <div className="compat-report-log"><label><input type="checkbox" checked={includeLog} disabled={!logLoaded} onChange={(event) => setIncludeLog(event.target.checked)} /> Include latest session log in public issue</label>{latestSession ? <button type="button" disabled={busy || logLoaded} onClick={() => void loadLog()}>{logLoaded ? "Log loaded" : "Load latest session log"}</button> : <small>No session log available.</small>}<small>Log content may include local paths and system details. It is limited to the last 40,000 characters.</small></div>

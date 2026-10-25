@@ -13,10 +13,11 @@ describe("compatibility report generation", () => {
     const body = compatibilityIssueBody({
       gameTitle: "Astro Bot", titleId: "PPSA21567", gameVersion: "01.000", kytyVersion: "KytyPS5 @ abc", status: "In game",
       details: "Works <locally>", steps: "Launch", expected: "Game starts", os: "Linux", cpu: "CPU", gpu: "GPU",
-      memory: "16 GiB", patchConfig: "", relatedIssues: [{ number: 42, title: "Same title", state: "open" }], log: "",
+      memory: "16 GiB", patchConfig: "", extraNotes: "Only tested on the default profile.", relatedIssues: [{ number: 42, title: "Same title", state: "open" }], log: "",
     });
     expect(body).toContain("Works \\<locally\\>");
     expect(body).toContain("https://github.com/KytyPS5/KytyPS5/issues/42");
     expect(body).toContain("No log was included");
+    expect(body).toContain("Only tested on the default profile\\.");
   });
 });

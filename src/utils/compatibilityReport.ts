@@ -18,6 +18,7 @@ export type CompatibilityIssueDraft = {
   gpu: string;
   memory: string;
   patchConfig: string;
+  extraNotes: string;
   relatedIssues: CompatibilityIssueLink[];
   log: string;
 };
@@ -94,7 +95,7 @@ export function compatibilityIssueBody(draft: CompatibilityIssueDraft): string {
     lines.push("", "## Log file upload", "No log was included. Please attach the complete KytyPS5 log to this issue.");
   }
 
-  lines.push("", "## Screenshots/video", "No media attached.", "", "## Extra notes", "Report prepared by KytyPS5 Studio; review the details before relying on this result.");
+  lines.push("", "## Screenshots/video", "No media attached.", "", "## Extra notes", escapeMarkdown(draft.extraNotes || "Report prepared by KytyPS5 Studio; review the details before relying on this result."));
   return lines.join("\n");
 }
 

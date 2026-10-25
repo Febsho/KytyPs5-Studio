@@ -23,6 +23,8 @@ type Page =
   | "diagnostics"
   | "settings"
   | "game-details";
+type TrophySummary = ReturnType<typeof trophySummary>;
+const trophyCache = new Map<number, { summary: TrophySummary; lastPlayed: number | null; cachedAt: number }>();
 export type HomePageProps = {
   games: Game[];
   officialCompatibilityIndex?: OfficialCompatibilityIndex | null;
@@ -70,18 +72,28 @@ export function HomePage({
   runningGameId,
   onShowRunningSession,
 }: HomePageProps) {
-  const [trophyProgress, setTrophyProgress] = useState<ReturnType<typeof trophySummary> | null>(null);
+  const [trophyProgress, setTrophyProgress] = useState<{ gameId: number; summary: TrophySummary } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ game: Game; x: number; y: number } | null>(null);
   const featuredBuild = builds.find((build) => build.id === featuredGame?.build_id) ?? active;
   useEffect(() => {
     if (!featuredGame || !inspectGameContent) { setTrophyProgress(null); return; }
     let current = true;
-    setTrophyProgress(null);
+    const cached = trophyCache.get(featuredGame.id);
+    if (cached) setTrophyProgress({ gameId: featuredGame.id, summary: cached.summary });
+    else setTrophyProgress(null);
+    if (cached && cached.lastPlayed === featuredGame.last_played && Date.now() - cached.cachedAt < 5 * 60 * 1000) {
+      return () => { current = false; };
+    }
     const timer = window.setTimeout(() => {
-      void inspectGameContent(featuredGame.id).then((result)=>{ if(current) setTrophyProgress(trophySummary(result)); }).catch(()=>{ if(current) setTrophyProgress(null); });
+      void inspectGameContent(featuredGame.id).then((result) => {
+        const summary = trophySummary(result);
+        trophyCache.set(featuredGame.id, { summary, lastPlayed: featuredGame.last_played, cachedAt: Date.now() });
+        if (current) setTrophyProgress({ gameId: featuredGame.id, summary });
+      }).catch(() => { if (current && !cached) setTrophyProgress(null); });
     }, 1200);
     return ()=>{ current=false; window.clearTimeout(timer); };
-  }, [featuredGame?.id, inspectGameContent]);
+  }, [featuredGame?.id, featuredGame?.last_played, inspectGameContent]);
+  const visibleTrophyProgress = featuredGame && trophyProgress?.gameId === featuredGame.id ? trophyProgress.summary : null;
   return (
     <section
       className="page home-page"
@@ -139,11 +151,11 @@ export function HomePage({
           {featuredGame?.game_version && <span>VERSION {featuredGame.game_version}</span>}
           {featuredGame?.install_size !== null && featuredGame?.install_size !== undefined && <span>{formatBytes(featuredGame.install_size)}</span>}
           {featuredGame?.last_played && <span>{Math.round(featuredGame.play_seconds / 60)} MIN PLAYED</span>}
-          {trophyProgress && trophyProgress.total > 0 && <span>{trophyProgress.earned === null ? `${trophyProgress.total} TROPHIES` : `${trophyProgress.earned}/${trophyProgress.total} TROPHIES EARNED`}</span>}
+          {visibleTrophyProgress && visibleTrophyProgress.total > 0 && <span>{visibleTrophyProgress.earned === null ? `${visibleTrophyProgress.total} TROPHIES` : `${visibleTrophyProgress.earned}/${visibleTrophyProgress.total} TROPHIES EARNED`}</span>}
         </div>
-        {trophyProgress && trophyProgress.total > 0 && <div className="home-trophy-progress" aria-label="Trophy progress">
-          <div className="trophy-progress-heading"><strong>Trophies</strong><span>{trophyProgress.earned === null ? "Earned status unavailable" : `${trophyProgress.earned} / ${trophyProgress.total} earned`}</span></div>
-          <div className="trophy-progress-grid">{(["bronze", "silver", "gold", "platinum"] as const).map((grade) => <div className={`trophy-progress-grade trophy-${grade}`} key={grade}><span>{grade}</span><strong>{trophyProgress.earned === null ? "—" : trophyProgress.earnedByGrade[grade]} <i>/</i> {trophyProgress.counts[grade]}</strong></div>)}</div>
+        {visibleTrophyProgress && visibleTrophyProgress.total > 0 && <div className="home-trophy-progress" aria-label="Trophy progress">
+          <div className="trophy-progress-heading"><strong>Trophies</strong><span>{visibleTrophyProgress.earned === null ? "Earned status unavailable" : `${visibleTrophyProgress.earned} / ${visibleTrophyProgress.total} earned`}</span></div>
+          <div className="trophy-progress-grid">{(["bronze", "silver", "gold", "platinum"] as const).map((grade) => <div className={`trophy-progress-grade trophy-${grade}`} key={grade}><span>{grade}</span><strong>{visibleTrophyProgress.earned === null ? "—" : visibleTrophyProgress.earnedByGrade[grade]} <i>/</i> {visibleTrophyProgress.counts[grade]}</strong></div>)}</div>
         </div>}
         <div className="hero-actions">
           {featuredGame ? (

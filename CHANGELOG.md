@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.0
+
+### Home and game details
+
+- Enlarge transparent game logos in the home view and game details without letting the artwork intercept clicks or increase the details banner height.
+- Keep trophy summaries cached per game while switching between library selections, and refresh them after a new play session or when the cache expires.
+
+### Compatibility reports
+
+- Restyle the GitHub game status report dialog and its input fields to match the Studio theme, with clearer report actions and preview.
+- Make extra notes editable and include them in the generated issue body alongside game, build, host, observation, patch, and selected related-issue details.
+- Improve compatibility build comparison and platform status presentation across the available panel width.
+
 ## 1.2.0
 
 ### Game launch and emulator settings

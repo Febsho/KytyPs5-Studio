@@ -1,5 +1,8 @@
 import type { ReactNode, Dispatch, SetStateAction } from "react";
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { confirm as nativeConfirm, open as nativeOpen, save as nativeSave } from "@tauri-apps/plugin-dialog";
 import { Play } from "lucide-react";
 import type {
   Build,
@@ -19,7 +22,12 @@ import { date, emulatorBuildName, formatBytes, short } from "../utils/format";
 import { trophyGrade, trophyGrades } from "../utils/trophies";
 import { compatibilityOsLabel, compatibilityStatusLabel, currentCompatibilityOS, normalizeTitleId, officialCompatibilityForGame, recommendVerifiedBuild } from "../utils/compatibility";
 
-type Tab = "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Patches";
+type Tab = "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Patches" | "Save Data";
+type SaveEntry = { id:string; title_id:string; user_id:string|null; slot:string; build_id:number; build_name:string; game_version:string|null; path:string; size_bytes:number; modified_at:number|null; layout:string };
+type SaveBackup = { path:string; title_id:string; user_id:string|null; source_build:string; source_build_id:number; source_fork:string; timestamp:number; checksum_sha256:string; label:string; includes_trophies:boolean; trophy_filenames:string[] };
+type SaveDataProgress = { game_id:number; operation:string; phase:string; completed:number; total:number };
+type TrophyProgress = { id:string; title_id:string; build_id:number; build_name:string; build_path:string; user_id:string; service_label:string; path:string; read_status:string; earned:number|null; earned_ids:string[]; error:string|null };
+type TrophyBackup = {path:string;title_id:string;user_id:string;service_label:string;source_build:string;source_build_id:number;timestamp:number;sha256:string;filename:string};
 export type GameDetailsPageProps = {
   game: Game;
   gameLogo?: string | null;
@@ -128,6 +136,21 @@ export function GameDetailsPage({
   const [patchToggleBusy, setPatchToggleBusy] = useState(false);
   const [patchToggleError, setPatchToggleError] = useState("");
   const [customPatchPath, setCustomPatchPath] = useState("");
+  const [saves, setSaves] = useState<SaveEntry[]>([]);
+  const [saveBusy, setSaveBusy] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [saveNotice, setSaveNotice] = useState("");
+  const [backupHistory, setBackupHistory] = useState<SaveBackup[]>([]);
+  const [autoBackup, setAutoBackup] = useState(false);
+  const [backupDirectory, setBackupDirectory] = useState("");
+  const [retentionDays, setRetentionDays] = useState("90");
+  const [restorePointName, setRestorePointName] = useState("");
+  const [saveProgress, setSaveProgress] = useState<SaveDataProgress | null>(null);
+  const [trophyProgress, setTrophyProgress] = useState<TrophyProgress[]>([]);
+  const [trophyBusy, setTrophyBusy] = useState(false);
+  const [trophyError, setTrophyError] = useState("");
+  const [trophyNotice, setTrophyNotice] = useState("");
+  const [trophyBackups, setTrophyBackups] = useState<TrophyBackup[]>([]);
   const [abSettingsBuildId, setAbSettingsBuildId] = useState<number | null>(
     currentGame.build_id ?? builds.find((build) => build.active)?.id ?? builds[0]?.id ?? null,
   );
@@ -169,6 +192,14 @@ export function GameDetailsPage({
     void onInspectContent(currentGame.id).then((result) => { if (current) { setContent(result); setContentError(""); } }).catch((error) => { if (current) setContentError(String(error)); });
     return () => { current = false; };
   }, [gameDetailsTab, currentGame.id, currentGame.build_id, onInspectContent]);
+  const refreshTrophyProgress = async () => {
+    setTrophyBusy(true); setTrophyError("");
+    try { const [progress,backups]=await Promise.all([invoke<TrophyProgress[]>("list_trophy_progress", {gameId: currentGame.id}),invoke<TrophyBackup[]>("list_trophy_backups",{gameId:currentGame.id})]);setTrophyProgress(progress);setTrophyBackups(backups); }
+    catch(error) { setTrophyError(String(error)); }
+    finally { setTrophyBusy(false); }
+  };
+  useEffect(() => { if(gameDetailsTab === "Trophies") void refreshTrophyProgress(); }, [gameDetailsTab,currentGame.id]);
+  const backupTrophy = async (entry:TrophyProgress) => { setTrophyBusy(true);setTrophyError("");setTrophyNotice("");try{const path=await invoke<string>("backup_trophy_progress",{gameId:currentGame.id,path:entry.path});setTrophyNotice(`Verified trophy backup created: ${path}`);}catch(error){setTrophyError(String(error));}finally{setTrophyBusy(false);void refreshTrophyProgress();} };
   useEffect(() => {
     if (gameDetailsTab !== "Patches" || !onFetchOnlineCheats) return;
     let current = true;
@@ -180,6 +211,29 @@ export function GameDetailsPage({
       .catch((error) => { if (current) setRemoteCheatError(String(error)); });
     return () => { current = false; };
   }, [gameDetailsTab, currentGame.id, onFetchOnlineCheats]);
+  const detectSaves = async () => {
+    setSaveBusy(true); setSaveError("");
+    try { const [found,backups] = await Promise.all([invoke<SaveEntry[]>("list_saves", { gameId: currentGame.id }),invoke<SaveBackup[]>("list_save_backups", { gameId: currentGame.id })]); setSaves(found); setBackupHistory(backups); }
+    catch (error) { setSaveError(String(error)); }
+    finally { setSaveBusy(false); }
+  };
+  useEffect(() => { if (gameDetailsTab === "Save Data") void detectSaves(); }, [gameDetailsTab, currentGame.id]);
+  useEffect(() => { if (gameDetailsTab !== "Save Data") return; void Promise.all([invoke<string | null>("get_setting",{key:"save_data_auto_backup"}),invoke<string | null>("get_setting",{key:"save_data_backup_directory"}),invoke<string | null>("get_setting",{key:"save_data_retention_days"})]).then(([automatic,directory,days])=>{setAutoBackup(automatic==="true");setBackupDirectory(directory??"");setRetentionDays(days??"90");}).catch((error)=>setSaveError(String(error))); },[gameDetailsTab]);
+  useEffect(() => {
+    if (gameDetailsTab !== "Save Data") return;
+    let unlisten: (()=>void) | undefined;
+    let disposed=false;
+    void listen<SaveDataProgress>("save-data-progress",({payload})=>{
+      if(payload.game_id===currentGame.id)setSaveProgress(payload);
+    }).then((stop)=>{if(disposed)stop();else unlisten=stop;}).catch((error)=>setSaveError(String(error)));
+    return ()=>{disposed=true;unlisten?.();};
+  },[gameDetailsTab,currentGame.id]);
+  const createSaveBackup = async (entry: SaveEntry, label?: string, includeTrophies = false) => {
+    setSaveBusy(true); setSaveError(""); setSaveNotice("");
+    try { const path = await invoke<string>(includeTrophies ? "backup_save_with_trophies" : "backup_save", { gameId: currentGame.id, savePath: entry.path, label: label ?? null }); setSaveNotice(`${includeTrophies ? "Combined save and trophy backup" : "Save backup"} created: ${path}`); const backups=await invoke<SaveBackup[]>("list_save_backups",{gameId:currentGame.id}); setBackupHistory(backups); }
+    catch (error) { setSaveError(String(error)); }
+    finally { setSaveBusy(false); }
+  };
   const importCustomPatch = async () => {
     if (!onImportCustomPatch) return;
     setCustomPatchBusy(true);
@@ -280,7 +334,7 @@ export function GameDetailsPage({
         </div>
       </div>
       <nav className="details-tabs" aria-label="Game details tabs">
-        {(["Overview", "Settings", "Compatibility", "Logs", "Trophies", "Patches"] as const).map(
+        {(["Overview", "Settings", "Compatibility", "Logs", "Trophies", "Patches", "Save Data"] as const).map(
           (tab) => (
             <button
               key={tab}
@@ -292,6 +346,18 @@ export function GameDetailsPage({
           ),
         )}
       </nav>
+      {gameDetailsTab === "Save Data" && <div className="panel save-data-panel">
+        <div className="game-overview-heading"><div><span className="eyebrow">PER-GAME STORAGE</span><h2>Save Data</h2><p>Detected only in verified KytyPS5 save layouts under installed build directories. Physical console saves need a real conversion tool and cannot be imported directly.</p></div><button className="outline" disabled={saveBusy || activeSessions} onClick={() => void detectSaves()}>{saveBusy ? "Working…" : "Detect saves"}</button></div>
+        {activeSessions && <p className="hint">Close all emulator sessions before changing save data.</p>}
+        <div className="save-data-settings"><label className="save-auto-backup"><input type="checkbox" checked={autoBackup} onChange={async(e)=>{const enabled=e.currentTarget.checked;setAutoBackup(enabled);try{await invoke("set_setting",{key:"save_data_auto_backup",value:String(enabled)});}catch(error){setAutoBackup(!enabled);setSaveError(String(error));}}}/> Create deduplicated backups after each completed game session</label><div className="buttonrow"><span className="path">{backupDirectory || "Studio app data / save-backups"}</span><button className="outline" disabled={saveBusy} onClick={async()=>{const selected=await nativeOpen({directory:true,multiple:false,title:"Choose save backup folder"});if(typeof selected!=="string")return;try{const path=await invoke<string>("set_save_backup_directory",{path:selected});setBackupDirectory(path);setSaveNotice(`Backup destination changed to ${path}`);}catch(error){setSaveError(String(error));}}}>Choose backup folder</button></div><div className="buttonrow"><label>Keep backups for <input aria-label="Backup retention days" type="number" min={1} max={3650} value={retentionDays} onChange={(e)=>setRetentionDays(e.currentTarget.value)} onBlur={()=>{const days=Math.max(1,Math.min(3650,Number(retentionDays)||90));setRetentionDays(String(days));void invoke("set_setting",{key:"save_data_retention_days",value:String(days)}).catch((error)=>setSaveError(String(error)));}}/> days</label><button className="outline" disabled={saveBusy || activeSessions} onClick={async()=>{const days=Math.max(1,Math.min(3650,Number(retentionDays)||90));if(!await nativeConfirm(`Remove verified backups older than ${days} days? The newest verified backup for each build, user and slot will be kept.`,{title:"Clean save backup history",kind:"warning",okLabel:"Clean old backups"}))return;setSaveBusy(true);try{const bytes=await invoke<number>("clean_save_backups",{gameId:currentGame.id,retentionDays:days});setSaveNotice(`Removed ${formatBytes(bytes)} of old verified backups.`);await detectSaves();}catch(error){setSaveError(String(error));}finally{setSaveBusy(false);}}}>Clean old backups…</button></div><label className="save-point-name">Restore point name <input value={restorePointName} maxLength={64} placeholder="e.g. Before boss fight" onChange={(e)=>setRestorePointName(e.currentTarget.value)}/></label></div>
+        {saveError && <p className="error-text">{saveError}</p>}{saveNotice && <p className="hint">{saveNotice}</p>}
+        {saveBusy && saveProgress && <div className="save-progress" aria-live="polite"><div className="save-progress-heading"><strong>{saveProgress.operation.replaceAll("-"," ")}</strong><span>{saveProgress.phase}</span></div>{saveProgress.total>1 && <div className="shader-precompile-progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={saveProgress.total} aria-valuenow={saveProgress.completed}><span style={{width:`${Math.min(100,Math.round(saveProgress.completed/saveProgress.total*100))}%`}}/></div>}</div>}
+        <div className="buttonrow"><button className="outline" disabled={saveBusy || activeSessions || !builds.length} onClick={async () => { const selected = await nativeOpen({ directory:true, multiple:false, title:"Select a save folder named for this game's title ID" }); if (typeof selected !== "string") return; if(!await nativeConfirm("Import this title save root? Detected matching saves are backed up before replacement.",{title:"Import save folder",kind:"warning",okLabel:"Import save"}))return; const buildId=currentGame.build_id ?? builds.find((b)=>b.active)?.id ?? builds[0]?.id; if (buildId === undefined) return; setSaveBusy(true); setSaveError(""); try { const path=await invoke<string>("import_save_directory",{gameId:currentGame.id,sourcePath:selected,buildId}); setSaveNotice(`Imported to ${path}`); await detectSaves(); } catch(e) { setSaveError(String(e)); } finally { setSaveBusy(false); } }}>Import save folder</button><button className="outline" disabled={saveBusy || activeSessions || !builds.length} onClick={async()=>{const archive=await nativeOpen({multiple:false,filters:[{name:"ZIP archive",extensions:["zip"]}]});if(typeof archive!=="string")return;if(!await nativeConfirm("Import this verified save slot into the selected build? An existing matching slot is backed up first.",{title:"Import save ZIP",kind:"warning",okLabel:"Import save"}))return;const buildId=currentGame.build_id??builds.find((b)=>b.active)?.id??builds[0]?.id;if(buildId===undefined)return;setSaveBusy(true);try{const path=await invoke<string>("import_save_archive",{gameId:currentGame.id,archivePath:archive,buildId});setSaveNotice(`Imported to ${path}`);await detectSaves();}catch(e){setSaveError(String(e));}finally{setSaveBusy(false);}}}>Import ZIP</button></div>
+        {saves.length === 0 && <p>{saveBusy ? "Scanning installed builds…" : "No saves were detected in the verified layouts."}</p>}
+        {saves.map((entry) => <section className="save-data-entry" key={entry.id}><div><strong>{entry.slot}</strong><p>{entry.title_id} · User {entry.user_id ?? "default/unknown"} · {entry.build_name}</p><p>{entry.path}</p><small>{formatBytes(entry.size_bytes)} · {entry.modified_at ? date(entry.modified_at) : "Modified time unavailable"} · {entry.layout}{entry.game_version ? ` · game ${entry.game_version}` : ""}</small></div><div className="buttonrow"><button className="outline" disabled={saveBusy || activeSessions} onClick={() => void createSaveBackup(entry,restorePointName.trim()||"manual")}>Create save backup</button><button className="outline" disabled={saveBusy || activeSessions || !entry.user_id} title={!entry.user_id?"Combined backups require a known save user ID":"Includes trophy files for the same user, build and title"} onClick={() => void createSaveBackup(entry,restorePointName.trim()||"manual",true)}>Save + Trophies</button><button className="outline" disabled={saveBusy} onClick={async()=>{const destination=await nativeSave({defaultPath:`${entry.title_id}-${entry.slot}.zip`,filters:[{name:"ZIP archive",extensions:["zip"]}]});if(!destination)return;setSaveBusy(true);try{const path=await invoke<string>("export_save_archive",{gameId:currentGame.id,savePath:entry.path,destination});setSaveNotice(`Exported ${path}`);}catch(e){setSaveError(String(e));}finally{setSaveBusy(false);}}}>Export ZIP</button><button className="outline" onClick={() => void invoke("open_save_folder",{path:entry.path}).catch((e)=>setSaveError(String(e)))}>Folder</button><button className="outline" disabled={saveBusy || activeSessions} onClick={async()=>{ if (!await nativeConfirm("Delete this save? Studio creates a verified backup first.", {title:"Delete save data",kind:"warning",okLabel:"Delete save"})) return; setSaveBusy(true); try { await invoke("delete_save",{gameId:currentGame.id,savePath:entry.path}); await detectSaves(); } catch(e) { setSaveError(String(e)); } finally { setSaveBusy(false); } }}>Delete…</button></div></section>)}
+        {backupHistory.length > 0 && <div><h3>Backup history</h3>{backupHistory.map((record)=><section className="save-data-entry" key={record.path}><div><strong>{record.label} · {date(record.timestamp)} · {record.source_fork} / {record.source_build} · user {record.user_id ?? "default/unknown"}</strong><p>{record.path}</p><small>SHA-256 {record.checksum_sha256} · {record.includes_trophies?`includes ${record.trophy_filenames.join(", ")}`:"save data only"}</small></div><button className="outline" disabled={saveBusy || activeSessions} onClick={async()=>{const details=record.includes_trophies?` It will also restore these local trophy files for user ${record.user_id}: ${record.trophy_filenames.join(", ")}.`:"";if(!await nativeConfirm(`Restore this verified backup to its original build and save layout? Existing data is backed up first.${details}`,{title:"Restore save backup",kind:"warning",okLabel:"Restore backup"}))return;setSaveBusy(true);try{await invoke("restore_save",{gameId:currentGame.id,backupPath:record.path});setSaveNotice("Backup restored and verified.");await detectSaves();}catch(e){setSaveError(String(e));}finally{setSaveBusy(false);}}}>Restore</button></section>)}</div>}
+        <p className="hint">Backups are stored at {backupDirectory || "Studio app data / save-backups"}, outside emulator build folders. Only checksum-verified backups are shown. Use “Save + Trophies” to include the matching user’s trophy JSON files for that same build; ordinary save backups exclude trophies. Cleanup keeps the last verified restore point per build, user and slot.</p>
+      </div>}
       {gameDetailsTab === "Overview" && (
         <div className="details-overview">
           <div className="panel game-overview-panel">
@@ -489,7 +555,14 @@ export function GameDetailsPage({
       {(gameDetailsTab === "Trophies" || gameDetailsTab === "Patches") && <div className="panel game-content-panel">
         {gameDetailsTab === "Trophies" ? <>
           <h2>Trophies</h2>
-          <p>All trophies from the game package, grouped by grade. Earned status comes from this emulator build’s local trophy progress.</p>
+          <p>Definitions come from the game package. Earned status is local emulator progress only; there is no PlayStation Network sync.</p>
+          {trophyError && <p className="error-note">{trophyError}</p>}{trophyNotice && <p className="hint">{trophyNotice}</p>}
+          <section className="trophy-progress-manager"><div className="buttonrow"><h3>Local progress by build, user and service</h3><button className="outline" disabled={trophyBusy} onClick={()=>void refreshTrophyProgress()}>{trophyBusy?"Reading…":"Refresh"}</button></div>
+            {trophyProgress.length===0&&!trophyBusy&&<p>No local trophy progress files were found in installed build folders. Missing files do not mean zero trophies earned.</p>}
+            {trophyProgress.map((entry)=><article className="save-data-entry" key={entry.id}><div><strong>{entry.build_name} · User {entry.user_id} · Service {entry.service_label}</strong><p>{entry.read_status==="readable"?`${entry.earned} earned IDs read`:"Progress file could not be read; earned count unavailable"}</p><small>{entry.path}</small>{entry.error&&<p className="error-note">{entry.error}</p>}</div><div className="buttonrow"><button className="outline" disabled={trophyBusy||activeSessions||entry.read_status!=="readable"} onClick={()=>void backupTrophy(entry)}>Backup Trophies</button><button className="outline" disabled={trophyBusy||activeSessions||entry.read_status!=="readable"} onClick={async()=>{const destination=await nativeSave({defaultPath:`trophies_${entry.user_id}_${entry.service_label}.json`,filters:[{name:"Trophy JSON",extensions:["json"]}]});if(!destination)return;setTrophyBusy(true);try{const path=await invoke<string>("export_trophy_progress",{gameId:currentGame.id,path:entry.path,destination});setTrophyNotice(`Exported ${path}`);}catch(error){setTrophyError(String(error));}finally{setTrophyBusy(false);}}}>Export</button><button className="outline" disabled={trophyBusy||activeSessions} onClick={()=>void invoke("open_trophy_folder",{gameId:currentGame.id,path:entry.path}).catch(error=>setTrophyError(String(error)))}>Open Trophy Folder</button></div></article>)}
+            <button className="outline" disabled={trophyBusy||activeSessions} onClick={async()=>{const source=await nativeOpen({multiple:false,filters:[{name:"Trophy JSON",extensions:["json"]}]});if(typeof source!=="string")return;const target=builds.find(b=>b.id===currentGame.build_id)?.id??builds.find(b=>b.active)?.id;if(!target){setTrophyError("No registered build is available as an import target.");return;}if(!await nativeConfirm("Import this exact user and service file? Existing trophy progress will never be overwritten.",{title:"Import trophy progress",kind:"warning",okLabel:"Import JSON"}))return;setTrophyBusy(true);try{const path=await invoke<string>("import_trophy_progress",{gameId:currentGame.id,source,buildId:target});setTrophyNotice(`Imported ${path}`);await refreshTrophyProgress();}catch(error){setTrophyError(String(error));}finally{setTrophyBusy(false);}}}>Import Trophy JSON…</button>
+          </section>
+          <section className="trophy-progress-manager"><h3>Verified trophy backup history</h3>{trophyBackups.length===0?<p>No verified trophy backups yet.</p>:trophyBackups.map(record=><article className="save-data-entry" key={record.path}><div><strong>{record.source_build} · User {record.user_id} · Service {record.service_label}</strong><p>{date(record.timestamp)} · SHA-256 {record.sha256}</p><small>{record.path}</small></div><button className="outline" disabled={trophyBusy||activeSessions} onClick={async()=>{if(!await nativeConfirm(`Restore ${record.filename} for user ${record.user_id}, service ${record.service_label}, to build ${record.source_build}? Existing progress for this exact account and service is backed up first.`,{title:"Restore trophy progress",kind:"warning",okLabel:"Restore progress"}))return;setTrophyBusy(true);try{const path=await invoke<string>("restore_trophy_backup",{gameId:currentGame.id,backupPath:record.path});setTrophyNotice(`Restored ${path}`);await refreshTrophyProgress();}catch(error){setTrophyError(String(error));}finally{setTrophyBusy(false);}}}>Restore…</button></article>)}</section>
           {contentError && <p className="error-note">{contentError}</p>}
           {!content && !contentError && <p>Reading trophy package…</p>}
           {content?.trophies.length ? <>

@@ -157,10 +157,10 @@ export const cliOptionInfo: Record<
     group: "System",
     kind: "bool",
   },
-  "--trophy-notifications": {
-    label: "Trophy notifications",
+  "--no-trophy-notifications": {
+    label: "Disable trophy notifications",
     group: "System",
-    kind: "bool",
+    kind: "switch",
   },
   "--trophy-duration": {
     label: "Trophy notification duration (5–10 sec)",
@@ -305,19 +305,46 @@ export function ProfileOptionFields({
   optionMetadata = {},
 }: Props) {
   const [dialogError, setDialogError] = useState("");
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
+  const validateField = (flag: string, value: string) => {
+    if (!value) return "";
+    const metadata = optionMetadata[flag];
+    if (metadata?.choices?.length && !metadata.choices.includes(value)) return `Choose one of: ${metadata.choices.join(", ")}`;
+    if (metadata?.minimum !== null && metadata?.minimum !== undefined || metadata?.maximum !== null && metadata?.maximum !== undefined) {
+      const number = Number(value);
+      if (!Number.isInteger(number)) return "Enter a whole number";
+      if (metadata?.minimum !== null && metadata?.minimum !== undefined && number < metadata.minimum || metadata?.maximum !== null && metadata?.maximum !== undefined && number > metadata.maximum) return `Value must be between ${metadata.minimum ?? "any"} and ${metadata.maximum ?? "any"}`;
+    }
+    if (flag === "--trophy-duration" && (!/^\d+$/.test(value) || Number(value) < 5 || Number(value) > 10)) return "Trophy duration must be 5 to 10 seconds";
+    if (flag === "--vblank-frequency" && (!/^\d+$/.test(value) || Number(value) < 30 || Number(value) > 360)) return "VBlank frequency must be 30 to 360 Hz";
+    if (["--screen-width", "--screen-height"].includes(flag) && (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 4294967295)) return "Enter a positive 32-bit pixel value";
+    if (flag === "--gpu" && (!/^-?\d+$/.test(value) || Number(value) < -1)) return "GPU index must be -1 (automatic) or a device index";
+    if (flag === "--keymap" && !value.split("\n").some((line) => line.trim() && line.includes("=") && line.split("=")[0].trim() && line.split("=").slice(1).join("=").trim())) return "Add a mapping in Control=Input format";
+    if (flag === "--controller-color" && !/^#[\da-fA-F]{6}$/.test(value)) return "Use #RRGGBB format";
+    if (["--controller-volume", "--controller-vibration"].includes(flag) && (!/^\d+$/.test(value) || Number(value) > 100)) return "Value must be between 0 and 100";
+    if (flag === "--console-language" && (!/^\d+$/.test(value) || Number(value) > 29)) return "Language code must be between 0 and 29";
+    if (flag === "--keyboard-player" && (!/^\d+$/.test(value) || Number(value) > 4)) return "Keyboard player must be between 0 and 4";
+    return "";
+  };
   const update = (flag: string, value: string) => {
+    setFieldErrors((current) => ({ ...current, [flag]: validateField(flag, value) }));
     const next = { ...options };
     if (value === "") delete next[flag];
     else next[flag] = value;
     if (flag === "--amd-cpu" && value === "true") delete next["--no-amd-cpu"];
     if (flag === "--no-amd-cpu" && value === "true") delete next["--amd-cpu"];
+    if (flag === "--no-trophy-notifications" && value === "true") delete next["--trophy-duration"];
     onChange(next);
   };
+  const effectiveOptions = { ...inheritedOptions, ...options };
   return (
     <>
       {(["Graphics", "Controls", "System", "Content", "Advanced"] as const).map(
         (group) => {
-          const fields = available.filter((flag) => (cliOptionInfo[flag]?.group ?? "Advanced") === group);
+          const fields = available.filter((flag) =>
+            (cliOptionInfo[flag]?.group ?? "Advanced") === group &&
+            !(flag === "--trophy-duration" && effectiveOptions["--no-trophy-notifications"] === "true"),
+          );
           if (!fields.length) return null;
           const body = (
             <>
@@ -362,7 +389,9 @@ export function ProfileOptionFields({
                       key={flag}
                     >
                       <label>{info.label}</label>
-                      {info.kind === "switch" || info.kind === "bool" ? (
+                      {flag === "--gpu" && gpuDevices.length === 0 ? (
+                        <><select aria-label={info.label} value={value && value !== "-1" ? value : "-1"} disabled>{value && value !== "-1" ? <option value={value}>Saved GPU {value} · not reported by Vulkan</option> : <option value="-1">Automatic selection only</option>}</select><small className="hint">No Vulkan physical device was reported. Install or repair a Vulkan driver/ICD to choose a device.</small></>
+                      ) : info.kind === "switch" || info.kind === "bool" ? (
                         <label className="checkbox">
                           <input
                             type="checkbox"
@@ -410,7 +439,7 @@ export function ProfileOptionFields({
                             !gpuDevices.some(
                               (device) => String(device.index) === value,
                             ) && (
-                              <option value={value}>
+                              <option value={value} disabled>
                                 {value} · Not reported by Vulkan diagnostics
                               </option>
                             )}
@@ -499,7 +528,7 @@ export function ProfileOptionFields({
                             aria-label={info.label}
                             type={info.kind === "number" ? "number" : "text"}
                             min={
-                              metadata?.minimum ?? (flag === "--user-id"
+                              metadata?.minimum ?? (flag === "--trophy-duration" ? 5 : flag === "--user-id"
                                 ? 0
                                 : flag === "--gpu"
                                   ? -1
@@ -508,7 +537,7 @@ export function ProfileOptionFields({
                                     : undefined)
                             }
                             max={
-                              metadata?.maximum ?? (flag === "--user-id"
+                              metadata?.maximum ?? (flag === "--trophy-duration" ? 10 : flag === "--user-id"
                                 ? 2147482879
                                 : flag === "--vblank-frequency"
                                   ? 360
@@ -565,6 +594,7 @@ export function ProfileOptionFields({
                           Inherited from global defaults
                         </small>
                       )}
+                      {fieldErrors[flag] && <small role="alert" className="error-note">{fieldErrors[flag]}</small>}
                       {info.hint && <small className="hint">{info.hint}</small>}
                     </div>
                   );

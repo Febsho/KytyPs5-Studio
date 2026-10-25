@@ -37,10 +37,14 @@ impl ProcessGroupCommandExt for Command {
         self.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED | CREATE_NO_WINDOW)
     }
 }
+#[path = "save_data.rs"]
+mod save_data;
 #[path = "steam.rs"]
 mod steam;
 #[path = "steam_shortcuts.rs"]
 mod steam_shortcuts;
+#[path = "trophies.rs"]
+mod trophies;
 
 #[cfg(any(windows, test))]
 #[cfg_attr(test, allow(dead_code))]
@@ -905,8 +909,28 @@ struct ProfileCapabilities {
     controller_vibration: bool,
     keyboard_player: bool,
     options: Vec<String>,
+    verified_options: Vec<String>,
+    option_states: HashMap<String, CapabilityStatus>,
+    binary_sha256: String,
+    host_os: String,
+    background_precompile: bool,
     switch_options: Vec<String>,
     option_metadata: HashMap<String, CliOptionMetadata>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CapabilityState {
+    VerifiedSupported,
+    AdvertisedUnverified,
+    Unavailable,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CapabilityStatus {
+    state: CapabilityState,
+    explanation: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -917,6 +941,8 @@ struct CliOptionMetadata {
     maximum: Option<i64>,
     default_value: Option<String>,
     description: String,
+    state: CapabilityState,
+    state_explanation: String,
 }
 
 const CONFIGURABLE_CLI_OPTIONS: &[&str] = &[
@@ -959,7 +985,7 @@ const CONFIGURABLE_CLI_OPTIONS: &[&str] = &[
     "--sync-raw-image-buffers",
     "--tessellation",
     "--trophy-duration",
-    "--trophy-notifications",
+    "--no-trophy-notifications",
     "--user-id",
     "--user-name",
     "--vblank-frequency",
@@ -973,6 +999,7 @@ fn cli_switch_options() -> &'static [&'static str] {
         "--fullscreen",
         "--hdr",
         "--hide-cursor",
+        "--no-trophy-notifications",
         "--no-splash",
         "--playgo-hack",
         "--profile",
@@ -994,7 +1021,6 @@ fn cli_boolean_options() -> &'static [&'static str] {
         "--skip-notice-screen",
         "--spirv-debug-printf",
         "--sync-raw-image-buffers",
-        "--trophy-notifications",
         "--vulkan-validation",
     ]
 }
@@ -1022,6 +1048,47 @@ fn profile_capabilities(help: &str) -> ProfileCapabilities {
     let reserved = ["--game", "--guest-exec", "--help"];
     let configurable = |flag: &&str| !reserved.contains(flag);
     let has = |flag: &str| supported.contains(flag);
+    let options = parsed
+        .iter()
+        .map(|(flag, _)| *flag)
+        .filter(configurable)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut option_metadata = cli_option_metadata(help);
+    for metadata in option_metadata.values_mut() {
+        metadata.state = CapabilityState::AdvertisedUnverified;
+        metadata.state_explanation = "The executable advertises this option in --help, but Studio has not verified its implementation for this exact build.".into();
+    }
+    let mut option_states = HashMap::new();
+    for flag in CONFIGURABLE_CLI_OPTIONS {
+        option_states.insert(
+            (*flag).to_owned(),
+            CapabilityStatus {
+                state: if has(flag) {
+                    CapabilityState::AdvertisedUnverified
+                } else {
+                    CapabilityState::Unsupported
+                },
+                explanation: if has(flag) {
+                    "Advertised by --help; implementation not source-verified for this build."
+                } else {
+                    "Not advertised by this build."
+                }
+                .into(),
+            },
+        );
+    }
+    for flag in &options {
+        option_states
+            .entry(flag.clone())
+            .or_insert_with(|| CapabilityStatus {
+                state: CapabilityState::AdvertisedUnverified,
+                explanation:
+                    "Advertised by --help; implementation not source-verified for this build."
+                        .into(),
+            });
+    }
+    let verified_options = Vec::new();
     ProfileCapabilities {
         screen_width: has("--screen-width"),
         screen_height: has("--screen-height"),
@@ -1032,18 +1099,18 @@ fn profile_capabilities(help: &str) -> ProfileCapabilities {
         controller_volume: has("--controller-volume"),
         controller_vibration: has("--controller-vibration"),
         keyboard_player: has("--keyboard-player"),
-        options: parsed
-            .iter()
-            .map(|(flag, _)| *flag)
-            .filter(configurable)
-            .map(str::to_string)
-            .collect(),
+        options,
+        verified_options,
+        option_states,
+        binary_sha256: String::new(),
+        host_os: env::consts::OS.to_owned(),
+        background_precompile: false,
         switch_options: parsed
             .iter()
             .filter(|(flag, takes_value)| !takes_value && configurable(flag))
             .map(|(flag, _)| (*flag).to_string())
             .collect(),
-        option_metadata: cli_option_metadata(help),
+        option_metadata,
     }
 }
 
@@ -1163,6 +1230,10 @@ fn cli_option_metadata(help: &str) -> HashMap<String, CliOptionMetadata> {
                     maximum,
                     default_value,
                     description,
+                    state: CapabilityState::AdvertisedUnverified,
+                    state_explanation:
+                        "Advertised by --help; implementation not source-verified for this build."
+                            .into(),
                 },
             )
         })
@@ -1210,42 +1281,270 @@ fn build_for_game(c: &Connection, game_id: i64) -> Result<Build, String> {
     build(c, id)
 }
 
-fn capabilities_for_build(b: &Build) -> Result<ProfileCapabilities, String> {
+fn capabilities_for_build(b: &Build, repository: &Repo) -> Result<ProfileCapabilities, String> {
     let exe = emulator_executable(Path::new(&b.path));
     let canonical = fs::canonicalize(&exe).map_err(|e| e.to_string())?;
-    let metadata = fs::metadata(&canonical).map_err(|e| e.to_string())?;
-    #[cfg(windows)]
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    #[cfg(unix)]
-    let identity = format!(
-        "{}:{}:{}:{}:{}",
-        metadata.dev(),
-        metadata.ino(),
-        metadata.permissions().mode(),
-        metadata.ctime(),
-        metadata.ctime_nsec()
+    let binary_bytes = fs::read(&canonical)
+        .map_err(|e| format!("Could not hash selected emulator binary: {e}"))?;
+    let binary_sha256 = format!("{:x}", Sha256::digest(&binary_bytes));
+    let source_identity = source_matches_build(b, repository)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unverified-source".into());
+    let key = format!(
+        "{binary_sha256}:{}:{}:{source_identity}",
+        env::consts::OS,
+        b.commit_sha
     );
-    #[cfg(windows)]
-    let identity = modified.to_string();
-    let key = format!("{}:{}:{}", canonical.display(), metadata.len(), identity);
     static CACHE: std::sync::OnceLock<Mutex<HashMap<String, ProfileCapabilities>>> =
         std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(capabilities) = cache.lock().map_err(|e| e.to_string())?.get(&key).cloned() {
         return Ok(capabilities);
     }
-    let capabilities = profile_capabilities(&emulator_help(&canonical)?);
+    let mut capabilities = profile_capabilities(&emulator_help(&canonical)?);
+    capabilities.binary_sha256 = binary_sha256;
+    capabilities.verified_options = source_verified_options(b, repository, &capabilities.options);
+    capabilities.background_precompile = source_proves_background_precompile(b, repository);
+    // HDR is gated by the connected display and Vulkan surface support. Studio
+    // cannot probe that combination reliably on every host, so it remains unavailable.
+    capabilities.verified_options.retain(|flag| flag != "--hdr");
+    let verified: HashSet<_> = capabilities.verified_options.iter().cloned().collect();
+    capabilities.screen_width = verified.contains("--screen-width");
+    capabilities.screen_height = verified.contains("--screen-height");
+    capabilities.present_mode = verified.contains("--present-mode");
+    capabilities.perf_overlay = verified.contains("--perf-overlay");
+    capabilities.fullscreen = verified.contains("--fullscreen");
+    capabilities.controller_color = verified.contains("--controller-color");
+    capabilities.controller_volume = verified.contains("--controller-volume");
+    capabilities.controller_vibration = verified.contains("--controller-vibration");
+    capabilities.keyboard_player = verified.contains("--keyboard-player");
+    for (flag, status) in &mut capabilities.option_states {
+        if verified.contains(flag) {
+            status.state = CapabilityState::VerifiedSupported;
+            status.explanation = format!(
+                "Verified in clean source revision {} and advertised by this binary (SHA-256 {}).",
+                b.commit_sha,
+                &capabilities.binary_sha256[..12]
+            );
+        }
+    }
+    for flag in &capabilities.options {
+        if !verified.contains(flag) {
+            if let Some(explanation) = source_option_unavailable_on_host(b, repository, flag) {
+                capabilities.option_states.insert(
+                    flag.clone(),
+                    CapabilityStatus {
+                        state: CapabilityState::Unavailable,
+                        explanation: explanation.clone(),
+                    },
+                );
+                if let Some(metadata) = capabilities.option_metadata.get_mut(flag) {
+                    metadata.state = CapabilityState::Unavailable;
+                    metadata.state_explanation = explanation;
+                }
+            }
+        }
+    }
+    if capabilities.options.iter().any(|flag| flag == "--hdr") {
+        let explanation = "This option also requires an HDR-capable connected display and Vulkan surface. Studio cannot verify both for this session.".to_string();
+        capabilities.option_states.insert(
+            "--hdr".into(),
+            CapabilityStatus {
+                state: CapabilityState::Unavailable,
+                explanation: explanation.clone(),
+            },
+        );
+        if let Some(metadata) = capabilities.option_metadata.get_mut("--hdr") {
+            metadata.state = CapabilityState::Unavailable;
+            metadata.state_explanation = explanation;
+        }
+    }
+    for (flag, metadata) in &mut capabilities.option_metadata {
+        if verified.contains(flag) {
+            metadata.state = CapabilityState::VerifiedSupported;
+            metadata.state_explanation = format!(
+                "Source implementation matched build commit {}; binary SHA-256 {}.",
+                b.commit_sha,
+                &capabilities.binary_sha256[..12]
+            );
+        }
+    }
     let mut cache = cache.lock().map_err(|e| e.to_string())?;
     if cache.len() >= 64 {
         cache.clear();
     }
     cache.insert(key, capabilities.clone());
     Ok(capabilities)
+}
+
+fn source_matches_build(b: &Build, repository: &Repo) -> Option<PathBuf> {
+    let source = PathBuf::from(repository.source_path.as_deref()?);
+    if git(Some(&source), &["rev-parse", "HEAD"]).ok()?.trim() != b.commit_sha
+        || !git(Some(&source), &["status", "--porcelain"])
+            .ok()?
+            .trim()
+            .is_empty()
+    {
+        return None;
+    }
+    Some(source)
+}
+
+fn source_option_unavailable_on_host(b: &Build, repository: &Repo, flag: &str) -> Option<String> {
+    if cfg!(windows) {
+        return None;
+    }
+    let source = source_matches_build(b, repository)?;
+    let main = fs::read_to_string(source.join("src/main.cpp")).ok()?;
+    let mut windows_only = false;
+    let mut found = false;
+    for line in main.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#if") && trimmed.contains("KYTY_PLATFORM_WINDOWS") {
+            windows_only = true;
+        }
+        if line.contains(flag) && windows_only {
+            found = true;
+        }
+        if trimmed.starts_with("#endif") {
+            windows_only = false;
+        }
+    }
+    found.then(|| "This option is compiled only for Windows builds.".into())
+}
+
+fn source_flag_field(main: &str, flag: &str) -> Option<String> {
+    for line in main.lines().filter(|line| line.contains(flag)) {
+        if let Some((_, tail)) = line.split_once("ConfigOptions::") {
+            let field = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<String>();
+            if !field.is_empty() {
+                return Some(field);
+            }
+        }
+    }
+    let lines = main.lines().collect::<Vec<_>>();
+    for (index, line) in lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(flag))
+    {
+        for candidate in lines.iter().skip(index).take(14) {
+            let token = candidate
+                .split("options.config.")
+                .nth(1)
+                .or_else(|| candidate.split("options.").nth(1));
+            if let Some(tail) = token {
+                let field = tail
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect::<String>();
+                if field.len() > 1 {
+                    return Some(field);
+                }
+            }
+            if candidate.contains("} else if (arg ==") && candidate != line {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn source_verified_options(b: &Build, repository: &Repo, advertised: &[String]) -> Vec<String> {
+    let Some(source) = source_matches_build(b, repository) else {
+        return Vec::new();
+    };
+    let main_path = source.join("src/main.cpp");
+    let Ok(main) = fs::read_to_string(&main_path) else {
+        return Vec::new();
+    };
+    let mut other_source = String::new();
+    for entry in walkdir::WalkDir::new(source.join("src"))
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if entry.path() == main_path
+            || !entry.file_type().is_file()
+            || !entry
+                .path()
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| matches!(ext, "cpp" | "h" | "hpp" | "inl"))
+        {
+            continue;
+        }
+        if let Ok(text) = fs::read_to_string(entry.path()) {
+            other_source.push_str(&text);
+            other_source.push('\n');
+        }
+    }
+    let windows_guarded = |flag: &str| {
+        let mut windows_only = false;
+        let mut found = false;
+        for line in main.lines() {
+            let t = line.trim();
+            if t.starts_with("#if") && t.contains("KYTY_PLATFORM_WINDOWS") {
+                windows_only = true;
+            }
+            if line.contains(flag) && windows_only {
+                found = true;
+            }
+            if t.starts_with("#endif") {
+                windows_only = false;
+            }
+        }
+        found && !cfg!(windows)
+    };
+    advertised
+        .iter()
+        .filter(|flag| {
+            if windows_guarded(flag) {
+                return false;
+            }
+            let Some(field) = source_flag_field(&main, flag) else {
+                return false;
+            };
+            let help = main
+                .split("static void PrintUsage()")
+                .last()
+                .unwrap_or("")
+                .split("static bool NextArg")
+                .next()
+                .unwrap_or("");
+            help.contains(*flag) && other_source.contains(&field)
+        })
+        .cloned()
+        .collect()
+}
+
+fn source_proves_background_precompile(b: &Build, repository: &Repo) -> bool {
+    let Some(source) = source_matches_build(b, repository) else {
+        return false;
+    };
+    let mut matches = 0;
+    for entry in walkdir::WalkDir::new(source.join("src"))
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if entry.file_type().is_file()
+            && entry
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| matches!(e, "cpp" | "h" | "hpp" | "inl"))
+            && fs::read_to_string(entry.path()).is_ok_and(|s| {
+                s.contains("KYTY_SHADER_PRECOMPILE") && s.contains("KYTY_PIPELINE_FAST_FIRST")
+            })
+        {
+            matches += 1;
+        }
+    }
+    matches > 0
 }
 fn profile(c: &Connection, game_id: i64) -> Result<Profile, String> {
     let mut profile = c.query_row(
@@ -1299,13 +1598,25 @@ fn validate_extra_profile_options(
     options: &BTreeMap<String, String>,
     capabilities: &ProfileCapabilities,
 ) -> Result<(), String> {
+    if options
+        .get("--no-trophy-notifications")
+        .is_some_and(|value| value == "true")
+        && options.contains_key("--trophy-duration")
+    {
+        return Err("Trophy duration cannot be set when trophy notifications are disabled".into());
+    }
     for (flag, value) in options {
         if !capabilities
-            .options
+            .verified_options
             .iter()
             .any(|supported| supported == flag)
         {
-            return Err(format!("The selected emulator does not support {flag}"));
+            let detail = capabilities
+                .option_states
+                .get(flag)
+                .map(|status| status.explanation.as_str())
+                .unwrap_or("No source-verified capability entry exists for this build.");
+            return Err(format!("Cannot apply {flag}: {detail}"));
         }
         if let Some(metadata) = capabilities.option_metadata.get(flag) {
             if !metadata.choices.is_empty() && !metadata.choices.contains(value) {
@@ -1563,7 +1874,7 @@ fn validate_extra_profile_options(
         .get("--gpu-assisted-validation")
         .is_some_and(|v| v == "true")
         && !capabilities
-            .options
+            .verified_options
             .iter()
             .any(|v| v == "--vulkan-validation")
     {
@@ -1573,6 +1884,33 @@ fn validate_extra_profile_options(
     }
     Ok(())
 }
+fn validate_gpu_hardware_selection(
+    options: &BTreeMap<String, String>,
+    vulkan_details: &str,
+) -> Result<(), String> {
+    let Some(value) = options.get("--gpu") else {
+        return Ok(());
+    };
+    let index = value
+        .parse::<i32>()
+        .map_err(|_| "GPU index must be a signed integer".to_string())?;
+    if index < 0 {
+        return Ok(());
+    }
+    let available = vulkan_details.lines().any(|line| {
+        line.trim()
+            .strip_prefix("GPU")
+            .and_then(|value| value.trim().trim_end_matches(':').parse::<i32>().ok())
+            == Some(index)
+    });
+    if available {
+        Ok(())
+    } else {
+        Err(format!(
+            "GPU {index} is not reported by Vulkan on this system. Select automatic GPU choice or inspect graphics diagnostics."
+        ))
+    }
+}
 fn effective_profile_options(
     global: &BTreeMap<String, String>,
     game: &BTreeMap<String, String>,
@@ -1580,7 +1918,7 @@ fn effective_profile_options(
 ) -> Result<BTreeMap<String, String>, String> {
     if let Some(unsupported) = game.keys().find(|flag| {
         !capabilities
-            .options
+            .verified_options
             .iter()
             .any(|supported| supported == *flag)
     }) {
@@ -1592,7 +1930,7 @@ fn effective_profile_options(
         .iter()
         .filter(|(flag, _)| {
             capabilities
-                .options
+                .verified_options
                 .iter()
                 .any(|supported| supported == *flag)
         })
@@ -1602,6 +1940,12 @@ fn effective_profile_options(
         game.iter()
             .map(|(flag, value)| (flag.clone(), value.clone())),
     );
+    if effective
+        .get("--no-trophy-notifications")
+        .is_some_and(|value| value == "true")
+    {
+        effective.remove("--trophy-duration");
+    }
     validate_extra_profile_options(&effective, capabilities)?;
     Ok(effective)
 }
@@ -3678,7 +4022,7 @@ fn shader_precompile_support(
     let installation = build(&connection, build_id)?;
     let repository = repo(&connection, installation.repo_id)?;
     stage_precompile_for_build(&installation, &repository)?;
-    let background_precompile = is_jetsku_precompile_fork(&repository);
+    let background_precompile = source_proves_background_precompile(&installation, &repository);
     Ok(ShaderPrecompileSupport {
         full_precompile: shader_precompile_files(Path::new(&installation.path)).is_some(),
         background_precompile,
@@ -4510,10 +4854,10 @@ fn patch_configuration_for_game(
     for (flag, value) in profile(c, game_id)?.options {
         options.insert(flag, value);
     }
-    let capabilities = capabilities_for_build(build)?;
+    let capabilities = capabilities_for_build(build, &repo(c, build.repo_id)?)?;
     options.retain(|flag, _| {
         capabilities
-            .options
+            .verified_options
             .iter()
             .any(|supported| supported == flag)
     });
@@ -8286,6 +8630,21 @@ fn activate_build(app: tauri::AppHandle, id: i64) -> Result<(), String> {
 }
 #[tauri::command]
 fn remove_build(app: tauri::AppHandle, id: i64) -> Result<(), String> {
+    let _lifecycle = SESSION_LIFECYCLE_LOCK
+        .lock()
+        .map_err(|_| "Session lifecycle is unavailable")?;
+    let active: bool = db(&app)?
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE build_id=? AND ended_at IS NULL)",
+            [id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if active {
+        return Err("Stop the active game session before removing its build".into());
+    }
+    save_data::backup_build_saves_locked(&app, id)?;
+    trophies::backup_build_trophies(&app, id)?;
     let mut c = db(&app)?;
     let root = state_paths(&app)?.data.join("builds");
     remove_managed_build(&mut c, id, &root)
@@ -9742,7 +10101,7 @@ fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_jso
     if let (Some(title_id), Some(build)) = (selected.title_id.as_deref(), selected_build.as_ref()) {
         let unlock_dir = Path::new(&build.path).join("_Trophies").join(title_id);
         if let Ok(entries) = fs::read_dir(unlock_dir) {
-            let mut unlocked = HashSet::new();
+            let mut state_files = Vec::new();
             for entry in entries.flatten() {
                 let path = entry.path();
                 let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
@@ -9753,29 +10112,39 @@ fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_jso
                 {
                     continue;
                 }
-                let Ok(bytes) = fs::read(&path) else { continue };
-                let Ok(state) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-                    continue;
-                };
-                let Some(ids) = state
-                    .get("unlockedTrophies")
-                    .and_then(|value| value.as_array())
-                else {
-                    continue;
-                };
-                unlock_data_available = true;
-                for id in ids.iter().filter_map(|value| value.as_u64()) {
-                    unlocked.insert(id);
-                }
+                state_files.push(path);
             }
-            if unlock_data_available {
-                for trophy in &mut trophies {
-                    let id = trophy
-                        .get("id")
-                        .and_then(|value| value.as_str())
-                        .and_then(|value| value.parse::<u64>().ok());
-                    if let Some(id) = id {
-                        trophy["unlocked"] = serde_json::json!(unlocked.contains(&id));
+            // GameContent has one unlocked flag per definition. Only select it when
+            // there is exactly one local service file for the resolved emulator user;
+            // combining service labels would invent progress provenance.
+            if state_files.len() == 1 {
+                let mut unlocked = HashSet::new();
+                if let Ok(bytes) = fs::read(&state_files[0]) {
+                    if bytes.len() <= 1024 * 1024 {
+                        if let Ok(state) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            if let Some(ids) = state
+                                .get("unlockedTrophies")
+                                .and_then(|value| value.as_array())
+                            {
+                                for id in ids.iter().filter_map(|value| {
+                                    value.as_u64().or_else(|| value.as_str()?.parse().ok())
+                                }) {
+                                    unlocked.insert(id);
+                                }
+                                unlock_data_available = true;
+                            }
+                        }
+                    }
+                }
+                if unlock_data_available {
+                    for trophy in &mut trophies {
+                        let id = trophy
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .and_then(|value| value.parse::<u64>().ok());
+                        if let Some(id) = id {
+                            trophy["unlocked"] = serde_json::json!(unlocked.contains(&id));
+                        }
                     }
                 }
             }
@@ -10183,7 +10552,8 @@ fn get_profile_capabilities(
     game_id: i64,
 ) -> Result<ProfileCapabilities, String> {
     let c = db(&app)?;
-    capabilities_for_build(&build_for_game(&c, game_id)?)
+    let selected = build_for_game(&c, game_id)?;
+    capabilities_for_build(&selected, &repo(&c, selected.repo_id)?)
 }
 #[tauri::command]
 fn get_global_profile_options(app: tauri::AppHandle) -> Result<BTreeMap<String, String>, String> {
@@ -10197,7 +10567,8 @@ fn get_active_profile_capabilities(app: tauri::AppHandle) -> Result<ProfileCapab
             r.get(0)
         })
         .map_err(|_| "No active emulator build".to_string())?;
-    capabilities_for_build(&build(&c, id)?)
+    let selected = build(&c, id)?;
+    capabilities_for_build(&selected, &repo(&c, selected.repo_id)?)
 }
 #[tauri::command]
 fn get_build_profile_capabilities(
@@ -10205,7 +10576,8 @@ fn get_build_profile_capabilities(
     build_id: i64,
 ) -> Result<ProfileCapabilities, String> {
     let c = db(&app)?;
-    capabilities_for_build(&build(&c, build_id)?)
+    let selected = build(&c, build_id)?;
+    capabilities_for_build(&selected, &repo(&c, selected.repo_id)?)
 }
 #[tauri::command]
 fn get_build_profile_options(
@@ -10229,7 +10601,8 @@ fn set_global_profile_options(
         .map_err(|_| {
             "Select and activate an emulator build before configuring global defaults".to_string()
         })?;
-    let capabilities = capabilities_for_build(&build(&c, build_id)?)?;
+    let selected = build(&c, build_id)?;
+    let capabilities = capabilities_for_build(&selected, &repo(&c, selected.repo_id)?)?;
     validate_extra_profile_options(&options, &capabilities)?;
     for (flag, value) in &mut options {
         if [
@@ -10256,7 +10629,7 @@ fn set_build_profile_options(
 ) -> Result<(), String> {
     let c = db(&app)?;
     let selected_build = build(&c, build_id)?;
-    let capabilities = capabilities_for_build(&selected_build)?;
+    let capabilities = capabilities_for_build(&selected_build, &repo(&c, selected_build.repo_id)?)?;
     validate_extra_profile_options(&options, &capabilities)?;
     for (flag, value) in &mut options {
         if [
@@ -10319,7 +10692,8 @@ fn set_profile(app: tauri::AppHandle, game_id: i64, mut profile: Profile) -> Res
     validate_profile_values(&profile)?;
     let c = db(&app)?;
     game(&c, game_id)?;
-    let capabilities = capabilities_for_build(&build_for_game(&c, game_id)?)?;
+    let selected_build = build_for_game(&c, game_id)?;
+    let capabilities = capabilities_for_build(&selected_build, &repo(&c, selected_build.repo_id)?)?;
     validate_extra_profile_options(&profile.options, &capabilities)?;
     for (flag, value) in &mut profile.options {
         if [
@@ -10334,15 +10708,51 @@ fn set_profile(app: tauri::AppHandle, game_id: i64, mut profile: Profile) -> Res
             *value = canonicalize_option_path(flag, value)?;
         }
     }
-    if profile.screen_width.is_some() && !capabilities.screen_width
-        || profile.screen_height.is_some() && !capabilities.screen_height
-        || profile.present_mode.is_some() && !capabilities.present_mode
-        || profile.perf_overlay && !capabilities.perf_overlay
-        || profile.fullscreen && !capabilities.fullscreen
-        || profile.controller_color.is_some() && !capabilities.controller_color
-        || profile.controller_volume.is_some() && !capabilities.controller_volume
-        || profile.controller_vibration.is_some() && !capabilities.controller_vibration
-        || profile.keyboard_player.is_some() && !capabilities.keyboard_player
+    if profile.screen_width.is_some()
+        && !capabilities
+            .verified_options
+            .iter()
+            .any(|f| f == "--screen-width")
+        || profile.screen_height.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--screen-height")
+        || profile.present_mode.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--present-mode")
+        || profile.perf_overlay
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--perf-overlay")
+        || profile.fullscreen
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--fullscreen")
+        || profile.controller_color.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--controller-color")
+        || profile.controller_volume.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--controller-volume")
+        || profile.controller_vibration.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--controller-vibration")
+        || profile.keyboard_player.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--keyboard-player")
     {
         return Err(
             "This emulator build does not support one or more selected profile options".into(),
@@ -10591,15 +11001,18 @@ fn launch_game_impl(
     };
     let b = build(&c, build_id)?;
     let selected_repo = repo(&c, b.repo_id)?;
-    let enable_shader_precompile = is_jetsku_precompile_fork(&selected_repo)
+    let supports_background_precompile = source_proves_background_precompile(&b, &selected_repo);
+    let enable_shader_precompile = supports_background_precompile
         && get_game_shader_precompile_enabled(&c, game_id, build_id)?;
-    let capabilities = capabilities_for_build(&b)?;
+    let capabilities = capabilities_for_build(&b, &selected_repo)?;
     let settings_build_id = settings_build_id.unwrap_or(build_id);
     let settings_defaults = build_profile_options(&c, settings_build_id)?;
     let mut effective_options = if settings_build_id == build_id {
         effective_profile_options(&settings_defaults, &game_profile.options, &capabilities)?
     } else {
-        let settings_capabilities = capabilities_for_build(&build(&c, settings_build_id)?)?;
+        let settings_build = build(&c, settings_build_id)?;
+        let settings_repo = repo(&c, settings_build.repo_id)?;
+        let settings_capabilities = capabilities_for_build(&settings_build, &settings_repo)?;
         let shared = effective_profile_options(
             &settings_defaults,
             &game_profile.options,
@@ -10607,7 +11020,7 @@ fn launch_game_impl(
         )?;
         if let Some(unsupported) = shared.keys().find(|flag| {
             !capabilities
-                .options
+                .verified_options
                 .iter()
                 .any(|supported| supported == *flag)
         }) {
@@ -10618,6 +11031,15 @@ fn launch_game_impl(
         validate_extra_profile_options(&shared, &capabilities)?;
         shared
     };
+    if effective_options
+        .get("--gpu")
+        .is_some_and(|value| value.parse::<i32>().is_ok_and(|index| index >= 0))
+    {
+        validate_gpu_hardware_selection(
+            &effective_options,
+            &graphics_diagnostics().vulkan_details,
+        )?;
+    }
     for (flag, value) in &mut effective_options {
         if [
             "--game-patch",
@@ -10641,7 +11063,7 @@ fn launch_game_impl(
             let patch_bytes = fs::read(&installed_patch).map_err(|error| error.to_string())?;
             validate_game_patch_document(&g, &patch_bytes)?;
             if !capabilities
-                .options
+                .verified_options
                 .iter()
                 .any(|option| option == "--game-patch")
             {
@@ -10656,15 +11078,51 @@ fn launch_game_impl(
             );
         }
     }
-    if game_profile.screen_width.is_some() && !capabilities.screen_width
-        || game_profile.screen_height.is_some() && !capabilities.screen_height
-        || game_profile.present_mode.is_some() && !capabilities.present_mode
-        || game_profile.perf_overlay && !capabilities.perf_overlay
-        || game_profile.fullscreen && !capabilities.fullscreen
-        || game_profile.controller_color.is_some() && !capabilities.controller_color
-        || game_profile.controller_volume.is_some() && !capabilities.controller_volume
-        || game_profile.controller_vibration.is_some() && !capabilities.controller_vibration
-        || game_profile.keyboard_player.is_some() && !capabilities.keyboard_player
+    if game_profile.screen_width.is_some()
+        && !capabilities
+            .verified_options
+            .iter()
+            .any(|f| f == "--screen-width")
+        || game_profile.screen_height.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--screen-height")
+        || game_profile.present_mode.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--present-mode")
+        || game_profile.perf_overlay
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--perf-overlay")
+        || game_profile.fullscreen
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--fullscreen")
+        || game_profile.controller_color.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--controller-color")
+        || game_profile.controller_volume.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--controller-volume")
+        || game_profile.controller_vibration.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--controller-vibration")
+        || game_profile.keyboard_player.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--keyboard-player")
     {
         return Err("The selected emulator build no longer supports this game's saved profile. Clear unsupported profile options before launching.".into());
     }
@@ -10697,7 +11155,7 @@ fn launch_game_impl(
     )?;
     let mut command = Command::new(&exe);
     command.arg("--game").arg(&game_path);
-    if is_jetsku_precompile_fork(&selected_repo) {
+    if supports_background_precompile {
         command.env(
             "KYTY_SHADER_PRECOMPILE",
             if enable_shader_precompile { "1" } else { "0" },
@@ -10878,6 +11336,8 @@ fn launch_game_impl(
                 let _ = tx.commit();
             }
         }
+        save_data::auto_backup_after_session(&app, game_id);
+        trophies::auto_backup_after_session(&app, game_id);
         emit(
             &app,
             "game",
@@ -11829,10 +12289,6 @@ fn valid_shader_precompile_setting_key(key: &str) -> bool {
 fn shader_precompile_setting_key(build_id: i64) -> String {
     format!("shader_precompile_enabled:{build_id}")
 }
-fn is_jetsku_precompile_fork(repository: &Repo) -> bool {
-    repository.owner.eq_ignore_ascii_case("Jetsku")
-        && repository.name.eq_ignore_ascii_case("KytyPS5")
-}
 fn get_build_shader_precompile_enabled(conn: &Connection, build_id: i64) -> Result<bool, String> {
     conn.query_row(
         "SELECT value FROM settings WHERE key=?",
@@ -12027,13 +12483,47 @@ pub fn run() {
             read_build_log,
             get_setting,
             set_setting,
-            desktop_notification
+            desktop_notification,
+            save_data::list_saves,
+            save_data::backup_save,
+            save_data::backup_save_with_trophies,
+            save_data::list_save_backups,
+            save_data::set_save_backup_directory,
+            save_data::clean_save_backups,
+            save_data::restore_save,
+            save_data::import_save_directory,
+            save_data::import_save_archive,
+            save_data::export_save_archive,
+            save_data::delete_save,
+            save_data::open_save_folder,
+            trophies::list_trophy_progress,
+            trophies::backup_trophy_progress,
+            trophies::export_trophy_progress,
+            trophies::import_trophy_progress,
+            trophies::open_trophy_folder,
+            trophies::list_trophy_backups,
+            trophies::restore_trophy_backup
         ])
         .run(tauri::generate_context!())
         .expect("Tauri error");
 }
 #[cfg(test)]
 mod tests {
+    fn verified_profile_capabilities(help: &str) -> ProfileCapabilities {
+        let mut capabilities = profile_capabilities(help);
+        capabilities.verified_options = capabilities.options.clone();
+        for flag in &capabilities.verified_options {
+            capabilities.option_states.insert(
+                flag.clone(),
+                CapabilityStatus {
+                    state: CapabilityState::VerifiedSupported,
+                    explanation: "test source proof".into(),
+                },
+            );
+        }
+        capabilities
+    }
+
     #[test]
     fn shader_precompile_progress_counts_completed_pipeline_shards_and_live_workers() {
         let root = std::env::temp_dir().join(format!(
@@ -13752,7 +14242,7 @@ mod tests {
     }
     #[test]
     fn gpu_and_vblank_values_match_upstream_ranges() {
-        let capabilities = profile_capabilities(
+        let capabilities = verified_profile_capabilities(
             "--gpu <index> Vulkan device\n--vblank-frequency <num> Virtual frequency",
         );
         for (flag, value) in [
@@ -13778,6 +14268,56 @@ mod tests {
             )
             .is_err());
         }
+    }
+    #[test]
+    fn explicit_gpu_selection_must_exist_in_vulkan_diagnostics() {
+        let automatic = BTreeMap::from([("--gpu".into(), "-1".into())]);
+        let explicit = BTreeMap::from([("--gpu".into(), "1".into())]);
+        assert!(validate_gpu_hardware_selection(&automatic, "").is_ok());
+        assert!(validate_gpu_hardware_selection(
+            &explicit,
+            "GPU0:\n  deviceName = GPU A\nGPU 1:\n"
+        )
+        .is_ok());
+        assert!(
+            validate_gpu_hardware_selection(&explicit, "GPU0:\n  deviceName = GPU A\n").is_err()
+        );
+    }
+    #[test]
+    fn help_advertisement_alone_does_not_authorize_an_option() {
+        let capabilities = profile_capabilities("--future-switch Toggle future behavior\n");
+        assert!(capabilities
+            .options
+            .iter()
+            .any(|flag| flag == "--future-switch"));
+        assert!(capabilities.verified_options.is_empty());
+        assert!(matches!(
+            capabilities.option_states["--future-switch"].state,
+            CapabilityState::AdvertisedUnverified
+        ));
+        assert!(validate_extra_profile_options(
+            &BTreeMap::from([("--future-switch".into(), "true".into())]),
+            &capabilities
+        )
+        .is_err());
+    }
+    #[test]
+    fn trophy_duration_is_hidden_by_the_correct_disable_switch_and_rejected_if_combined() {
+        let capabilities = verified_profile_capabilities(
+            "--no-trophy-notifications Disable trophy notifications\n--trophy-duration <seconds> Notification duration\n",
+        );
+        assert!(capabilities
+            .switch_options
+            .contains(&"--no-trophy-notifications".into()));
+        let invalid = BTreeMap::from([
+            ("--no-trophy-notifications".into(), "true".into()),
+            ("--trophy-duration".into(), "7".into()),
+        ]);
+        assert!(validate_extra_profile_options(&invalid, &capabilities).is_err());
+        assert_eq!(
+            effective_profile_options(&invalid, &BTreeMap::new(), &capabilities).unwrap(),
+            BTreeMap::from([("--no-trophy-notifications".into(), "true".into())])
+        );
     }
     #[test]
     fn profile_capabilities_are_derived_from_emulator_help() {
@@ -13849,7 +14389,7 @@ mod tests {
             "--sync-raw-image-buffers",
             "--tessellation",
             "--trophy-duration",
-            "--trophy-notifications",
+            "--no-trophy-notifications",
             "--user-id",
             "--user-name",
             "--vblank-frequency",
@@ -13900,7 +14440,7 @@ mod tests {
     }
     #[test]
     fn dynamic_profile_options_require_advertised_support_and_valid_values() {
-        let capabilities = profile_capabilities("  --hdr Enable HDR\n  --gpu-assisted-validation <bool> GPU validation\n  --vulkan-validation <bool> Vulkan validation\n  --console-language <0-29> language\n  --keymap <mapping> mapping\n");
+        let capabilities = verified_profile_capabilities("  --hdr Enable HDR\n  --gpu-assisted-validation <bool> GPU validation\n  --vulkan-validation <bool> Vulkan validation\n  --console-language <0-29> language\n  --keymap <mapping> mapping\n");
         let mut options = BTreeMap::from([
             ("--hdr".into(), "true".into()),
             ("--console-language".into(), "3".into()),
@@ -13919,7 +14459,7 @@ mod tests {
     }
     #[test]
     fn future_fork_options_are_derived_from_help_and_reserved_modes_stay_hidden() {
-        let capabilities = profile_capabilities(
+        let capabilities = verified_profile_capabilities(
             "--future-mode <value> Future value\n--future-switch Enable future behavior\n--game <path> Game input\n--guest-exec <path> Guest execution mode\n--help Print help\n",
         );
         assert_eq!(
@@ -13942,7 +14482,8 @@ mod tests {
     }
     #[test]
     fn per_game_options_override_global_defaults_and_global_unsupported_values_are_skipped() {
-        let capabilities = profile_capabilities("--screen-width <num> Width\n--hdr Enable HDR\n");
+        let capabilities =
+            verified_profile_capabilities("--screen-width <num> Width\n--hdr Enable HDR\n");
         let global = BTreeMap::from([
             ("--screen-width".into(), "1600".into()),
             ("--old-fork-option".into(), "legacy".into()),

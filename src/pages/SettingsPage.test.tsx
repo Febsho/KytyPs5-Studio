@@ -21,6 +21,7 @@ const capabilities: ProfileCapabilities = {
   controller_vibration: true,
   keyboard_player: true,
   options: ["--screen-width", "--user-name"],
+  verified_options: ["--screen-width"],
 };
 
 function props(overrides: Partial<SettingsPageProps> = {}): SettingsPageProps {
@@ -140,7 +141,7 @@ describe("SettingsPage", () => {
     });
   });
 
-  it("shows the real KytyPS5 pipeline cache without inventing a precompile switch", () => {
+  it("does not infer background precompile from the repository name", () => {
     render(
       <SettingsPage
         {...props({
@@ -185,9 +186,8 @@ describe("SettingsPage", () => {
       />,
     );
 
-    expect(screen.getByRole("note").textContent).toMatch(/Shader precompilation/);
-    expect(screen.getByText(/first launch still compiles shaders as needed/)).toBeTruthy();
-    expect(screen.getByText(/No complete precompile-before-launch option is available/)).toBeTruthy();
+    expect(screen.queryByText(/Background shader precompile/)).toBeNull();
+    expect(screen.queryByText(/Source verified/)).toBeNull();
     expect(screen.queryByRole("checkbox", { name: /precompilation/i })).toBeNull();
   });
 

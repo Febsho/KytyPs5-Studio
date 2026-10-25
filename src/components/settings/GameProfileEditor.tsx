@@ -56,7 +56,7 @@ export function GameProfileEditor({
           <h3>Game profile</h3>
           <p>Override the emulator defaults for this game. Clear a field to inherit the selected build’s global value.</p>
         </div>
-        {capabilities && <span>{capabilities.options.length} supported options</span>}
+        {capabilities && <span>{capabilities.verified_options?.length ?? 0} source-verified options</span>}
       </div>
       <ProfileActions
         games={games}
@@ -70,7 +70,7 @@ export function GameProfileEditor({
         onRestore={onRestore}
       />
       <ProfileOptionFields
-        available={capabilities?.options || []}
+        available={capabilities?.verified_options || []}
         optionMetadata={capabilities?.option_metadata}
         options={profile.options}
         inheritedOptions={globalOptions}
@@ -80,11 +80,12 @@ export function GameProfileEditor({
           setProfile((current) => profileWithOptions(current, options))
         }
         gpuDevices={gpuDevices}
+        showUnavailable={false}
       />
-      {capabilities?.options.length === 0 && (
+      {(capabilities?.verified_options?.length ?? 0) === 0 && (
         <div className="settings-empty-options">
-          <strong>No launch settings reported</strong>
-          <span>This emulator build does not advertise configurable options for this game.</span>
+          <strong>No source-verified launch settings</strong>
+          <span>Help-advertised settings stay disabled until Studio can match a clean source checkout to this build’s exact commit.</span>
         </div>
       )}
       {unsupported && (
@@ -93,8 +94,8 @@ export function GameProfileEditor({
         </button>
       )}
       <p className="hint">
-        Only options reported by this selected emulator build are enabled. Empty
-        values inherit global defaults or KytyPS5 defaults.
+        Only options verified against this selected build’s binary and matching
+        clean source revision are editable. Empty values inherit this build’s defaults.
       </p>
       <div className="buttonrow">
         <button

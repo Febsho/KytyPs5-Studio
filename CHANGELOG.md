@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.0.0
+
+### Build-specific emulator settings
+
+- Verify configurable CLI options against the exact clean source revision for each installed binary; show advertised but unverified flags separately and keep them out of launch arguments.
+- Key capability results to the executable SHA-256, source revision, and host OS, and display those identifiers with the selected build.
+- Keep defaults per emulator build, expose unavailable settings with explanations, and validate option values in both the editor and Rust command path.
+- Filter stale inherited settings before launch, Steam shortcut generation, and A/B comparison; preserve each game's saved options for compatible builds.
+- Verify background shader precompile support from source usage instead of guessing from a repository name, and identify full offline precompile only when its required assets are present.
+- Use the upstream `--no-trophy-notifications` switch and enforce its duration dependency.
+
+### Release
+
+- Mark the first stable Studio release as 1.0.0. This release includes the Save Data Manager, local trophy preservation, compatibility details, and game patch management added in 0.10.0.
+
+## 0.10.0
+
+### Trophy preservation
+
+- Read local earned-state JSON separately by installed build, user, and service label; malformed or missing progress remains explicitly unavailable.
+- Add verified local trophy backups, restore, raw JSON import/export, and folder access; back up trophy files before build removal and after opted-in session backups.
+- Add optional combined Save + Trophies backups with per-file hashes and explicit manifest inclusions; restore is restricted to the same title, build, and numeric user and preserves service labels separately.
+- Document that trophy package definitions are distinct from local progress and that no PlayStation Network sync is provided.
+
+### Save Data Manager
+
+- Detect verified standard, guest-user, and memory save slots across installed builds.
+- Add safe folder and ZIP import, ZIP export, checksummed backups, restore history, and confirmed deletion.
+- Add session lockout, optional automatic session backups, configurable backup storage, and explicit retention cleanup that protects the latest verified restore point per slot.
+- Document supported layouts and physical console save limitations.
+
 ## 0.9.3
 
 ### Game patches

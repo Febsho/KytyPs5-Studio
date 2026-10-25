@@ -22,7 +22,7 @@ describe('ProfileOptionFields', () => {
       '--command-buffer-dump-folder', '--graphics-debug-dump',
       '--printf-direction', '--printf-output-file', '--profile',
       '--spirv-debug-printf', '--readback-linear-images',
-      '--sync-raw-image-buffers', '--trophy-notifications', '--trophy-duration',
+      '--sync-raw-image-buffers', '--no-trophy-notifications', '--trophy-duration',
       '--perf-overlay', '--playgo-hack', '--skip-notice-screen', '--keymap', '--rd',
     ];
     expect(Object.keys(cliOptionInfo).sort()).toEqual(upstreamLinuxOptions.sort());
@@ -56,6 +56,12 @@ describe('ProfileOptionFields', () => {
     render(<ProfileOptionFields available={['--hdr']} options={{ '--hdr': 'true' }} onChange={onChange} />);
     fireEvent.click(screen.getByRole('button', { name: 'Reset to emulator default' }));
     expect(onChange).toHaveBeenCalledWith({});
+  });
+
+  it('shows inline validation when a value is outside the supported range', () => {
+    render(<ProfileOptionFields available={['--trophy-duration']} options={{}} onChange={vi.fn()} />);
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Trophy notification duration (5–10 sec)' }), { target: { value: '4' } });
+    expect(screen.getByRole('alert').textContent).toMatch(/5 to 10 seconds/);
   });
 
   it('previews repeated keymap entries as separate CLI arguments', () => {
@@ -151,7 +157,7 @@ describe('ProfileOptionFields', () => {
     expect(screen.getByText('Controls')).toBeTruthy();
   });
 
-  it('constrains GPU auto-selection and VBlank input to KytyPS5 supported values', () => {
+  it('requires a reported Vulkan device for selection and constrains VBlank', () => {
     const { container } = render(
       <ProfileOptionFields
         available={['--gpu', '--vblank-frequency']}
@@ -159,13 +165,12 @@ describe('ProfileOptionFields', () => {
         onChange={vi.fn()}
       />,
     );
-    const inputs = container.querySelectorAll<HTMLInputElement>(
-      'input[type="number"]',
-    );
-    expect(inputs[0].min).toBe('-1');
-    expect(inputs[1].min).toBe('30');
-    expect(inputs[1].max).toBe('360');
-    expect(screen.getByText(/KytyPS5 accepts 30–360 Hz/)).toBeTruthy();
+    const inputs = container.querySelectorAll<HTMLInputElement>('input[type="number"]');
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0].min).toBe('30');
+    expect(inputs[0].max).toBe('360');
+    expect((screen.getByRole('combobox', { name: 'Vulkan GPU' }) as HTMLSelectElement).disabled).toBe(true);
+    expect(screen.getByText(/No Vulkan physical device was reported/)).toBeTruthy();
   });
 
   it('shows automatic GPU selection and keeps an undetected saved index visible', () => {

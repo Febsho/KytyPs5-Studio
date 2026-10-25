@@ -5097,6 +5097,19 @@ textarea:focus {
 .library-title-row h2 { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; }
 .home-game-meta .home-official-compatibility { padding: 3px 8px; font-family: inherit; font-size: var(--studio-font-xs); letter-spacing: 0; }
 .home-game-meta .home-official-compatibility::before { content: none; }
+.save-data-panel { display: grid; gap: 14px; }
+.save-data-entry { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; padding: 14px 0; border-top: 1px solid var(--studio-border, #303640); }
+.save-data-entry > div:first-child { min-width: 0; }
+.save-data-entry p, .save-data-entry small { display: block; overflow-wrap: anywhere; color: var(--studio-muted, #aeb6c0); margin: 5px 0; }
+.save-data-entry .buttonrow { flex-shrink: 0; }
+.save-data-settings { display: grid; gap: 10px; padding: 12px; border: 1px solid #303640; border-radius: 8px; }
+.save-progress { display: grid; gap: 7px; padding: 10px 12px; border-radius: 7px; background: #11151a; }
+.save-progress-heading { display: flex; justify-content: space-between; gap: 10px; text-transform: capitalize; }
+.save-data-settings input[type="number"] { width: 76px; }
+.save-data-settings .path { max-width: 100%; overflow-wrap: anywhere; }
+.save-point-name { display: flex; align-items: center; gap: 8px; }
+.save-point-name input { min-width: 220px; }
+@media (max-width: 760px) { .save-data-entry { flex-direction: column; } .save-data-entry .buttonrow { flex-wrap: wrap; } }
 @media (max-width: 600px) {
   .official-platform-results { grid-template-columns: 1fr; }
   .official-compatibility-heading { align-items: flex-start; }

@@ -40,21 +40,63 @@ pub(super) fn add_game_to_steam(
         });
     let game_profile = profile(&c, game_id)?;
     let b = build(&c, build_id)?;
-    let capabilities = capabilities_for_build(&b)?;
+    let capabilities = capabilities_for_build(&b, &repo(&c, b.repo_id)?)?;
     let mut options = effective_profile_options(
-        &global_profile_options(&c)?,
+        &build_profile_options(&c, b.id)?,
         &game_profile.options,
         &capabilities,
     )?;
-    if game_profile.screen_width.is_some() && !capabilities.screen_width
-        || game_profile.screen_height.is_some() && !capabilities.screen_height
-        || game_profile.present_mode.is_some() && !capabilities.present_mode
-        || game_profile.perf_overlay && !capabilities.perf_overlay
-        || game_profile.fullscreen && !capabilities.fullscreen
-        || game_profile.controller_color.is_some() && !capabilities.controller_color
-        || game_profile.controller_volume.is_some() && !capabilities.controller_volume
-        || game_profile.controller_vibration.is_some() && !capabilities.controller_vibration
-        || game_profile.keyboard_player.is_some() && !capabilities.keyboard_player
+    if options
+        .get("--gpu")
+        .is_some_and(|value| value.parse::<i32>().is_ok_and(|index| index >= 0))
+    {
+        validate_gpu_hardware_selection(&options, &graphics_diagnostics().vulkan_details)?;
+    }
+    if game_profile.screen_width.is_some()
+        && !capabilities
+            .verified_options
+            .iter()
+            .any(|f| f == "--screen-width")
+        || game_profile.screen_height.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--screen-height")
+        || game_profile.present_mode.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--present-mode")
+        || game_profile.perf_overlay
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--perf-overlay")
+        || game_profile.fullscreen
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--fullscreen")
+        || game_profile.controller_color.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--controller-color")
+        || game_profile.controller_volume.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--controller-volume")
+        || game_profile.controller_vibration.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--controller-vibration")
+        || game_profile.keyboard_player.is_some()
+            && !capabilities
+                .verified_options
+                .iter()
+                .any(|f| f == "--keyboard-player")
     {
         return Err("The selected emulator build no longer supports this game's saved profile. Clear unsupported profile options before adding it to Steam.".into());
     }

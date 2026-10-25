@@ -43,7 +43,7 @@ export type HomePageProps = {
   launchGame: (gameId: number) => Promise<void>;
   selectGameWithGuard: (gameId: number, afterSelect?: () => void) => boolean | void;
   setGameDetailsTab: Dispatch<
-    SetStateAction<"Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Patches">
+    SetStateAction<"Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Patches" | "Save Data">
   >;
   setHomeSelection: Dispatch<SetStateAction<number | null>>;
   inspectGameContent?: (gameId:number) => Promise<GameContent>;

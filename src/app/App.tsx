@@ -186,7 +186,7 @@ export function App() {
     readUiId("game"),
   );
   const [gameDetailsTab, setGameDetailsTab] = useState<
-    "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Patches"
+    "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Patches" | "Save Data"
   >("Overview");
   const [homeSelection, setHomeSelection] = useState<number | null>(() =>
     readUiId("home_game"),
@@ -1398,7 +1398,7 @@ export function App() {
   const globalUnsupported =
     !!globalProfileCapabilities &&
     Object.keys(globalProfileOptions).some(
-      (flag) => !globalProfileCapabilities.options.includes(flag),
+      (flag) => !(globalProfileCapabilities.verified_options ?? []).includes(flag),
     );
   const profileDirty =
     !profileLoading &&
@@ -1436,7 +1436,7 @@ export function App() {
       (profile.keyboard_player !== null &&
         !profileCapabilities.keyboard_player) ||
       Object.keys(profile.options).some(
-        (flag) => !profileCapabilities.options.includes(flag),
+        (flag) => !(profileCapabilities.verified_options ?? []).includes(flag),
       ));
   useEffect(() => {
     setGameCompatibility(null);
@@ -1834,7 +1834,7 @@ export function App() {
             current,
             Object.fromEntries(
               Object.entries(current.options).filter(([flag]) =>
-                profileCapabilities?.options.includes(flag),
+                profileCapabilities?.verified_options?.includes(flag),
               ),
             ),
           ),

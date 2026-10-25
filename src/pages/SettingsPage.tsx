@@ -88,18 +88,21 @@ export function SettingsPage({
     ? repos.find((repo) => repo.id === selectedBuild.repo_id)
     : null;
   const reportedOptions = globalProfileCapabilities?.options ?? [];
-  const primaryOptions = reportedOptions.filter((flag) =>
+  const verifiedOptions = globalProfileCapabilities?.verified_options ?? [];
+  const primaryOptions = verifiedOptions.filter((flag) =>
     primaryEmulatorFlags.includes(flag),
   );
-  const additionalOptions = reportedOptions.filter(
+  const additionalOptions = verifiedOptions.filter(
     (flag) => !primaryEmulatorFlags.includes(flag),
   );
-  const isOfficialKytyPs5 =
-    selectedRepo?.owner.toLowerCase() === "kytyps5" &&
-    selectedRepo.name.toLowerCase() === "kytyps5";
-  const supportsBackgroundShaderPrecompile =
-    selectedRepo?.owner.toLowerCase() === "jetsku" &&
-    selectedRepo.name.toLowerCase() === "kytyps5";
+  const advertisedUnverified = reportedOptions.filter((flag) =>
+    !verifiedOptions.includes(flag) &&
+    globalProfileCapabilities?.option_states?.[flag]?.state !== "unavailable",
+  );
+  const unavailableOptions = Object.entries(globalProfileCapabilities?.option_states ?? {})
+    .filter(([, status]) => status.state === "unavailable" || status.state === "unsupported")
+    .map(([flag, status]) => ({ flag, explanation: status.explanation }));
+  const supportsBackgroundShaderPrecompile = globalProfileCapabilities?.background_precompile === true;
   const shaderPrecompileOption = reportedOptions.find((flag) =>
     /(?:shader.*pre.?comp|pre.?comp.*shader)/i.test(flag),
   );
@@ -197,12 +200,12 @@ export function SettingsPage({
         <div>
           <span className="eyebrow">STUDIO PREFERENCES</span>
           <h2>Settings</h2>
-          <p>Configure emulator behavior, manage local files, and control Studio integrations.</p>
+          <p>Set defaults for a selected emulator build, then manage Studio-wide storage and integrations.</p>
         </div>
         <span className="settings-version">v{installedVersion}</span>
       </header>
       <nav className="settings-nav" aria-label="Settings sections">
-        <a href="#settings-emulator"><Gamepad2 size={16} /> Emulator</a>
+        <a href="#settings-emulator"><Gamepad2 size={16} /> Selected build</a>
         <a href="#settings-github"><Github size={16} /> GitHub</a>
         <a href="#settings-emulator-updates"><RefreshCw size={16} /> Emulator updates</a>
         <a href="#settings-storage"><Database size={16} /> Storage</a>
@@ -213,8 +216,8 @@ export function SettingsPage({
       <div id="settings-emulator" className="panel settings-emulator-panel settings-section">
         <div className="settings-emulator-heading">
           <div>
-            <h3>Emulator settings</h3>
-            <p>Choose an installed build. Defaults apply to games assigned to that build.</p>
+            <h3>Selected build defaults</h3>
+            <p>Choose a build to see source-verified options. These defaults apply to games assigned to that build.</p>
           </div>
           <label>
             Emulator
@@ -246,44 +249,29 @@ export function SettingsPage({
           <div className="settings-emulator-summary">
             <strong>{emulatorBuildName(selectedRepo, selectedBuild)}</strong>
             <span>
-              {selectedBuild.build_type} build
+              {selectedBuild.build_type} build · {globalProfileCapabilities?.host_os ?? hostOS} host
               {selectedBuild.active ? " · currently active" : ""}
             </span>
+            <small>Commit {selectedBuild.commit_sha}</small>
+            {globalProfileCapabilities?.binary_sha256 && <small>Executable SHA-256 {globalProfileCapabilities.binary_sha256}</small>}
           </div>
         )}
-        {selectedBuild && isOfficialKytyPs5 && (
+        {selectedBuild && shaderPrecompileOption && !supportsBackgroundShaderPrecompile && (
           <aside className="settings-shader-cache" role="note">
-            <div className="settings-shader-cache-heading">
-              <strong>Shader precompilation</strong>
-              <span>{shaderPrecompileOption ?? "No precompile option reported"}</span>
-            </div>
-            {selectedBuild.build_type.toLowerCase() === "release" ? (
-              <p>
-                No complete precompile-before-launch option is available in this
-                build. KytyPS5 Release builds do save Vulkan pipeline-cache data
-                as the game uses shaders and can reuse it on later launches,
-                but the first launch still compiles shaders as needed.
-              </p>
-            ) : (
-              <p>
-                KytyPS5 disables its persistent Vulkan pipeline cache in Debug
-                builds, and does not provide a setting for full shader
-                precompilation before launch.
-              </p>
-            )}
+            <strong>Shader precompile is not source-verified for this build</strong>
+            <p>{globalProfileCapabilities?.option_metadata?.[shaderPrecompileOption]?.state_explanation || "A command-line mention does not prove precompile behavior."} Full offline precompile is enabled only when a usable script and tool are present.</p>
           </aside>
         )}
         {selectedBuild && supportsBackgroundShaderPrecompile && (
           <aside className="settings-shader-cache" role="group" aria-label="Shader precompilation">
             <div className="settings-shader-cache-heading">
               <strong>Background shader precompile</strong>
-              <span>Jetsku fork</span>
+              <span>Source verified</span>
             </div>
             <p>
               Records shaders seen during play and translates them in the background on later starts.
-              This also enables the fork’s fast-first pipeline mode. The first run still discovers
+              This build’s source also enables fast-first pipeline mode. The first run still discovers
               shaders; this does not precompile every game area.
-              {hostOS === "linux" && " Linux support depends on the selected build and has not been verified here."}
             </p>
             <label className="settings-shader-precompile-toggle">
               <input
@@ -306,8 +294,8 @@ export function SettingsPage({
         )}
         {selectedBuild && globalProfileCapabilities && (
           <div className="settings-build-caption">
-            <span>{globalProfileCapabilities.options.length} CLI options reported by this build</span>
-            <span>Only reported options are available below</span>
+            <span>{verifiedOptions.length} source-verified settings</span>
+            <span>{reportedOptions.length} CLI options advertised</span>
           </div>
         )}
         {globalUnsupported && (
@@ -320,7 +308,7 @@ export function SettingsPage({
                 setGlobalProfileOptions(
                   Object.fromEntries(
                     Object.entries(globalProfileOptions).filter(([flag]) =>
-                      globalProfileCapabilities!.options.includes(flag),
+                      verifiedOptions.includes(flag),
                     ),
                   ),
                 )
@@ -347,8 +335,7 @@ export function SettingsPage({
         )}
         {globalProfileCapabilities && additionalOptions.length > 0 && (
           <details className="settings-additional-options">
-            <summary>More options reported by this build ({additionalOptions.length})</summary>
-            <p className="hint">These options come from the selected emulator’s command-line help.</p>
+            <summary>More source-verified options ({additionalOptions.length})</summary>
             <ProfileOptionFields
               available={additionalOptions}
               optionMetadata={globalProfileCapabilities.option_metadata}
@@ -361,12 +348,14 @@ export function SettingsPage({
             />
           </details>
         )}
-        {globalProfileCapabilities && reportedOptions.length === 0 && (
+        {globalProfileCapabilities && verifiedOptions.length === 0 && (
           <div className="settings-empty-options">
-            <strong>No configurable options reported</strong>
-            <span>This build does not advertise any settings Studio can edit.</span>
+            <strong>No source-verified options are available</strong>
+            <span>Match this build’s exact commit to a clean source checkout. Unverified flags are not sent to the emulator.</span>
           </div>
         )}
+        {advertisedUnverified.length > 0 && <details className="settings-additional-options"><summary>Advertised, not verified ({advertisedUnverified.length})</summary><p className="hint">Help output alone does not prove implementation. These options remain disabled and are filtered from launches.</p><ul>{advertisedUnverified.map(flag=><li key={flag}><strong>{flag}</strong> — {globalProfileCapabilities?.option_states?.[flag]?.explanation}</li>)}</ul></details>}
+        {unavailableOptions.length > 0 && <details className="settings-additional-options"><summary>Unavailable or not advertised ({unavailableOptions.length})</summary><p className="hint">These options are disabled because the build does not advertise them or this host lacks a verified requirement.</p><ul>{unavailableOptions.map(({flag, explanation})=><li key={flag}><strong>{flag}</strong> — {explanation}</li>)}</ul></details>}
         <div className="settings-save-row">
           <span>{selectedBuild ? "Changes apply to games assigned to this build." : "Select an installed build to edit its settings."}</span>
           <button
@@ -381,7 +370,7 @@ export function SettingsPage({
       </div>
       <div className="sectionhead">
         <div>
-          <h3>Settings & storage</h3>
+          <h3>Studio-wide settings & storage</h3>
           <p>{storageDescription}</p>
         </div>
         <Settings />

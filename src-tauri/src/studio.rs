@@ -13225,8 +13225,7 @@ mod tests {
         assert_eq!(steam_next_entry_index(root_end, max_index).unwrap(), 0);
         assert_eq!(&shortcuts[root_end..], b"\x08\x08");
 
-        let mut entry = vec![0];
-        entry.extend_from_slice(b"0\0");
+        let mut entry = b"0\0".to_vec();
         steam_vdf_string(&mut entry, "AppName", "Studio test").unwrap();
         entry.push(8);
         shortcuts.splice(root_end..root_end, entry);
@@ -13239,7 +13238,6 @@ mod tests {
     #[test]
     fn steam_shortcut_index_overflow_is_reported_without_reusing_an_entry() {
         let mut shortcuts = b"\0shortcuts\0\0".to_vec();
-        shortcuts.push(0);
         shortcuts.extend_from_slice(b"4294967295\0");
         shortcuts.extend_from_slice(b"\x08\x08\x08");
         let (root_end, max_index) = steam_root_end(&shortcuts).unwrap();
@@ -13254,8 +13252,7 @@ mod tests {
         let mut shortcuts = b"\0shortcuts\0\0\x08\x08".to_vec();
         let (root_end, _) = steam_root_end(&shortcuts).unwrap();
         let make_entry = |exe: &str, options: &str| {
-            let mut entry = vec![0];
-            entry.extend_from_slice(b"0\0");
+            let mut entry = b"0\0".to_vec();
             steam_vdf_string(&mut entry, "AppName", "Game · KytyPS5 Studio").unwrap();
             steam_vdf_string(&mut entry, "Exe", exe).unwrap();
             steam_vdf_string(&mut entry, "LaunchOptions", options).unwrap();

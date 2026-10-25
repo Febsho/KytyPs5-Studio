@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.3
+
+### Steam shortcuts
+
+- Fix adding games to Steam by parsing the shortcut entry format Steam writes to `shortcuts.vdf`, preserving existing shortcuts while adding or updating a game.
+
 ## 1.4.2
 
 ### Home screen

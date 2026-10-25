@@ -98,14 +98,24 @@ pub(super) fn steam_root_end(bytes: &[u8]) -> Result<(usize, u32), String> {
         if kind == 8 {
             return Ok((pos, max_index.unwrap_or(0)));
         }
-        pos += 1;
-        let (key, value_pos) = steam_vdf_key(bytes, pos)?;
-        if kind == 0 {
-            if let Ok(index) = key.parse::<u32>() {
-                max_index = Some(max_index.map_or(index, |previous: u32| previous.max(index)));
-            }
+        // Steam writes shortcut entries as an index key followed directly by
+        // the entry fields (without the usual object type byte).
+        let (key, mut cursor) = steam_vdf_key(bytes, pos)?;
+        if let Ok(index) = key.parse::<u32>() {
+            max_index = Some(max_index.map_or(index, |previous: u32| previous.max(index)));
         }
-        pos = steam_vdf_skip(bytes, kind, value_pos)?;
+        loop {
+            let field_kind = *bytes
+                .get(cursor)
+                .ok_or("Steam shortcut entry is incomplete")?;
+            cursor += 1;
+            if field_kind == 8 {
+                pos = cursor;
+                break;
+            }
+            let (_, value_pos) = steam_vdf_key(bytes, cursor)?;
+            cursor = steam_vdf_skip(bytes, field_kind, value_pos)?;
+        }
     }
 }
 
@@ -148,12 +158,7 @@ pub(super) fn steam_upsert_shortcut(
     let mut inserted = false;
     while pos < root_end {
         let start = pos;
-        let kind = bytes[pos];
-        pos += 1;
-        let (_, value_pos) = steam_vdf_key(bytes, pos)?;
-        if kind != 0 {
-            return Err("Steam shortcuts file has a non-object entry in its root".into());
-        }
+        let (key, value_pos) = steam_vdf_key(bytes, pos)?;
         let mut cursor = value_pos;
         let mut found_name = None;
         loop {
@@ -174,13 +179,10 @@ pub(super) fn steam_upsert_shortcut(
                 cursor = steam_vdf_skip(bytes, field_kind, field_value_pos)?;
             }
         }
-        let (key, _) = steam_vdf_key(bytes, start + 1)?;
         let entry_matches = found_name.as_deref() == Some(app_name);
         if entry_matches {
             if !inserted {
-                let index = key;
-                kept.push(0);
-                kept.extend_from_slice(index.as_bytes());
+                kept.extend_from_slice(key.as_bytes());
                 kept.push(0);
                 kept.extend_from_slice(&replacement[3..]);
                 inserted = true;
@@ -193,7 +195,6 @@ pub(super) fn steam_upsert_shortcut(
     if !inserted {
         let (_, max_index) = steam_root_end(bytes)?;
         let index = steam_next_entry_index(root_end, max_index)?;
-        kept.push(0);
         kept.extend_from_slice(index.to_string().as_bytes());
         kept.push(0);
         kept.extend_from_slice(&replacement[3..]);

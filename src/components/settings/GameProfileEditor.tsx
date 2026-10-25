@@ -4,7 +4,7 @@ import type {
   Profile,
   ProfileCapabilities,
 } from "../../types/studio";
-import { profileWithOptions } from "../../utils/profile";
+import { availableProfileOptions, profileWithOptions } from "../../utils/profile";
 import { ProfileActions } from "./ProfileActions";
 import { ProfileOptionFields } from "./ProfileOptionFields";
 
@@ -56,7 +56,7 @@ export function GameProfileEditor({
           <h3>Game profile</h3>
           <p>Override the emulator defaults for this game. Clear a field to inherit the selected build’s global value.</p>
         </div>
-        {capabilities && <span>{capabilities.verified_options?.length ?? 0} source-verified options</span>}
+        {capabilities && <span>{availableProfileOptions(capabilities).length} options available in this build</span>}
       </div>
       <ProfileActions
         games={games}
@@ -70,7 +70,7 @@ export function GameProfileEditor({
         onRestore={onRestore}
       />
       <ProfileOptionFields
-        available={capabilities?.verified_options || []}
+        available={availableProfileOptions(capabilities)}
         optionMetadata={capabilities?.option_metadata}
         options={profile.options}
         inheritedOptions={globalOptions}
@@ -82,10 +82,10 @@ export function GameProfileEditor({
         gpuDevices={gpuDevices}
         showUnavailable={false}
       />
-      {(capabilities?.verified_options?.length ?? 0) === 0 && (
+      {availableProfileOptions(capabilities).length === 0 && capabilities && (
         <div className="settings-empty-options">
-          <strong>No source-verified launch settings</strong>
-          <span>Help-advertised settings stay disabled until Studio can match a clean source checkout to this build’s exact commit.</span>
+          <strong>This build advertises no configurable launch settings</strong>
+          <span>Studio reads each build’s installed executable directly, so the displayed options follow that build rather than the newest upstream release.</span>
         </div>
       )}
       {unsupported && (
@@ -94,8 +94,7 @@ export function GameProfileEditor({
         </button>
       )}
       <p className="hint">
-        Only options verified against this selected build’s binary and matching
-        clean source revision are editable. Empty values inherit this build’s defaults.
+        Options are read from this build’s own executable help. Empty values inherit this build’s global defaults; source-unverified options are marked in their capability details.
       </p>
       <div className="buttonrow">
         <button

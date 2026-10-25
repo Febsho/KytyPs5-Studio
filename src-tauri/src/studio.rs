@@ -907,6 +907,7 @@ struct ProfileCapabilities {
     controller_vibration: bool,
     keyboard_player: bool,
     options: Vec<String>,
+    available_options: Vec<String>,
     verified_options: Vec<String>,
     option_states: HashMap<String, CapabilityStatus>,
     binary_sha256: String,
@@ -1097,6 +1098,7 @@ fn profile_capabilities(help: &str) -> ProfileCapabilities {
         controller_volume: has("--controller-volume"),
         controller_vibration: has("--controller-vibration"),
         keyboard_player: has("--keyboard-player"),
+        available_options: options.clone(),
         options,
         verified_options,
         option_states,
@@ -1307,15 +1309,6 @@ fn capabilities_for_build(b: &Build, repository: &Repo) -> Result<ProfileCapabil
     // cannot probe that combination reliably on every host, so it remains unavailable.
     capabilities.verified_options.retain(|flag| flag != "--hdr");
     let verified: HashSet<_> = capabilities.verified_options.iter().cloned().collect();
-    capabilities.screen_width = verified.contains("--screen-width");
-    capabilities.screen_height = verified.contains("--screen-height");
-    capabilities.present_mode = verified.contains("--present-mode");
-    capabilities.perf_overlay = verified.contains("--perf-overlay");
-    capabilities.fullscreen = verified.contains("--fullscreen");
-    capabilities.controller_color = verified.contains("--controller-color");
-    capabilities.controller_volume = verified.contains("--controller-volume");
-    capabilities.controller_vibration = verified.contains("--controller-vibration");
-    capabilities.keyboard_player = verified.contains("--keyboard-player");
     for (flag, status) in &mut capabilities.option_states {
         if verified.contains(flag) {
             status.state = CapabilityState::VerifiedSupported;
@@ -1357,6 +1350,29 @@ fn capabilities_for_build(b: &Build, repository: &Repo) -> Result<ProfileCapabil
             metadata.state_explanation = explanation;
         }
     }
+    capabilities.available_options = capabilities
+        .options
+        .iter()
+        .filter(|flag| {
+            !capabilities.option_states.get(*flag).is_some_and(|status| {
+                matches!(
+                    &status.state,
+                    CapabilityState::Unavailable | CapabilityState::Unsupported
+                )
+            })
+        })
+        .cloned()
+        .collect();
+    let available: HashSet<_> = capabilities.available_options.iter().cloned().collect();
+    capabilities.screen_width = available.contains("--screen-width");
+    capabilities.screen_height = available.contains("--screen-height");
+    capabilities.present_mode = available.contains("--present-mode");
+    capabilities.perf_overlay = available.contains("--perf-overlay");
+    capabilities.fullscreen = available.contains("--fullscreen");
+    capabilities.controller_color = available.contains("--controller-color");
+    capabilities.controller_volume = available.contains("--controller-volume");
+    capabilities.controller_vibration = available.contains("--controller-vibration");
+    capabilities.keyboard_player = available.contains("--keyboard-player");
     for (flag, metadata) in &mut capabilities.option_metadata {
         if verified.contains(flag) {
             metadata.state = CapabilityState::VerifiedSupported;
@@ -1605,7 +1621,7 @@ fn validate_extra_profile_options(
     }
     for (flag, value) in options {
         if !capabilities
-            .verified_options
+            .available_options
             .iter()
             .any(|supported| supported == flag)
         {
@@ -1613,7 +1629,7 @@ fn validate_extra_profile_options(
                 .option_states
                 .get(flag)
                 .map(|status| status.explanation.as_str())
-                .unwrap_or("No source-verified capability entry exists for this build.");
+                .unwrap_or("The selected executable does not advertise this option.");
             return Err(format!("Cannot apply {flag}: {detail}"));
         }
         if let Some(metadata) = capabilities.option_metadata.get(flag) {
@@ -1872,7 +1888,7 @@ fn validate_extra_profile_options(
         .get("--gpu-assisted-validation")
         .is_some_and(|v| v == "true")
         && !capabilities
-            .verified_options
+            .available_options
             .iter()
             .any(|v| v == "--vulkan-validation")
     {
@@ -1916,19 +1932,19 @@ fn effective_profile_options(
 ) -> Result<BTreeMap<String, String>, String> {
     if let Some(unsupported) = game.keys().find(|flag| {
         !capabilities
-            .verified_options
+            .available_options
             .iter()
             .any(|supported| supported == *flag)
     }) {
         return Err(format!(
-            "The selected emulator build no longer supports {unsupported}; clear unsupported game options before launching"
+            "The selected emulator build does not advertise {unsupported}; clear unsupported game options before launching"
         ));
     }
     let mut effective: BTreeMap<_, _> = global
         .iter()
         .filter(|(flag, _)| {
             capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|supported| supported == *flag)
         })
@@ -4855,7 +4871,7 @@ fn patch_configuration_for_game(
     let capabilities = capabilities_for_build(build, &repo(c, build.repo_id)?)?;
     options.retain(|flag, _| {
         capabilities
-            .verified_options
+            .available_options
             .iter()
             .any(|supported| supported == flag)
     });
@@ -10149,15 +10165,10 @@ fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_jso
         }
     }
     let options = game_options;
-    let installed_patch = selected_build
-        .as_ref()
-        .and_then(|build| {
-            selected
-                .title_id
-                .as_deref()
-                .map(|id| build_patch_path(build, id))
-        })
-        .filter(|path| path.is_file());
+    let installed_patch = match (selected_build.as_ref(), selected.title_id.as_deref()) {
+        (Some(build), Some(title_id)) => sync_persistent_game_patch(&app, build, title_id)?,
+        _ => None,
+    };
     let configured_patch = options
         .get("--game-patch")
         .or_else(|| global_options.get("--game-patch"))
@@ -10359,7 +10370,7 @@ fn download_game_cheat(
     let directory = Path::new(&selected_build.path).join("_Patches");
     fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let destination = directory.join(format!("{title_id}.json"));
-    write_patch_file(&destination, source.as_bytes())?;
+    persist_game_patch(&app, &selected_build, &title_id, source.as_bytes())?;
     Ok(destination.display().to_string())
 }
 
@@ -10367,6 +10378,46 @@ fn build_patch_path(build: &Build, title_id: &str) -> PathBuf {
     Path::new(&build.path)
         .join("_Patches")
         .join(format!("{}.json", title_id.trim().to_ascii_uppercase()))
+}
+
+fn persistent_game_patch_path(app: &tauri::AppHandle, title_id: &str) -> Result<PathBuf, String> {
+    Ok(state_paths(app)?
+        .data
+        .join("game-patches")
+        .join(format!("{}.json", title_id.trim().to_ascii_uppercase())))
+}
+
+fn persist_game_patch(
+    app: &tauri::AppHandle,
+    build: &Build,
+    title_id: &str,
+    content: &[u8],
+) -> Result<PathBuf, String> {
+    let persistent = persistent_game_patch_path(app, title_id)?;
+    write_patch_file(&persistent, content)?;
+    let installed = build_patch_path(build, title_id);
+    write_patch_file(&installed, content)?;
+    Ok(installed)
+}
+
+fn sync_persistent_game_patch(
+    app: &tauri::AppHandle,
+    build: &Build,
+    title_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    let persistent = persistent_game_patch_path(app, title_id)?;
+    let installed = build_patch_path(build, title_id);
+    if !persistent.is_file() && installed.is_file() {
+        let bytes = fs::read(&installed).map_err(|error| error.to_string())?;
+        write_patch_file(&persistent, &bytes)?;
+    }
+    if persistent.is_file() {
+        let bytes = fs::read(&persistent).map_err(|error| error.to_string())?;
+        write_patch_file(&installed, &bytes)?;
+        Ok(Some(installed))
+    } else {
+        Ok(None)
+    }
 }
 
 fn validate_game_patch_document(
@@ -10477,12 +10528,13 @@ fn store_custom_game_patch(
     let selected = game(&conn, game_id)?;
     let document = validate_game_patch_document(&selected, content)?;
     let selected_build = build_for_game(&conn, game_id)?;
-    let destination = build_patch_path(
+    let bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
+    let destination = persist_game_patch(
+        app,
         &selected_build,
         selected.title_id.as_deref().unwrap_or_default(),
-    );
-    let bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
-    write_patch_file(&destination, &bytes)?;
+        &bytes,
+    )?;
     Ok(destination.display().to_string())
 }
 
@@ -10500,12 +10552,15 @@ fn set_game_patch_mod_enabled(
         &selected_build,
         selected.title_id.as_deref().unwrap_or_default(),
     );
-    let bytes =
-        fs::read(&path).map_err(|error| format!("Could not read installed patch: {error}"))?;
+    let title_id = selected.title_id.as_deref().unwrap_or_default();
+    let persistent = persistent_game_patch_path(&app, title_id)?;
+    let bytes = fs::read(&persistent)
+        .or_else(|_| fs::read(&path))
+        .map_err(|error| format!("Could not read installed patch: {error}"))?;
     let mut document = validate_game_patch_document(&selected, &bytes)?;
     set_patch_mod_enabled(&mut document, mod_index, enabled)?;
     let bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
-    write_patch_file(&path, &bytes)?;
+    persist_game_patch(&app, &selected_build, title_id, &bytes)?;
     String::from_utf8(bytes).map_err(|error| error.to_string())
 }
 
@@ -10708,47 +10763,47 @@ fn set_profile(app: tauri::AppHandle, game_id: i64, mut profile: Profile) -> Res
     }
     if profile.screen_width.is_some()
         && !capabilities
-            .verified_options
+            .available_options
             .iter()
             .any(|f| f == "--screen-width")
         || profile.screen_height.is_some()
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--screen-height")
         || profile.present_mode.is_some()
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--present-mode")
         || profile.perf_overlay
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--perf-overlay")
         || profile.fullscreen
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--fullscreen")
         || profile.controller_color.is_some()
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--controller-color")
         || profile.controller_volume.is_some()
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--controller-volume")
         || profile.controller_vibration.is_some()
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--controller-vibration")
         || profile.keyboard_player.is_some()
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--keyboard-player")
     {
@@ -10998,6 +11053,10 @@ fn launch_game_impl(
         .map_err(|_| "Select an active emulator build".to_string())?
     };
     let b = build(&c, build_id)?;
+    save_data::sync_saves_from_last_played_build(&app, game_id, build_id)?;
+    if let Some(title_id) = g.title_id.as_deref() {
+        sync_persistent_game_patch(&app, &b, title_id)?;
+    }
     let selected_repo = repo(&c, b.repo_id)?;
     let supports_background_precompile = source_proves_background_precompile(&b, &selected_repo);
     let enable_shader_precompile = supports_background_precompile
@@ -11018,7 +11077,7 @@ fn launch_game_impl(
         )?;
         if let Some(unsupported) = shared.keys().find(|flag| {
             !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|supported| supported == *flag)
         }) {
@@ -11061,7 +11120,7 @@ fn launch_game_impl(
             let patch_bytes = fs::read(&installed_patch).map_err(|error| error.to_string())?;
             validate_game_patch_document(&g, &patch_bytes)?;
             if !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|option| option == "--game-patch")
             {
@@ -11078,47 +11137,47 @@ fn launch_game_impl(
     }
     if game_profile.screen_width.is_some()
         && !capabilities
-            .verified_options
+            .available_options
             .iter()
             .any(|f| f == "--screen-width")
         || game_profile.screen_height.is_some()
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--screen-height")
         || game_profile.present_mode.is_some()
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--present-mode")
         || game_profile.perf_overlay
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--perf-overlay")
         || game_profile.fullscreen
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--fullscreen")
         || game_profile.controller_color.is_some()
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--controller-color")
         || game_profile.controller_volume.is_some()
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--controller-volume")
         || game_profile.controller_vibration.is_some()
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--controller-vibration")
         || game_profile.keyboard_player.is_some()
             && !capabilities
-                .verified_options
+                .available_options
                 .iter()
                 .any(|f| f == "--keyboard-player")
     {
@@ -14282,7 +14341,7 @@ mod tests {
         );
     }
     #[test]
-    fn help_advertisement_alone_does_not_authorize_an_option() {
+    fn help_advertisement_makes_option_available_for_that_binary() {
         let capabilities = profile_capabilities("--future-switch Toggle future behavior\n");
         assert!(capabilities
             .options
@@ -14296,6 +14355,18 @@ mod tests {
         assert!(validate_extra_profile_options(
             &BTreeMap::from([("--future-switch".into(), "true".into())]),
             &capabilities
+        )
+        .is_ok());
+        let mut unavailable = capabilities;
+        unavailable.available_options.clear();
+        unavailable
+            .option_states
+            .get_mut("--future-switch")
+            .unwrap()
+            .state = CapabilityState::Unavailable;
+        assert!(validate_extra_profile_options(
+            &BTreeMap::from([("--future-switch".into(), "true".into())]),
+            &unavailable
         )
         .is_err());
     }

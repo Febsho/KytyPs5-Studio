@@ -6,6 +6,7 @@ import type { AppUpdateInfo, Build, ProfileCapabilities, Repo, StorageReport } f
 import { ProfileOptionFields } from "../components/settings/ProfileOptionFields";
 import { emulatorBuildName, formatBytes } from "../utils/format";
 import { currentCompatibilityOS } from "../utils/compatibility";
+import { availableProfileOptions } from "../utils/profile";
 
 const primaryEmulatorFlags = [
   "--screen-width",
@@ -89,16 +90,14 @@ export function SettingsPage({
     : null;
   const reportedOptions = globalProfileCapabilities?.options ?? [];
   const verifiedOptions = globalProfileCapabilities?.verified_options ?? [];
-  const primaryOptions = verifiedOptions.filter((flag) =>
+  const availableOptions = availableProfileOptions(globalProfileCapabilities);
+  const primaryOptions = availableOptions.filter((flag) =>
     primaryEmulatorFlags.includes(flag),
   );
-  const additionalOptions = verifiedOptions.filter(
+  const additionalOptions = availableOptions.filter(
     (flag) => !primaryEmulatorFlags.includes(flag),
   );
-  const advertisedUnverified = reportedOptions.filter((flag) =>
-    !verifiedOptions.includes(flag) &&
-    globalProfileCapabilities?.option_states?.[flag]?.state !== "unavailable",
-  );
+  const advertisedUnverified = availableOptions.filter((flag) => !verifiedOptions.includes(flag));
   const unavailableOptions = Object.entries(globalProfileCapabilities?.option_states ?? {})
     .filter(([, status]) => status.state === "unavailable" || status.state === "unsupported")
     .map(([flag, status]) => ({ flag, explanation: status.explanation }));
@@ -217,7 +216,7 @@ export function SettingsPage({
         <div className="settings-emulator-heading">
           <div>
             <h3>Selected build defaults</h3>
-            <p>Choose a build to see source-verified options. These defaults apply to games assigned to that build.</p>
+            <p>Choose a build to see the launch options advertised by its executable. These defaults apply to games assigned to that build.</p>
           </div>
           <label>
             Emulator
@@ -294,7 +293,7 @@ export function SettingsPage({
         )}
         {selectedBuild && globalProfileCapabilities && (
           <div className="settings-build-caption">
-            <span>{verifiedOptions.length} source-verified settings</span>
+            <span>{availableOptions.length} settings available in this build</span>
             <span>{reportedOptions.length} CLI options advertised</span>
           </div>
         )}
@@ -308,7 +307,7 @@ export function SettingsPage({
                 setGlobalProfileOptions(
                   Object.fromEntries(
                     Object.entries(globalProfileOptions).filter(([flag]) =>
-                      verifiedOptions.includes(flag),
+                      availableOptions.includes(flag),
                     ),
                   ),
                 )
@@ -335,7 +334,7 @@ export function SettingsPage({
         )}
         {globalProfileCapabilities && additionalOptions.length > 0 && (
           <details className="settings-additional-options">
-            <summary>More source-verified options ({additionalOptions.length})</summary>
+            <summary>More build-specific options ({additionalOptions.length})</summary>
             <ProfileOptionFields
               available={additionalOptions}
               optionMetadata={globalProfileCapabilities.option_metadata}
@@ -348,13 +347,13 @@ export function SettingsPage({
             />
           </details>
         )}
-        {globalProfileCapabilities && verifiedOptions.length === 0 && (
+        {globalProfileCapabilities && availableOptions.length === 0 && (
           <div className="settings-empty-options">
-            <strong>No source-verified options are available</strong>
-            <span>Match this build’s exact commit to a clean source checkout. Unverified flags are not sent to the emulator.</span>
+            <strong>This build advertises no configurable launch options</strong>
+            <span>Options are read from the selected build’s executable, so older builds show the options they actually provide.</span>
           </div>
         )}
-        {advertisedUnverified.length > 0 && <details className="settings-additional-options"><summary>Advertised, not verified ({advertisedUnverified.length})</summary><p className="hint">Help output alone does not prove implementation. These options remain disabled and are filtered from launches.</p><ul>{advertisedUnverified.map(flag=><li key={flag}><strong>{flag}</strong> — {globalProfileCapabilities?.option_states?.[flag]?.explanation}</li>)}</ul></details>}
+        {advertisedUnverified.length > 0 && <details className="settings-additional-options"><summary>Source implementation not matched ({advertisedUnverified.length})</summary><p className="hint">These controls are advertised by the selected executable and remain available. Studio could not match their implementation to a clean checkout of this exact build.</p><ul>{advertisedUnverified.map(flag=><li key={flag}><strong>{flag}</strong> — {globalProfileCapabilities?.option_states?.[flag]?.explanation}</li>)}</ul></details>}
         {unavailableOptions.length > 0 && <details className="settings-additional-options"><summary>Unavailable or not advertised ({unavailableOptions.length})</summary><p className="hint">These options are disabled because the build does not advertise them or this host lacks a verified requirement.</p><ul>{unavailableOptions.map(({flag, explanation})=><li key={flag}><strong>{flag}</strong> — {explanation}</li>)}</ul></details>}
         <div className="settings-save-row">
           <span>{selectedBuild ? "Changes apply to games assigned to this build." : "Select an installed build to edit its settings."}</span>

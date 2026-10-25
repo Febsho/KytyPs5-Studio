@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1.0
+
+### Saves and patches
+
+- Automatically carry the save from the most recently played emulator build into the build selected for the next launch, preserving a verified backup before replacing different save data.
+- Keep imported and edited game patches in Studio data and restore them into the selected build after app restarts or build changes.
+- Fix the automatic save-backup control layout.
+
+### Build-specific settings
+
+- Show launch settings advertised by each installed executable, including older builds, instead of limiting settings to the newest upstream revision.
+- Refresh the selected build's capabilities when opening its settings and filter options that build marks unavailable or unsupported.
+
+### Library and sessions
+
+- Enlarge game logos and move version, storage, compatibility, and trophy details below the logo; remove the redundant imported-game status line.
+- Refresh trophy progress cards with clearer, modern grade styling.
+- Prevent a previous crashed or closed game's session summary from reopening when a later launch attempt fails.
+
 ## 1.0.0
 
 ### Build-specific emulator settings

@@ -56,6 +56,73 @@ describe("App startup", () => {
     await waitFor(() => expect(screen.getByText("Your library is empty")).toBeTruthy());
   });
 
+  it("does not reopen the previous session summary when a later launch fails", async () => {
+    vi.stubGlobal("ResizeObserver", class {
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    });
+    const game = {
+      id: 4,
+      path: "/games/example/eboot.bin",
+      title: "Example Game",
+      favorite: false,
+      build_id: null,
+      play_seconds: 0,
+      last_played: null,
+      title_id: "PPSA00001",
+      game_version: "01.000",
+      icon_path: null,
+      install_size: 1024,
+      file_status: "Available" as const,
+    };
+    const endedSession = {
+      id: 12,
+      game_id: game.id,
+      build_id: 2,
+      title: game.title,
+      started_at: 1_700_000_000,
+      ended_at: 1_700_000_010,
+      exit_code: 139,
+      outcome: "crash",
+      log_path: "",
+      commit_sha: "abc123456789",
+      build_type: "Release",
+      pid: null,
+    };
+    let launchCount = 0;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (["list_repos", "list_builds"].includes(command)) return [];
+      if (command === "list_games") return [game];
+      if (command === "recent_sessions") return launchCount > 0 ? [endedSession] : [];
+      if (command === "game_sessions") return [endedSession];
+      if (command === "process_metrics") return [];
+      if (command === "launch_game") {
+        launchCount += 1;
+        if (launchCount === 2) throw new Error("Selected build is unavailable");
+        return undefined;
+      }
+      return null;
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    const playButton = await screen.findByRole("button", { name: /play game/i });
+    await user.click(playButton);
+    expect(await screen.findByRole("dialog", { name: "Emulator session" })).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Dismiss launcher" }));
+    expect(screen.queryByRole("dialog", { name: "Emulator session" })).toBeNull();
+
+    await user.click(playButton);
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.filter(([command]) => command === "launch_game")).toHaveLength(2);
+    });
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.filter(([command]) => command === "game_sessions")).toHaveLength(2);
+    });
+    expect(screen.queryByRole("dialog", { name: "Emulator session" })).toBeNull();
+  });
+
   it("checks a fork only after a manual click and asks before building its update", async () => {
     const repo = {
       id: 9,

@@ -360,6 +360,76 @@ pub(super) fn list_saves(app: tauri::AppHandle, game_id: i64) -> Result<Vec<Save
     scan(&app, game_id)
 }
 
+/// Keep a selected build's saves aligned with the last build that actually ran
+/// this game. Existing target saves are backed up before they are replaced.
+pub(super) fn sync_saves_from_last_played_build(
+    app: &tauri::AppHandle,
+    game_id: i64,
+    target_build_id: i64,
+) -> Result<usize, String> {
+    let conn = super::db(app)?;
+    let game = super::game(&conn, game_id)?;
+    if !game.title_id.as_deref().is_some_and(valid_title_id) {
+        return Ok(0);
+    }
+    let target_build = super::build(&conn, target_build_id)?;
+    let target_root = fs::canonicalize(&target_build.path).map_err(|e| e.to_string())?;
+    let entries = scan(app, game_id)?;
+    let source_build_id = conn
+        .query_row(
+            "SELECT build_id FROM sessions WHERE game_id=? AND process_pid IS NOT NULL AND ended_at IS NOT NULL ORDER BY started_at DESC,id DESC LIMIT 1",
+            [game_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()
+        .or_else(|| {
+            entries
+                .iter()
+                .filter(|entry| entry.build_id != target_build_id)
+                .max_by_key(|entry| entry.modified_at.unwrap_or(0))
+                .map(|entry| entry.build_id)
+        });
+    let Some(source_build_id) = source_build_id.filter(|id| *id != target_build_id) else {
+        return Ok(0);
+    };
+    let mut copied = 0;
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.build_id == source_build_id)
+    {
+        let destination = save_target(
+            &target_root,
+            &entry.title_id,
+            &entry.layout,
+            entry.user_id.as_deref(),
+        )?;
+        if destination.exists()
+            && !entries.iter().any(|existing| {
+                existing.build_id == target_build_id && Path::new(&existing.path) == destination
+            })
+        {
+            if destination.is_dir() && directory_size(&destination) == 0 {
+                fs::remove_dir(&destination).map_err(|e| e.to_string())?;
+            } else {
+                continue;
+            }
+        }
+        if destination.exists() && tree_hash(&destination)? == tree_hash(Path::new(&entry.path))? {
+            continue;
+        }
+        install_payload(
+            app,
+            game_id,
+            target_build_id,
+            &destination,
+            Path::new(&entry.path),
+            "before-auto-sync",
+        )?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
 pub(super) fn auto_backup_after_session(app: &tauri::AppHandle, game_id: i64) {
     let Ok(_lifecycle) = super::SESSION_LIFECYCLE_LOCK.lock() else {
         return;

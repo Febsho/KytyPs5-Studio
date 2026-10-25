@@ -596,6 +596,7 @@ export function ProfileOptionFields({
                       )}
                       {fieldErrors[flag] && <small role="alert" className="error-note">{fieldErrors[flag]}</small>}
                       {info.hint && <small className="hint">{info.hint}</small>}
+                      {metadata?.state === "advertised_unverified" && <small className="hint">Advertised by this executable; its source implementation was not matched to this build.</small>}
                     </div>
                   );
                 })}

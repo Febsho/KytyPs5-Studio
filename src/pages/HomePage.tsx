@@ -12,7 +12,7 @@ import type {
 } from "../types/studio";
 import { GameContextMenu, VirtualHomeGameRow } from "../components/games/GameLibrary";
 import { GameCompatibilityBadge } from "../components/games/GameCompatibilityBadge";
-import { date, emulatorBuildName, formatBytes } from "../utils/format";
+import { emulatorBuildName, formatBytes } from "../utils/format";
 import { trophySummary } from "../utils/trophies";
 
 type Page =
@@ -132,21 +132,6 @@ export function HomePage({
         )}
       </div>
       {featuredGame && <div className="home-feature">
-        <div className="home-game-meta">
-          {featuredGame?.title_id && <span>{featuredGame.title_id}</span>}
-          {featuredGame && <GameCompatibilityBadge game={featuredGame} index={officialCompatibilityIndex} className="home-official-compatibility" />}
-          {featuredGame?.game_version && (
-            <span>VERSION {featuredGame.game_version}</span>
-          )}
-          {featuredGame?.install_size !== null &&
-            featuredGame?.install_size !== undefined && (
-              <span>{formatBytes(featuredGame.install_size)}</span>
-            )}
-          {featuredGame?.last_played && (
-            <span>{Math.round(featuredGame.play_seconds / 60)} MIN PLAYED</span>
-          )}
-          {trophyProgress && trophyProgress.total > 0 && <span>{trophyProgress.earned === null ? `${trophyProgress.total} TROPHIES` : `${trophyProgress.earned}/${trophyProgress.total} TROPHIES EARNED`}</span>}
-        </div>
         {featuredLogo ? (
           <>
             <h2 className="sr-only">{featuredGame?.title || "KytyPS5 Studio"}</h2>
@@ -155,13 +140,14 @@ export function HomePage({
         ) : (
           <h2>{featuredGame?.title || "KytyPS5 Studio"}</h2>
         )}
-        <p>
-          {featuredGame
-            ? featuredGame.last_played
-              ? `Last played ${date(featuredGame.last_played)}.`
-              : "Imported game · gameplay compatibility is unconfirmed."
-            : "Import a supported game folder to build your library."}
-        </p>
+        <div className="home-game-meta">
+          {featuredGame?.title_id && <span>{featuredGame.title_id}</span>}
+          {featuredGame && <GameCompatibilityBadge game={featuredGame} index={officialCompatibilityIndex} className="home-official-compatibility" />}
+          {featuredGame?.game_version && <span>VERSION {featuredGame.game_version}</span>}
+          {featuredGame?.install_size !== null && featuredGame?.install_size !== undefined && <span>{formatBytes(featuredGame.install_size)}</span>}
+          {featuredGame?.last_played && <span>{Math.round(featuredGame.play_seconds / 60)} MIN PLAYED</span>}
+          {trophyProgress && trophyProgress.total > 0 && <span>{trophyProgress.earned === null ? `${trophyProgress.total} TROPHIES` : `${trophyProgress.earned}/${trophyProgress.total} TROPHIES EARNED`}</span>}
+        </div>
         {trophyProgress && trophyProgress.total > 0 && <div className="home-trophy-progress" aria-label="Trophy progress">
           <div className="trophy-progress-heading"><strong>Trophies</strong><span>{trophyProgress.earned === null ? "Earned status unavailable" : `${trophyProgress.earned} / ${trophyProgress.total} earned`}</span></div>
           <div className="trophy-progress-grid">{(["bronze", "silver", "gold", "platinum"] as const).map((grade) => <div className={`trophy-progress-grade trophy-${grade}`} key={grade}><span>{grade}</span><strong>{trophyProgress.earned === null ? "—" : trophyProgress.earnedByGrade[grade]} <i>/</i> {trophyProgress.counts[grade]}</strong></div>)}</div>

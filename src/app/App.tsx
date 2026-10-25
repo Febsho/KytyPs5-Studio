@@ -76,7 +76,7 @@ import { SettingsPage } from "../pages/SettingsPage";
 import { LauncherSessionModal } from "../components/emulator/LauncherSessionModal";
 import { RepositoryManagerPage } from "../pages/RepositoryManagerPage";
 import { GameProfileEditor } from "../components/settings/GameProfileEditor";
-import { profileWithOptions } from "../utils/profile";
+import { availableProfileOptions, profileWithOptions } from "../utils/profile";
 import { MainNavigation } from "../components/navigation/MainNavigation";
 import { CommunityPullRequestDrawer } from "../components/community/CommunityPullRequestDrawer";
 import { CommunityBuildHistory } from "../components/community/CommunityBuildHistory";
@@ -272,6 +272,7 @@ export function App() {
   const [discordPresenceEnabled, setDiscordPresenceEnabled] = useState(true);
   const [processMetrics, setProcessMetrics] = useState<ProcessMetric[]>([]);
   const processMetricsRef = useRef<ProcessMetric[]>([]);
+  const launcherSessionCutoff = useRef<number | null>(null);
   const gamepadWindowFocused = useRef(true);
   const gamepadGameRunning = useRef(false);
   const sessionPerformanceSamples = useRef(
@@ -811,7 +812,7 @@ export function App() {
     const completed = wasActive
       .filter((metric) => !activeIds.has(metric.session_id))
       .at(-1);
-    if (completed) {
+    if (completed && (launcherSessionCutoff.current === null || completed.session_id > launcherSessionCutoff.current)) {
       setLauncherSessionId(completed.session_id);
       setLauncherDismissed(false);
       void invoke<Session[]>("recent_sessions")
@@ -1096,8 +1097,10 @@ export function App() {
       (latest, session) => Math.max(latest, session.id),
       0,
     );
+    launcherSessionCutoff.current = previousId;
     setMessage("");
-    setLauncherDismissed(false);
+    setLauncherSessionId(null);
+    setLauncherDismissed(true);
     try {
       await call("launch_game", { gameId });
       refreshProcessMetricsNow();
@@ -1111,7 +1114,10 @@ export function App() {
       const launched = recent.find(
         (session) => session.game_id === gameId && session.id > previousId,
       );
-      if (launched) setLauncherSessionId(launched.id);
+      if (launched) {
+        setLauncherSessionId(launched.id);
+        setLauncherDismissed(false);
+      }
       await refreshData();
     } catch (error) {
       setMessage(`Could not refresh launcher session: ${String(error)}`);
@@ -1156,8 +1162,10 @@ export function App() {
       return;
     }
     const previousId = sessions.reduce((latest, session) => Math.max(latest, session.id), 0);
+    launcherSessionCutoff.current = previousId;
     setMessage("");
-    setLauncherDismissed(false);
+    setLauncherSessionId(null);
+    setLauncherDismissed(true);
     try {
       await call("launch_game_ab", { gameId, buildId, settingsBuildId });
       refreshProcessMetricsNow();
@@ -1165,7 +1173,10 @@ export function App() {
       setSessions(recent);
       setGameSessionHistory(await call<Session[]>("game_sessions", { gameId }));
       const launched = recent.find((session) => session.game_id === gameId && session.id > previousId);
-      if (launched) setLauncherSessionId(launched.id);
+      if (launched) {
+        setLauncherSessionId(launched.id);
+        setLauncherDismissed(false);
+      }
       await refreshData();
     } catch (error) {
       setMessage(String(error));
@@ -1361,11 +1372,17 @@ export function App() {
     loading: profileLoading,
     copyFromGame,
     restore: restoreSavedProfile,
+    refreshCapabilities: refreshGameProfileCapabilities,
   } = useGameProfile(
     currentGame?.id,
     `${currentGame?.build_id ?? "active"}:${active?.id ?? "none"}`,
     setMessage,
   );
+  useEffect(() => {
+    if (page === "game-details" && gameDetailsTab === "Settings") {
+      void refreshGameProfileCapabilities();
+    }
+  }, [page, gameDetailsTab, currentGame?.id, currentGame?.build_id, active?.id, refreshGameProfileCapabilities]);
   const featuredGame = useMemo(
     () =>
       publicGames.find((game) => game.id === homeSelection) ||
@@ -1398,7 +1415,7 @@ export function App() {
   const globalUnsupported =
     !!globalProfileCapabilities &&
     Object.keys(globalProfileOptions).some(
-      (flag) => !(globalProfileCapabilities.verified_options ?? []).includes(flag),
+      (flag) => !availableProfileOptions(globalProfileCapabilities).includes(flag),
     );
   const profileDirty =
     !profileLoading &&
@@ -1436,7 +1453,7 @@ export function App() {
       (profile.keyboard_player !== null &&
         !profileCapabilities.keyboard_player) ||
       Object.keys(profile.options).some(
-        (flag) => !(profileCapabilities.verified_options ?? []).includes(flag),
+        (flag) => !availableProfileOptions(profileCapabilities).includes(flag),
       ));
   useEffect(() => {
     setGameCompatibility(null);
@@ -1834,7 +1851,7 @@ export function App() {
             current,
             Object.fromEntries(
               Object.entries(current.options).filter(([flag]) =>
-                profileCapabilities?.verified_options?.includes(flag),
+                availableProfileOptions(profileCapabilities).includes(flag),
               ),
             ),
           ),

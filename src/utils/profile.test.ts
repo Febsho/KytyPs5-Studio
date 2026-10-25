@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Profile } from "../types/studio";
-import { profileWithOptions } from "./profile";
+import { availableProfileOptions, profileWithOptions } from "./profile";
 
 const emptyProfile: Profile = {
   screen_width: null,
@@ -50,5 +50,28 @@ describe("profileWithOptions", () => {
       fullscreen: false,
       options: {},
     });
+  });
+});
+
+describe("availableProfileOptions", () => {
+  it("uses this build's advertised options while excluding host-unavailable flags", () => {
+    expect(availableProfileOptions({
+      screen_width: false,
+      screen_height: false,
+      present_mode: false,
+      perf_overlay: false,
+      fullscreen: false,
+      controller_color: false,
+      controller_volume: false,
+      controller_vibration: false,
+      keyboard_player: false,
+      options: ["--old-build-option", "--windows-only"],
+      available_options: ["--old-build-option"],
+      verified_options: [],
+      option_states: {
+        "--old-build-option": { state: "advertised_unverified", explanation: "In this build help." },
+        "--windows-only": { state: "unavailable", explanation: "Host restriction." },
+      },
+    })).toEqual(["--old-build-option"]);
   });
 });

@@ -106,6 +106,17 @@ export function useGameProfile(
     }
   }, [savedSnapshot]);
 
+  const refreshCapabilities = useCallback(async () => {
+    if (gameId === undefined) return;
+    const request = requestId.current;
+    try {
+      const available = await loadersRef.current.loadCapabilities(gameId);
+      if (request === requestId.current) setCapabilities(available);
+    } catch (error) {
+      if (request === requestId.current) onErrorRef.current(String(error));
+    }
+  }, [gameId]);
+
   const ready = identity !== null && loadedIdentity === identity;
   return {
     profile: ready ? profile : emptyProfile(),
@@ -117,5 +128,6 @@ export function useGameProfile(
     setLoading,
     copyFromGame,
     restore,
+    refreshCapabilities,
   };
 }

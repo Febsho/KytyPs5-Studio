@@ -4706,7 +4706,14 @@ main {
   filter: drop-shadow(0 5px 20px #000b);
   pointer-events: none;
 }
-.home-feature { min-height: clamp(380px, 42vh, 480px); isolation: isolate; }
+.home-feature {
+  display: flex;
+  min-height: clamp(380px, 42vh, 480px);
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: flex-start;
+  isolation: isolate;
+}
 .home-feature > :not(.home-feature-logo) { position: relative; z-index: 1; }
 .home-feature > .sr-only { position: absolute; }
 .sr-only {

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.2
+
+### Home screen
+
+- Anchor the featured game title, metadata, trophies, and play actions to the bottom left, whether a game has a logo or uses its text title.
+
 ## 1.4.1
 
 ### Home screen

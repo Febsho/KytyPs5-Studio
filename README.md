@@ -29,7 +29,7 @@ The screenshots show the games home page, installed emulator builds, and the sou
 - Adds games to Steam and shares the current game through Discord Rich Presence when enabled.
 - Shows host and Vulkan diagnostics to help troubleshoot build and launch problems.
 
-See the [1.4.0 release notes](CHANGELOG.md) for the latest changes. Fork updates preserve the selected build's save data, trophy progress, and precompiled pipeline cache in the replacement installation.
+See the [1.4.1 release notes](CHANGELOG.md) for the latest changes. Fork updates preserve the selected build's save data, trophy progress, and precompiled pipeline cache in the replacement installation.
 
 Successful compilation or CLI verification does **not** guarantee that a game will run. Compatibility depends on the emulator, game, drivers, and system configuration.
 
@@ -53,8 +53,8 @@ Manual testing on a Windows desktop has not yet been completed. Automated Window
 Download the Linux AppImage from the [GitHub Releases](https://github.com/Febsho/KytyPs5-Studio/releases) page, make it executable, and run it:
 
 ```sh
-chmod +x "KytyPS5.Studio_1.4.0_amd64.AppImage"
-./"KytyPS5.Studio_1.4.0_amd64.AppImage"
+chmod +x "KytyPS5.Studio_1.4.1_amd64.AppImage"
+./"KytyPS5.Studio_1.4.1_amd64.AppImage"
 ```
 
 The AppImage filename changes between releases. Linux application data, cache, and configuration follow XDG user directories. An optional GitHub token is stored in Linux Secret Service; it is required only to publish compatibility issues from Studio.

@@ -4690,13 +4690,13 @@ main {
   font-size: clamp(40px, 4vw, 62px);
 }
 .home-feature-logo {
-  position: absolute;
+  position: relative;
   z-index: 0;
-  left: 0;
-  bottom: clamp(245px, 26vh, 300px);
+  inset: auto;
   display: block;
   width: min(480px, 40vw);
   height: clamp(100px, 15vh, 160px);
+  margin: 0 0 8px;
   object-fit: contain;
   object-position: left bottom;
   background: transparent;
@@ -4708,6 +4708,7 @@ main {
 }
 .home-feature { min-height: clamp(380px, 42vh, 480px); isolation: isolate; }
 .home-feature > :not(.home-feature-logo) { position: relative; z-index: 1; }
+.home-feature > .sr-only { position: absolute; }
 .sr-only {
   position: absolute;
   width: 1px;

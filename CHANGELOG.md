@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.1
+
+### Home screen
+
+- Keep the featured game's logo in the layout flow so game details, trophy counts, and play actions remain anchored together at the lower left without overlapping the logo.
+- Preserve transparent logo rendering and button clickability while the layout adapts to different screen sizes.
+
 ## 1.4.0
 
 ### Build updates and local data

@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.0
+
+### Game launch and emulator settings
+
+- Show each game's preferred emulator fork and build under Play; fall back to the active build when no game-specific build is selected.
+- Automatically remove saved per-game and per-build options that the selected executable does not support or whose saved values it rejects. The launch notice lists each removed option and the reason; global defaults remain available to other builds.
+- Keep launch failures visible on the Home screen.
+
+### Compatibility reports
+
+- Open the official compatibility database and issue form in the system browser, including when detailed compatibility data is unavailable.
+- Prepare a KytyPS5 game status report inside Studio with game, build, host, saved observation, and selected related issue details. Review before public submission; logs are included only when explicitly selected. GitHub issue write access is required.
+
+### Home screen
+
+- Remove the Technical Specs button and drawer; refine the featured game's logo and details layout.
+
 ## 1.1.0
 
 ### Saves and patches

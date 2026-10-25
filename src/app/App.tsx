@@ -52,6 +52,7 @@ import type {
   CommunityPRDetails,
   CommunityBuildHistory as CommunityBuildHistoryEntry,
 } from "../types/studio";
+import type { CompatibilityIssueLink } from "../utils/compatibilityReport";
 import {
   loadGameIcon,
   loadGameLogo,
@@ -190,9 +191,6 @@ export function App() {
   >("Overview");
   const [homeSelection, setHomeSelection] = useState<number | null>(() =>
     readUiId("home_game"),
-  );
-  const [specsOpen, setSpecsOpen] = useState(
-    () => readUiState("specs") === "open",
   );
   const [buildMode, setBuildMode] = useState<"simple" | "advanced">(() =>
     readUiState("build_mode") === "advanced" ? "advanced" : "simple",
@@ -441,7 +439,6 @@ export function App() {
       ["library_sort", librarySort],
       ["home_game", homeSelection?.toString() || ""],
       ["build_mode", buildMode],
-      ["specs", specsOpen ? "open" : "closed"],
     ] as const) {
       try {
         localStorage.setItem(`studio.ui.${key}`, value);
@@ -459,7 +456,6 @@ export function App() {
     librarySort,
     homeSelection,
     buildMode,
-    specsOpen,
   ]);
   useEffect(() => {
     if (!trackedRepos.length) {
@@ -628,9 +624,9 @@ export function App() {
     return () => stop();
   }, []);
   useEffect(() => {
-    if (page === "build" || page === "diagnostics")
+    if (page === "build" || page === "diagnostics" || (page === "game-details" && gameDetailsTab === "Compatibility"))
       void refreshSystem().catch(() => {});
-  }, [page, refreshSystem]);
+  }, [page, gameDetailsTab, refreshSystem]);
   useEffect(() => {
     if (!busy) return;
     const tick = () => {
@@ -1102,7 +1098,10 @@ export function App() {
     setLauncherSessionId(null);
     setLauncherDismissed(true);
     try {
-      await call("launch_game", { gameId });
+      const removed = await call<{ flag: string; scope: string; reason: string }[]>("launch_game", { gameId });
+      if (removed.length) {
+        setMessage(`Unsupported saved settings were removed automatically: ${removed.map(({ flag, scope, reason }) => `${flag} (${scope}) — ${reason}`).join("; ")}`);
+      }
       refreshProcessMetricsNow();
     } catch (error) {
       setMessage(String(error));
@@ -1486,7 +1485,7 @@ export function App() {
         .catch(() => {});
   }, [currentGame?.id]);
   useEffect(() => {
-    if (page !== "diagnostics" && page !== "settings" && !(page === "home" && specsOpen)) return;
+    if (page !== "diagnostics" && page !== "settings" && !(page === "game-details" && gameDetailsTab === "Compatibility")) return;
     let disposed = false;
     setGraphics(null);
     invoke<GraphicsDiagnostics>("inspect_graphics")
@@ -1500,7 +1499,7 @@ export function App() {
     return () => {
       disposed = true;
     };
-  }, [page, specsOpen]);
+  }, [page, gameDetailsTab]);
   useEffect(() => {
     let disposed = false;
     if (page === "library" && currentGame) {
@@ -1997,7 +1996,7 @@ export function App() {
       </header>
       <main>
         <div className="main-content">
-          {page !== "home" && message && !message.includes("Update available:") && (
+          {message && !message.includes("Update available:") && (
             <div className="notice" onClick={() => setMessage("")}>
               <CircleAlert size={17} />
               {message}
@@ -2012,11 +2011,8 @@ export function App() {
               featuredLogo={featuredLogo}
               featuredBackground={featuredBackground}
               active={active}
+              builds={builds}
               repos={repos}
-              system={system}
-              graphics={graphics}
-              specsOpen={specsOpen}
-              setSpecsOpen={setSpecsOpen}
               message={message}
               setPage={setPage}
               choose={choose}
@@ -2695,6 +2691,14 @@ export function App() {
               onImportCustomPatch={importCustomGamePatch}
               onSaveCustomPatch={saveCustomGamePatch}
               onSetGamePatchModEnabled={setGamePatchModEnabled}
+              system={system}
+              graphics={graphics}
+              githubTokenAvailable={githubTokenAvailable}
+              onOpenOfficialDatabase={() => void call("open_external_url", { url: "https://kytyps5.github.io/compatibility/" }).catch(() => {})}
+              onOpenExternalUrl={async (url) => { await call("open_external_url", { url }); }}
+              onSearchCompatibilityIssues={(titleId) => call<CompatibilityIssueLink[]>("search_compatibility_issues", { titleId })}
+              onReadSessionLog={(session) => call<string>("read_log", { path: session.log_path })}
+              onSubmitCompatibilityIssue={(title, body) => call<{ number: number; url: string }>("create_compatibility_issue", { title, body })}
             />
           )}
           {page === "game-details" && !currentGame && (

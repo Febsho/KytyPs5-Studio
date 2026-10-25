@@ -380,6 +380,7 @@ export function SettingsPage({
           Anonymous access works within GitHub rate limits. A personal access
           token is stored in {credentialStore}, never in Studio's database.
         </p>
+        <p>Creating a public compatibility report requires a GitHub token with Issues read and write access to KytyPS5/KytyPS5. Review the report and any included log before publishing.</p>
         <div className="kv">
           <span>Credential status</span>
           <strong>

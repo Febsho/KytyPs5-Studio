@@ -896,6 +896,83 @@ fn sync_legacy_profile_fields(profile: &mut Profile) {
 }
 
 #[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemovedProfileOption {
+    flag: String,
+    scope: String,
+    reason: String,
+}
+
+fn sanitize_saved_profile_options(
+    options: &mut BTreeMap<String, String>,
+    capabilities: &ProfileCapabilities,
+    scope: &str,
+) -> Vec<RemovedProfileOption> {
+    let mut removed = options
+        .keys()
+        .filter(|flag| !capabilities.available_options.contains(flag))
+        .cloned()
+        .map(|flag| {
+            let reason = capabilities
+                .option_states
+                .get(&flag)
+                .map(|status| status.explanation.clone())
+                .unwrap_or_else(|| "This option is not available in the selected build.".into());
+            (flag, reason)
+        })
+        .collect::<Vec<_>>();
+    for (flag, _) in &removed {
+        options.remove(flag);
+    }
+    let invalid_values = options
+        .iter()
+        .filter_map(|(flag, value)| {
+            let single_option = BTreeMap::from([(flag.clone(), value.clone())]);
+            validate_extra_profile_options(&single_option, capabilities)
+                .err()
+                .map(|reason| (flag.clone(), reason))
+        })
+        .collect::<Vec<_>>();
+    for (flag, _) in &invalid_values {
+        options.remove(flag);
+    }
+    removed.extend(invalid_values);
+    removed
+        .into_iter()
+        .map(|(flag, reason)| RemovedProfileOption {
+            reason,
+            flag,
+            scope: scope.into(),
+        })
+        .collect()
+}
+
+fn persist_game_profile(conn: &Connection, game_id: i64, profile: &Profile) -> Result<(), String> {
+    let options_json =
+        serde_json::to_string(&profile.options).map_err(|error| error.to_string())?;
+    conn.execute(
+        "INSERT INTO profiles(game_id,screen_width,screen_height,present_mode,perf_overlay,fullscreen,controller_color,controller_volume,controller_vibration,keyboard_player,options_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(game_id) DO UPDATE SET screen_width=excluded.screen_width,screen_height=excluded.screen_height,present_mode=excluded.present_mode,perf_overlay=excluded.perf_overlay,fullscreen=excluded.fullscreen,controller_color=excluded.controller_color,controller_volume=excluded.controller_volume,controller_vibration=excluded.controller_vibration,keyboard_player=excluded.keyboard_player,options_json=excluded.options_json",
+        params![game_id, profile.screen_width, profile.screen_height, profile.present_mode, profile.perf_overlay, profile.fullscreen, profile.controller_color, profile.controller_volume, profile.controller_vibration, profile.keyboard_player, options_json],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn persist_build_profile_options(
+    conn: &Connection,
+    build_id: i64,
+    options: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let json = serde_json::to_string(options).map_err(|error| error.to_string())?;
+    conn.execute(
+        "INSERT INTO build_profile_defaults(build_id,options_json) VALUES(?,?) ON CONFLICT(build_id) DO UPDATE SET options_json=excluded.options_json",
+        params![build_id, json],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct ProfileCapabilities {
     screen_width: bool,
     screen_height: bool,
@@ -3936,6 +4013,50 @@ fn open_directory(path: &Path) -> Result<(), String> {
     });
     Ok(())
 }
+fn validate_official_external_url(value: &str) -> Result<String, String> {
+    let parsed =
+        url::Url::parse(value).map_err(|error| format!("Invalid external URL: {error}"))?;
+    if parsed.scheme() != "https"
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.host_str(), Some("github.com" | "kytyps5.github.io"))
+    {
+        return Err("Only official KytyPS5 HTTPS pages can be opened externally".into());
+    }
+    Ok(parsed.to_string())
+}
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let url = validate_official_external_url(&url)?;
+    #[cfg(unix)]
+    let mut child = host_tool_command("xdg-open")
+        .arg(url)
+        .spawn()
+        .map_err(|error| format!("Could not open the link in the default browser: {error}"))?;
+    #[cfg(windows)]
+    let mut child = {
+        let system_root = env::var_os("SystemRoot")
+            .filter(|root| !root.is_empty())
+            .ok_or("Windows SystemRoot is unavailable")?;
+        let browser_launcher = PathBuf::from(system_root)
+            .join("System32")
+            .join("rundll32.exe");
+        if !browser_launcher.is_file() {
+            return Err("Windows URL launcher is unavailable under SystemRoot".into());
+        }
+        Command::new(browser_launcher)
+            .args(["url.dll,FileProtocolHandler", &url])
+            .spawn()
+            .map_err(|error| format!("Could not open the link in the default browser: {error}"))?
+    };
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
 #[tauri::command]
 fn open_repository_folder(app: tauri::AppHandle, id: i64) -> Result<(), String> {
     let c = db(&app)?;
@@ -5395,6 +5516,120 @@ fn github_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
         .body_mut()
         .read_json()
         .map_err(|error| format!("GitHub returned invalid JSON: {error}"))
+}
+#[derive(Deserialize)]
+struct GithubIssueSearchResponse {
+    items: Vec<GithubIssueSearchItem>,
+}
+#[derive(Deserialize)]
+struct GithubIssueSearchItem {
+    number: u64,
+    title: String,
+    state: String,
+    html_url: String,
+}
+#[derive(Serialize)]
+struct CompatibilityIssueMatch {
+    number: u64,
+    title: String,
+    state: String,
+    url: String,
+}
+fn compatibility_issue_search_url(title_id: &str) -> Result<String, String> {
+    let title_id = normalized_title_id(title_id)
+        .ok_or("A valid PPSA title ID is required to search existing reports")?;
+    let query = format!("repo:KytyPS5/KytyPS5 is:issue {title_id}");
+    let encoded = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("q", &query)
+        .append_pair("per_page", "8")
+        .finish();
+    Ok(format!("https://api.github.com/search/issues?{encoded}"))
+}
+#[tauri::command]
+fn search_compatibility_issues(title_id: String) -> Result<Vec<CompatibilityIssueMatch>, String> {
+    let response: GithubIssueSearchResponse =
+        github_json(&compatibility_issue_search_url(&title_id)?)?;
+    Ok(response
+        .items
+        .into_iter()
+        .filter_map(|issue| {
+            let expected_prefix = format!(
+                "https://github.com/KytyPS5/KytyPS5/issues/{}/",
+                issue.number
+            );
+            let valid_url = issue.html_url == expected_prefix.trim_end_matches('/')
+                || issue.html_url.starts_with(&expected_prefix);
+            valid_url.then_some(CompatibilityIssueMatch {
+                number: issue.number,
+                title: issue.title,
+                state: issue.state,
+                url: issue.html_url,
+            })
+        })
+        .collect())
+}
+#[derive(Deserialize)]
+struct GithubCreatedIssue {
+    number: u64,
+    html_url: String,
+}
+#[derive(Serialize)]
+struct CompatibilityIssueReceipt {
+    number: u64,
+    url: String,
+}
+#[tauri::command]
+fn create_compatibility_issue(
+    title: String,
+    body: String,
+) -> Result<CompatibilityIssueReceipt, String> {
+    const MAX_BODY_BYTES: usize = 60_000;
+    let title = title.trim();
+    if title.is_empty() || title.chars().count() > 256 || title.chars().any(char::is_control) {
+        return Err("Issue title must contain 1 to 256 printable characters".into());
+    }
+    if body.trim().is_empty() || body.len() > MAX_BODY_BYTES {
+        return Err("Issue body must be non-empty and no larger than 60,000 bytes".into());
+    }
+    let token = github_token()?.ok_or(
+        "Save a GitHub token with Issues read and write access before submitting a report",
+    )?;
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .new_agent();
+    let response = agent
+        .post("https://api.github.com/repos/KytyPS5/KytyPS5/issues")
+        .header("User-Agent", "KytyPS5-Studio")
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("Authorization", &format!("Bearer {token}"))
+        .send_json(serde_json::json!({ "title": title, "body": body }))
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("401") || message.contains("403") || message.contains("404") {
+                "GitHub denied issue creation. Check the token and grant it Issues read and write access to KytyPS5/KytyPS5.".to_string()
+            } else if message.contains("422") {
+                "GitHub rejected this issue report. Check its title and required fields.".to_string()
+            } else {
+                format!("Could not submit compatibility report to GitHub: {message}")
+            }
+        })?;
+    let issue: GithubCreatedIssue = response.into_body().read_json().map_err(|error| {
+        format!("GitHub created the issue but returned an unreadable response: {error}")
+    })?;
+    let url = validate_official_external_url(&issue.html_url)?;
+    if !url.starts_with(&format!(
+        "https://github.com/KytyPS5/KytyPS5/issues/{}/",
+        issue.number
+    )) && url != format!("https://github.com/KytyPS5/KytyPS5/issues/{}", issue.number)
+    {
+        return Err("GitHub returned an issue link outside the official KytyPS5 repository".into());
+    }
+    Ok(CompatibilityIssueReceipt {
+        number: issue.number,
+        url,
+    })
 }
 const APP_RELEASES_API: &str = "https://api.github.com/repos/Febsho/KytyPs5-Studio/releases/latest";
 const APP_RELEASES_DOWNLOAD_PREFIX: &str =
@@ -11009,7 +11244,7 @@ fn add_game_to_steam(app: tauri::AppHandle, game_id: i64, build_id: i64) -> Resu
 }
 
 #[tauri::command]
-fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<(), String> {
+fn launch_game(app: tauri::AppHandle, game_id: i64) -> Result<Vec<RemovedProfileOption>, String> {
     launch_game_impl(app, game_id, None, None)
 }
 #[tauri::command]
@@ -11018,7 +11253,7 @@ fn launch_game_ab(
     game_id: i64,
     build_id: i64,
     settings_build_id: i64,
-) -> Result<(), String> {
+) -> Result<Vec<RemovedProfileOption>, String> {
     launch_game_impl(app, game_id, Some(build_id), Some(settings_build_id))
 }
 fn launch_game_impl(
@@ -11026,7 +11261,7 @@ fn launch_game_impl(
     game_id: i64,
     requested_build_id: Option<i64>,
     settings_build_id: Option<i64>,
-) -> Result<(), String> {
+) -> Result<Vec<RemovedProfileOption>, String> {
     if SHADER_PRECOMPILE_ACTIVE.load(Ordering::Acquire) {
         return Err("Wait for shader precompilation to finish before launching a game".into());
     }
@@ -11041,7 +11276,7 @@ fn launch_game_impl(
     }
     let mut c = db(&app)?;
     let g = game(&c, game_id)?;
-    let game_profile = profile(&c, game_id)?;
+    let mut game_profile = profile(&c, game_id)?;
     let build_id = if let Some(id) = requested_build_id {
         id
     } else if let Some(id) = g.build_id {
@@ -11063,7 +11298,26 @@ fn launch_game_impl(
         && get_game_shader_precompile_enabled(&c, game_id, build_id)?;
     let capabilities = capabilities_for_build(&b, &selected_repo)?;
     let settings_build_id = settings_build_id.unwrap_or(build_id);
-    let settings_defaults = build_profile_options(&c, settings_build_id)?;
+    let mut settings_defaults = build_profile_options(&c, settings_build_id)?;
+    let mut removed_profile_options = Vec::new();
+    if requested_build_id.is_none() {
+        let removed_game = sanitize_saved_profile_options(
+            &mut game_profile.options,
+            &capabilities,
+            "game profile",
+        );
+        if !removed_game.is_empty() {
+            sync_legacy_profile_fields(&mut game_profile);
+            persist_game_profile(&c, game_id, &game_profile)?;
+            removed_profile_options.extend(removed_game);
+        }
+        let removed_build =
+            sanitize_saved_profile_options(&mut settings_defaults, &capabilities, "build defaults");
+        if !removed_build.is_empty() {
+            persist_build_profile_options(&c, build_id, &settings_defaults)?;
+            removed_profile_options.extend(removed_build);
+        }
+    }
     let mut effective_options = if settings_build_id == build_id {
         effective_profile_options(&settings_defaults, &game_profile.options, &capabilities)?
     } else {
@@ -11409,7 +11663,7 @@ fn launch_game_impl(
                 .is_ok_and(|(_, outcome)| outcome == "normal"),
         );
     });
-    Ok(())
+    Ok(removed_profile_options)
 }
 #[derive(Serialize)]
 struct ProcessMetric {
@@ -12461,6 +12715,7 @@ pub fn run() {
             check_app_update,
             install_app_update,
             list_repos,
+            open_external_url,
             open_repository_folder,
             list_builds,
             open_build_folder,
@@ -12485,6 +12740,8 @@ pub fn run() {
             save_github_token,
             delete_github_token,
             github_token_status,
+            search_compatibility_issues,
+            create_compatibility_issue,
             inspect_build_source,
             system_info,
             start_install_build_tools,
@@ -13397,6 +13654,66 @@ mod tests {
         );
         assert_eq!(query.get("page").unwrap(), "3");
         assert_eq!(query.get("per_page").unwrap(), "20");
+    }
+    #[test]
+    fn compatibility_issue_search_is_scoped_and_rejects_non_ps5_ids() {
+        let url = compatibility_issue_search_url("ppsa-01234").unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let query: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(
+            query.get("q").unwrap(),
+            "repo:KytyPS5/KytyPS5 is:issue PPSA01234"
+        );
+        assert_eq!(query.get("per_page").unwrap(), "8");
+        assert!(compatibility_issue_search_url("../PPSA01234").is_err());
+    }
+    #[test]
+    fn external_links_only_open_official_https_hosts() {
+        assert_eq!(
+            validate_official_external_url("https://github.com/KytyPS5/KytyPS5/issues/123")
+                .unwrap(),
+            "https://github.com/KytyPS5/KytyPS5/issues/123"
+        );
+        assert!(validate_official_external_url("http://github.com/KytyPS5/KytyPS5").is_err());
+        assert!(validate_official_external_url("https://example.com/issue").is_err());
+        assert!(validate_official_external_url("https://github.com.evil.example/").is_err());
+    }
+    #[test]
+    fn unsupported_saved_options_are_removed_but_supported_options_remain() {
+        let mut options = BTreeMap::from([
+            ("--screen-width".to_string(), "1920".to_string()),
+            ("--gpu".to_string(), "1".to_string()),
+        ]);
+        let capabilities = ProfileCapabilities {
+            screen_width: true,
+            screen_height: false,
+            present_mode: false,
+            perf_overlay: false,
+            fullscreen: false,
+            controller_color: false,
+            controller_volume: false,
+            controller_vibration: false,
+            keyboard_player: false,
+            options: vec!["--screen-width".into()],
+            available_options: vec!["--screen-width".into()],
+            verified_options: Vec::new(),
+            option_states: HashMap::new(),
+            binary_sha256: String::new(),
+            host_os: "linux".into(),
+            background_precompile: false,
+            switch_options: Vec::new(),
+            option_metadata: HashMap::new(),
+        };
+        let removed = sanitize_saved_profile_options(&mut options, &capabilities, "game profile");
+        assert_eq!(
+            options.get("--screen-width").map(String::as_str),
+            Some("1920")
+        );
+        assert!(!options.contains_key("--gpu"));
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].flag, "--gpu");
+        assert_eq!(removed[0].scope, "game profile");
+        assert!(removed[0].reason.contains("not available"));
     }
     #[test]
     fn github_search_pagination_stops_at_the_api_result_limit() {

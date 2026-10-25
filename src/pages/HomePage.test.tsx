@@ -15,11 +15,8 @@ function props(overrides: Partial<HomePageProps> = {}): HomePageProps {
     games: [],
     featuredGame: null,
     featuredBackground: null,
+    builds: [],
     repos: [],
-    system: null,
-    graphics: null,
-    specsOpen: false,
-    setSpecsOpen: vi.fn(),
     message: "",
     setPage: vi.fn(),
     choose: vi.fn().mockResolvedValue(undefined),
@@ -45,15 +42,6 @@ describe("HomePage", () => {
     expect(page.choose).toHaveBeenCalledWith("directory");
     fireEvent.click(screen.getByRole("button", { name: "Library" }));
     expect(page.setPage).toHaveBeenCalledWith("library");
-  });
-
-  it("opens diagnostics from the technical specifications drawer", () => {
-    const page = props({ specsOpen: true });
-    render(<HomePage {...page} />);
-
-    fireEvent.click(screen.getByRole("button", { name: "Open Diagnostics" }));
-    expect(page.setSpecsOpen).toHaveBeenCalledWith(false);
-    expect(page.setPage).toHaveBeenCalledWith("diagnostics");
   });
 
   it("shows the compatibility status in the bottom game details, not on its cover", () => {
@@ -83,5 +71,23 @@ describe("HomePage", () => {
     expect(badge.classList.contains("tone-in-game")).toBe(true);
     expect(badge.closest(".home-feature")).toBeTruthy();
     expect(document.querySelector(".home-game-art .compatibility-status-badge")).toBeNull();
+    expect(screen.queryByRole("button", { name: /technical specs/i })).toBeNull();
+  });
+
+  it("shows the featured game's preferred emulator instead of the globally active build", () => {
+    const game: Game = {
+      id: 7, path: "/games/preferred", title: "Preferred", favorite: false,
+      build_id: 2, play_seconds: 0, last_played: null, title_id: null,
+      game_version: null, icon_path: null, install_size: null, file_status: "Available",
+    };
+    const activeBuild = { id: 1, repo_id: 3, commit_sha: "active123456", active: true } as HomePageProps["active"];
+    const preferredBuild = { id: 2, repo_id: 4, commit_sha: "preferred123", active: false } as HomePageProps["builds"][number];
+    const repos = [
+      { id: 3, owner: "KytyPS5", name: "KytyPS5", url: "", branch: "main", source_path: null, adapter: "", installed_commit: null },
+      { id: 4, owner: "ExampleFork", name: "KytyPS5", url: "", branch: "main", source_path: null, adapter: "", installed_commit: null },
+    ];
+    render(<HomePage {...props({ games: [game], featuredGame: game, active: activeBuild, builds: [activeBuild!, preferredBuild], repos })} />);
+    expect(screen.getByText(/ExampleFork.*#preferre/i)).toBeTruthy();
+    expect(screen.queryByText(/KytyPS5.*#active123/i)).toBeNull();
   });
 });

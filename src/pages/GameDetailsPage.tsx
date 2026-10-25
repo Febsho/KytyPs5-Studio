@@ -21,6 +21,9 @@ import type {
 import { date, emulatorBuildName, formatBytes, short } from "../utils/format";
 import { trophyGrade, trophyGrades } from "../utils/trophies";
 import { compatibilityOsLabel, compatibilityStatusLabel, currentCompatibilityOS, normalizeTitleId, officialCompatibilityForGame, recommendVerifiedBuild } from "../utils/compatibility";
+import type { System, GraphicsDiagnostics } from "../types/studio";
+import { CompatibilityReportDialog } from "../components/compatibility/CompatibilityReportDialog";
+import type { CompatibilityIssueLink } from "../utils/compatibilityReport";
 
 type Tab = "Overview" | "Settings" | "Compatibility" | "Logs" | "Trophies" | "Patches" | "Save Data";
 type SaveEntry = { id:string; title_id:string; user_id:string|null; slot:string; build_id:number; build_name:string; game_version:string|null; path:string; size_bytes:number; modified_at:number|null; layout:string };
@@ -74,6 +77,14 @@ export type GameDetailsPageProps = {
   onImportCustomPatch?: (gameId:number) => Promise<{path:string;content:string} | null>;
   onSaveCustomPatch?: (gameId:number, content:string) => Promise<string>;
   onSetGamePatchModEnabled?: (gameId:number, modIndex:number, enabled:boolean) => Promise<{content:GameContent;patchJson:string}>;
+  system?: System | null;
+  graphics?: GraphicsDiagnostics | null;
+  githubTokenAvailable?: boolean;
+  onOpenOfficialDatabase?: () => void;
+  onSearchCompatibilityIssues?: (titleId: string) => Promise<CompatibilityIssueLink[]>;
+  onReadSessionLog?: (session: Session) => Promise<string>;
+  onSubmitCompatibilityIssue?: (title: string, body: string) => Promise<{ number: number; url: string }>;
+  onOpenExternalUrl?: (url: string) => Promise<void>;
 };
 
 export function GameDetailsPage({
@@ -122,6 +133,14 @@ export function GameDetailsPage({
   onImportCustomPatch,
   onSaveCustomPatch,
   onSetGamePatchModEnabled,
+  system = null,
+  graphics = null,
+  githubTokenAvailable = false,
+  onOpenOfficialDatabase,
+  onSearchCompatibilityIssues,
+  onReadSessionLog,
+  onSubmitCompatibilityIssue,
+  onOpenExternalUrl,
 }: GameDetailsPageProps) {
   const [content, setContent] = useState<GameContent | null>(null);
   const [contentError, setContentError] = useState("");
@@ -133,6 +152,7 @@ export function GameDetailsPage({
   const [customPatchDraft, setCustomPatchDraft] = useState("");
   const [customPatchError, setCustomPatchError] = useState("");
   const [customPatchBusy, setCustomPatchBusy] = useState(false);
+  const [compatibilityReportOpen, setCompatibilityReportOpen] = useState(false);
   const [patchToggleBusy, setPatchToggleBusy] = useState(false);
   const [patchToggleError, setPatchToggleError] = useState("");
   const [customPatchPath, setCustomPatchPath] = useState("");
@@ -815,9 +835,9 @@ export function GameDetailsPage({
                     {report.source?.url && <a href={report.source.url} target="_blank" rel="noreferrer">{report.source.label || "Open source report"}</a>}
                   </article>)}
                 </div> : officialCompatibilityDetails && <p className="hint">The official index has a status, but no detailed report is published for this exact title ID.</p>}
-                <a className="official-database-link" href="https://kytyps5.github.io/compatibility/" target="_blank" rel="noreferrer">Open official compatibility database</a>
               </>;
             })()}
+            <button className="official-database-link" type="button" onClick={() => onOpenOfficialDatabase?.()}>Open official compatibility database</button>
           </section>
           <h2>Compatibility evidence</h2>
           <div className="kv">
@@ -855,6 +875,7 @@ export function GameDetailsPage({
             compatibility.
           </p>
           <h3>Your test observations</h3>
+          {currentGame.title_id && onSearchCompatibilityIssues && onReadSessionLog && onSubmitCompatibilityIssue && onOpenExternalUrl && <button type="button" className="compat-report-open" onClick={() => setCompatibilityReportOpen(true)}>Prepare GitHub game status report</button>}
           <div className="formgrid">
             <div>
               <label htmlFor="compatibility-outcome">Outcome observed</label>
@@ -908,6 +929,13 @@ export function GameDetailsPage({
           ))}
         </div>
       )}
+      {compatibilityReportOpen && onSearchCompatibilityIssues && onReadSessionLog && onSubmitCompatibilityIssue && onOpenExternalUrl && <CompatibilityReportDialog
+        game={currentGame} builds={builds} repos={repos} system={system} graphics={graphics}
+        observations={compatibilityObservations} sessions={sessions} githubTokenAvailable={githubTokenAvailable}
+        onSearchIssues={onSearchCompatibilityIssues} onReadLog={onReadSessionLog}
+        onSubmit={onSubmitCompatibilityIssue} onOpenUrl={onOpenExternalUrl}
+        onClose={() => setCompatibilityReportOpen(false)}
+      />}
       {gameDetailsTab === "Logs" && (
         <div className="panel">
           <h2>Recent session logs</h2>

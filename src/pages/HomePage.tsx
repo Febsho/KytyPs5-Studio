@@ -5,9 +5,7 @@ import type {
   Build,
   Game,
   GameContent,
-  GraphicsDiagnostics,
   Repo,
-  System,
   OfficialCompatibilityIndex,
 } from "../types/studio";
 import { GameContextMenu, VirtualHomeGameRow } from "../components/games/GameLibrary";
@@ -32,11 +30,8 @@ export type HomePageProps = {
   featuredLogo?: string | null;
   featuredBackground: string | null;
   active?: Build;
+  builds: Build[];
   repos: Repo[];
-  system: System | null;
-  graphics: GraphicsDiagnostics | null;
-  specsOpen: boolean;
-  setSpecsOpen: Dispatch<SetStateAction<boolean>>;
   message: string;
   setPage: Dispatch<SetStateAction<Page>>;
   choose: (kind: "file" | "directory") => Promise<void>;
@@ -60,11 +55,8 @@ export function HomePage({
   featuredLogo,
   featuredBackground,
   active,
+  builds,
   repos,
-  system,
-  graphics,
-  specsOpen,
-  setSpecsOpen,
   message,
   setPage,
   choose,
@@ -80,6 +72,7 @@ export function HomePage({
 }: HomePageProps) {
   const [trophyProgress, setTrophyProgress] = useState<ReturnType<typeof trophySummary> | null>(null);
   const [contextMenu, setContextMenu] = useState<{ game: Game; x: number; y: number } | null>(null);
+  const featuredBuild = builds.find((build) => build.id === featuredGame?.build_id) ?? active;
   useEffect(() => {
     if (!featuredGame || !inspectGameContent) { setTrophyProgress(null); return; }
     let current = true;
@@ -194,15 +187,12 @@ export function HomePage({
               Import Game Folder
             </button>
           )}
-          <button className="spec-link" onClick={() => setSpecsOpen(true)}>
-            <Activity size={14} /> Technical Specs
-          </button>
         </div>
         <div className="home-status-line">
           <span>
             <i className="statusdot" />
-            {active
-              ? emulatorBuildName(repos.find((repo) => repo.id === active.repo_id), active)
+            {featuredBuild
+              ? emulatorBuildName(repos.find((repo) => repo.id === featuredBuild.repo_id), featuredBuild)
               : "No verified emulator build"}
           </span>
           {message.includes("Update available:") && (
@@ -234,74 +224,6 @@ export function HomePage({
             onRemoveGame(game.id);
           } : undefined}
         />
-      )}
-      {specsOpen && (
-        <div className="drawer-backdrop" onClick={() => setSpecsOpen(false)}>
-          <aside
-            className="spec-drawer"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <button
-              className="drawer-close outline"
-              onClick={() => setSpecsOpen(false)}
-            >
-              Close
-            </button>
-            <small className="eyebrow">SYSTEM / TECHNICAL SPECIFICATIONS</small>
-            <h2>System Status</h2>
-            <div className="technical-row">
-              <span>Operating system</span>
-              <strong>
-                {system?.os || "Unavailable"} · {system?.arch || "—"}
-              </strong>
-            </div>
-            <div className="technical-row">
-              <span>Processor</span>
-              <strong>{system?.cpu || "Unavailable"}</strong>
-            </div>
-            <div className="technical-row">
-              <span>Graphics device</span>
-              <strong>{system?.gpu || "Unavailable"}</strong>
-            </div>
-            <div className="technical-row">
-              <span>Vulkan</span>
-              <strong>{graphics?.vulkan_status || "Not checked"}</strong>
-            </div>
-            <div className="technical-row">
-              <span>Graphics driver</span>
-              <strong>{graphics?.drivers.join(", ") || "Not detected"}</strong>
-            </div>
-            <div className="technical-row">
-              <span>Memory available</span>
-              <strong>
-                {system
-                  ? `${(system.memory_available_bytes / 1024 ** 3).toFixed(1)} / ${(system.memory_total_bytes / 1024 ** 3).toFixed(1)} GB`
-                  : "Unavailable"}
-              </strong>
-            </div>
-            <div className="technical-row">
-              <span>Active emulator</span>
-              <strong>
-                {active
-                  ? `${emulatorBuildName(repos.find((repo) => repo.id === active.repo_id), active)} · ${active.build_type}`
-                  : "None"}
-              </strong>
-            </div>
-            <div className="technical-row">
-              <span>Display session</span>
-              <strong>{system?.session || "Unavailable"}</strong>
-            </div>
-            <button
-              className="outline"
-              onClick={() => {
-                setSpecsOpen(false);
-                setPage("diagnostics");
-              }}
-            >
-              Open Diagnostics
-            </button>
-          </aside>
-        </div>
       )}
     </section>
   );

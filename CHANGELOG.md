@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.3
+
+### Game patches
+
+- Fix patch option rows so checkboxes stay compact and patch names remain readable across the available panel width.
+
 ## 0.9.2
 
 ### Game library and trophies

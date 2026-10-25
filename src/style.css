@@ -4401,10 +4401,11 @@ main {
 .patch-json-editor { width: min(100%, 900px); min-height: 220px; padding: 12px; resize: vertical; border: 1px solid var(--studio-border); border-radius: 7px; background: var(--studio-bg); color: var(--studio-text); font: 12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .cheat-row { display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 10px 0; border-bottom: 1px solid var(--studio-border); }
 .cheat-row span { color: var(--studio-muted); }
-.game-patch-toggle { display: flex; align-items: flex-start; gap: 10px; padding: 11px 4px; border-bottom: 1px solid var(--studio-border); cursor: pointer; }
-.game-patch-toggle input { margin-top: 3px; accent-color: var(--studio-accent); }
-.game-patch-toggle > span { display: grid; gap: 4px; }
-.game-patch-toggle small { color: var(--studio-muted); }
+.game-patch-toggle { display: flex; align-items: flex-start; gap: 10px; padding: 11px 4px; border-bottom: 1px solid var(--studio-border); cursor: pointer; text-transform: none; letter-spacing: normal; }
+.game-patch-toggle input { flex: 0 0 16px; width: 16px; height: 16px; margin: 3px 0 0; accent-color: var(--studio-accent); }
+.game-patch-toggle > span { display: grid; flex: 1; min-width: 0; gap: 4px; }
+.game-patch-toggle strong { overflow-wrap: anywhere; line-height: 1.4; }
+.game-patch-toggle small { color: var(--studio-muted); overflow-wrap: anywhere; }
 .session-inline-log pre { max-height: 420px; overflow: auto; }
 .repo-grid .card { position: relative; padding-bottom: 44px; }
 .repo-remove-button { position: absolute; right: 10px; bottom: 9px; min-height: 28px; padding: 4px 8px; }

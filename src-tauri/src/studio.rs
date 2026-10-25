@@ -14499,7 +14499,7 @@ mod tests {
     }
     #[test]
     fn inherited_graphics_and_input_options_are_validated_and_passed_as_arguments() {
-        let capabilities = profile_capabilities(
+        let capabilities = verified_profile_capabilities(
             "--screen-width <num> Width\n--screen-height <num> Height\n--present-mode <value> Mode\n--perf-overlay <true|false> Overlay\n--fullscreen Fullscreen\n--controller-volume <0-100> Volume\n",
         );
         let options = BTreeMap::from([
@@ -14533,8 +14533,9 @@ mod tests {
     fn guest_printf_output_can_be_a_new_file_but_user_ids_follow_upstream_limits() {
         let dir = std::env::temp_dir().join(format!("kyty-printf-{}", now()));
         fs::create_dir_all(&dir).unwrap();
-        let caps =
-            profile_capabilities("  --printf-output-file <path> Output\n  --user-id <num> User\n");
+        let caps = verified_profile_capabilities(
+            "  --printf-output-file <path> Output\n  --user-id <num> User\n",
+        );
         let options = BTreeMap::from([
             (
                 "--printf-output-file".into(),

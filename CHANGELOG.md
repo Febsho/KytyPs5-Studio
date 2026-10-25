@@ -10,6 +10,7 @@
 - Filter stale inherited settings before launch, Steam shortcut generation, and A/B comparison; preserve each game's saved options for compatible builds.
 - Verify background shader precompile support from source usage instead of guessing from a repository name, and identify full offline precompile only when its required assets are present.
 - Use the upstream `--no-trophy-notifications` switch and enforce its duration dependency.
+- Accept safe nonnumeric trophy service labels while keeping the account ID numeric.
 
 ### Release
 

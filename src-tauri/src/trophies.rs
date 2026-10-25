@@ -38,7 +38,12 @@ struct TrophyManifest {
 fn parse_filename(name: &str) -> Option<(String, String)> {
     let stem = name.strip_prefix("trophies_")?.strip_suffix(".json")?;
     let (user, service) = stem.split_once('_')?;
-    if user.parse::<u32>().is_err() || service.parse::<u32>().is_err() {
+    if user.parse::<u32>().is_err()
+        || service.is_empty()
+        || !service
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
         return None;
     }
     Some((user.to_string(), service.to_string()))
@@ -737,6 +742,8 @@ mod tests {
             Some(("1000".into(), "2_extra".into()))
         );
         assert!(parse_filename("trophies_user_2.json").is_none());
+        assert!(parse_filename("trophies_1000_.json").is_none());
+        assert!(parse_filename("trophies_1000_../escape.json").is_none());
     }
     #[test]
     fn parses_preserving_json_ids() {

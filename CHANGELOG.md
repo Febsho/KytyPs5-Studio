@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.4
+
+### Game hub and trophies
+
+- Refine game selection transitions, featured actions, and trophy rows with a cleaner console-inspired presentation. Respect reduced-motion preferences.
+- Clear outdated trophy and patch information while loading a different game.
+- Correct the description of automatic save synchronization and keep context menus inside the window.
+- Remove the Add to Steam action from the game hub, library, and game details.
+
 ## 1.4.3
 
 ### Steam shortcuts

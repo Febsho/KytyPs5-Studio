@@ -45,7 +45,6 @@ export type HomePageProps = {
   setHomeSelection: Dispatch<SetStateAction<number | null>>;
   inspectGameContent?: (gameId:number) => Promise<GameContent>;
   onRemoveGame?: (gameId: number) => void;
-  onAddToSteam?: (game: Game) => void;
   runningGameId?: number;
   onShowRunningSession?: () => void;
 };
@@ -68,7 +67,6 @@ export function HomePage({
   setHomeSelection,
   inspectGameContent,
   onRemoveGame,
-  onAddToSteam,
   runningGameId,
   onShowRunningSession,
 }: HomePageProps) {
@@ -226,10 +224,6 @@ export function HomePage({
             if (selectGameWithGuard(game.id) === false) return;
             setGameDetailsTab("Overview");
             setPage("game-details");
-          }}
-          onAddToSteam={(game) => {
-            setContextMenu(null);
-            onAddToSteam?.(game);
           }}
           onRemove={onRemoveGame ? (game) => {
             setContextMenu(null);

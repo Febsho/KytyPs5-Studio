@@ -53,7 +53,6 @@ export type GameLibraryPageProps = {
   onToggleFavorite: (id: number) => void;
   onSetPreferredBuild: (id: number | null) => void;
   onRemoveGame?: (id: number) => void;
-  onAddToSteam?: (game: Game) => void;
 };
 
 export function GameLibraryPage({
@@ -85,7 +84,6 @@ export function GameLibraryPage({
   onToggleFavorite,
   onSetPreferredBuild,
   onRemoveGame,
-  onAddToSteam,
 }: GameLibraryPageProps) {
   const [contextMenu, setContextMenu] = useState<{ game: Game; x: number; y: number } | null>(null);
   const [trophyProgress, setTrophyProgress] = useState<ReturnType<typeof trophySummary> | null>(null);
@@ -313,10 +311,6 @@ export function GameLibraryPage({
           onDetails={(game) => {
             setContextMenu(null);
             if (onSelectGame(game.id) !== false) onOpenDetails();
-          }}
-          onAddToSteam={(game) => {
-            setContextMenu(null);
-            onAddToSteam?.(game);
           }}
           onOpenFolder={onOpenFolderForGame ? (game) => {
             setContextMenu(null);

@@ -71,7 +71,6 @@ import { GameDetailsPage } from "../pages/GameDetailsPage";
 import { BuildStudioPage } from "../pages/BuildStudioPage";
 import { EmulatorManagerPage } from "../pages/EmulatorManagerPage";
 import { GameLibraryPage } from "../pages/GameLibraryPage";
-import { SteamShortcutDialog } from "../components/games/SteamShortcutDialog";
 import { TextPromptDialog } from "../components/common/TextPromptDialog";
 import { SettingsPage } from "../pages/SettingsPage";
 import { LauncherSessionModal } from "../components/emulator/LauncherSessionModal";
@@ -137,9 +136,6 @@ export function App() {
     },
   );
   const [dragActive, setDragActive] = useState(false);
-  const [steamGame, setSteamGame] = useState<Game | null>(null);
-  const [steamBuildId, setSteamBuildId] = useState<number | null>(null);
-  const [steamBusy, setSteamBusy] = useState(false);
   const [renameCommunityBuild, setRenameCommunityBuild] = useState<CommunityBuildHistoryEntry | null>(null);
   const [controllerRemapOpen, setControllerRemapOpen] = useState(false);
   const controllerRemappingEnabled = false;
@@ -1181,28 +1177,6 @@ export function App() {
       setMessage(String(error));
     }
   };
-  const addGameToSteam = async (game: Game) => {
-    const preferredBuild = game.build_id ?? builds.find((build) => build.active)?.id ?? builds[0]?.id ?? null;
-    setSteamBuildId(preferredBuild);
-    setSteamGame(game);
-  };
-  const confirmAddGameToSteam = async () => {
-    if (!steamGame || steamBuildId === null) return;
-    setSteamBusy(true);
-    setMessage(`Adding ${steamGame.title} to Steam…`);
-    try {
-      const result = await call<string>("add_game_to_steam", {
-        gameId: steamGame.id,
-        buildId: steamBuildId,
-      });
-      setMessage(result);
-    } catch (error) {
-      setMessage(`Could not add ${steamGame.title} to Steam: ${String(error)}`);
-    } finally {
-      setSteamBusy(false);
-      setSteamGame(null);
-    }
-  };
   const importDroppedPaths = async (paths: string[]) => {
     let imported = 0;
     let alreadyRegistered = 0;
@@ -2017,7 +1991,6 @@ export function App() {
               setPage={setPage}
               choose={choose}
               launchGame={launchGame}
-              onAddToSteam={addGameToSteam}
               selectGameWithGuard={selectGameWithGuard}
               setGameDetailsTab={setGameDetailsTab}
               setHomeSelection={setHomeSelection}
@@ -2535,7 +2508,6 @@ export function App() {
                 action(() => call("open_game_folder", { gameId: game.id }))
               }
               onLaunch={(id) => void launchGame(id)}
-              onAddToSteam={addGameToSteam}
               onToggleFavorite={(id) =>
                 action(() => call("toggle_favorite", { gameId: id }))
               }
@@ -2618,7 +2590,6 @@ export function App() {
                 launchGameAB(gameId, buildId, settingsBuildId)
               }
               activeSessions={gameRunning || sessions.some((session) => session.ended_at === null)}
-              onAddToSteam={addGameToSteam}
               onOpenGameFolder={() =>
                 action(() =>
                   call("open_game_folder", { gameId: currentGame.id }),
@@ -2874,18 +2845,6 @@ export function App() {
               mapping={controllerMapping}
               onSave={saveControllerMapping}
               onClose={() => setControllerRemapOpen(false)}
-            />
-          )}
-          {steamGame && (
-            <SteamShortcutDialog
-              game={steamGame}
-              builds={builds}
-              repos={repos}
-              selectedBuildId={steamBuildId}
-              busy={steamBusy}
-              onSelectBuild={setSteamBuildId}
-              onAdd={() => void confirmAddGameToSteam()}
-              onClose={() => { if (!steamBusy) setSteamGame(null); }}
             />
           )}
           {renameCommunityBuild && (

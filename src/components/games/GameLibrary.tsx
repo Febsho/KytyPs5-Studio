@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
-import { Gamepad2, Trash2, ExternalLink, FolderOpen } from "lucide-react";
+import { Gamepad2, Trash2, FolderOpen } from "lucide-react";
 import type { Game, OfficialCompatibilityIndex } from "../../types/studio";
 import { getGridColumnCount, getVirtualWindow } from "./virtualWindow";
 import { date, formatBytes } from "../../utils/format";
@@ -14,7 +14,6 @@ export function GameContextMenu({
   y,
   onClose,
   onDetails,
-  onAddToSteam,
   onOpenFolder,
   onRemove,
 }: {
@@ -23,7 +22,6 @@ export function GameContextMenu({
   y: number;
   onClose: () => void;
   onDetails: (game: Game) => void;
-  onAddToSteam?: (game: Game) => void;
   onOpenFolder?: (game: Game) => void;
   onRemove?: (game: Game) => void;
 }) {
@@ -48,16 +46,11 @@ export function GameContextMenu({
       className="game-context-menu"
       role="menu"
       aria-label={`${game.title} actions`}
-      style={{ left: Math.min(x, window.innerWidth - 216), top: Math.min(y, window.innerHeight - 180) }}
+      style={{ left: Math.max(0, Math.min(x, window.innerWidth - 216)), top: Math.max(0, Math.min(y, window.innerHeight - 180)) }}
     >
       <button role="menuitem" onClick={() => onDetails(game)}>
         Game details
       </button>
-      {onAddToSteam && (
-        <button role="menuitem" onClick={() => onAddToSteam(game)}>
-          <ExternalLink size={14} /> Add to Steam
-        </button>
-      )}
       {onOpenFolder && (
         <button role="menuitem" onClick={() => onOpenFolder(game)}>
           <FolderOpen size={14} /> Open game folder

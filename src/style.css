@@ -5133,3 +5133,30 @@ textarea:focus {
 .game-details-page .official-platform-result { min-height: 76px; align-content: center; padding: 14px; border-color: #303844; background: linear-gradient(145deg, #10141a, #0a0d11); }
 .game-details-page .official-platform-result.preferred { border-color: #536274; box-shadow: inset 0 0 0 1px #53627440; }
 @media (max-width: 600px) { .compat-report-fields { grid-template-columns: 1fr; } .compat-report-fields label:nth-child(n) { grid-column: auto; } .compat-report-dialog { max-height: 94vh; padding: 16px; } .compat-report-dialog > header { top: -16px; margin: -16px -16px 0; padding: 16px; } .compat-report-actions { bottom: -16px; margin: 0 -16px -16px; padding: 12px 16px 16px; } .game-details-page .build-comparison-2 { padding: 14px; } }
+
+/* Game hub and trophy presentation */
+.home-game-art { transition: transform 220ms ease, filter 220ms ease, box-shadow 220ms ease; }
+.home-game-tile:hover .home-game-art, .home-game-tile.selected .home-game-art { box-shadow: 0 12px 32px #0009; }
+.home-feature .primary { border-radius: 999px; }
+.home-feature .ghost { border-radius: 999px; background: #ffffff18; }
+.game-details-header { overflow: hidden; }
+.details-tabs { overflow-x: auto; scrollbar-width: thin; }
+.details-tabs button { white-space: nowrap; }
+.trophy-grid { grid-template-columns: 1fr; gap: 8px; }
+.trophy-item { min-height: 100px; justify-content: center; padding: 16px 20px 16px 82px; border-color: #ffffff1c; border-radius: 8px; background: linear-gradient(110deg, #ffffff12, #ffffff05); box-shadow: none; transition: background 180ms ease, border-color 180ms ease; }
+.trophy-item:hover { background: linear-gradient(110deg, #ffffff20, #ffffff0a); border-color: #ffffff40; }
+.trophy-item::before { left: 20px; top: 50%; transform: translateY(-50%); }
+.trophy-platinum.trophy-item::before { transform: translateY(-50%) rotate(45deg) scale(.78); }
+.trophy-item strong { color: var(--studio-text); }
+.trophy-item-top { flex-wrap: wrap; }
+.trophy-progress-manager { overflow-wrap: anywhere; }
+@media (prefers-reduced-motion: reduce) {
+  .home-game-art, .trophy-item { transition: none; }
+}
+.trophy-item.trophy-bronze { --trophy-color: #c88955; }
+.trophy-item.trophy-silver { --trophy-color: #b9c3d0; }
+.trophy-item.trophy-gold { --trophy-color: #e5bd51; }
+.trophy-item.trophy-platinum { --trophy-color: #75d7e8; }
+.trophy-item.trophy-other { --trophy-color: var(--studio-accent-soft); }
+.trophy-item::before { color: var(--trophy-color); }
+.trophy-item .trophy-grade { color: var(--trophy-color); }

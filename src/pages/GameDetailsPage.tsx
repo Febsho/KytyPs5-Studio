@@ -55,7 +55,6 @@ export type GameDetailsPageProps = {
   onLaunch: (gameId: number) => void;
   onLaunchBuildAB?: (gameId: number, buildId: number, settingsBuildId: number) => void | Promise<void>;
   activeSessions?: boolean;
-  onAddToSteam?: (game: Game) => void;
   onOpenGameFolder: () => void;
   onRefreshMetadata: () => void;
   onRemoveEntry: () => void;
@@ -111,7 +110,6 @@ export function GameDetailsPage({
   onLaunch,
   onLaunchBuildAB,
   activeSessions = false,
-  onAddToSteam,
   onOpenGameFolder,
   onRefreshMetadata,
   onRemoveEntry,
@@ -210,6 +208,8 @@ export function GameDetailsPage({
   useEffect(() => {
     if ((gameDetailsTab !== "Trophies" && gameDetailsTab !== "Patches") || !onInspectContent) return;
     let current = true;
+    setContent(null);
+    setContentError("");
     void onInspectContent(currentGame.id).then((result) => { if (current) { setContent(result); setContentError(""); } }).catch((error) => { if (current) setContentError(String(error)); });
     return () => { current = false; };
   }, [gameDetailsTab, currentGame.id, currentGame.build_id, onInspectContent]);
@@ -335,11 +335,6 @@ export function GameDetailsPage({
           >
             Settings
           </button>
-          {onAddToSteam && (
-            <button className="outline" onClick={() => onAddToSteam(currentGame)}>
-              Add to Steam
-            </button>
-          )}
           <button
             className="primary"
             disabled={currentGame.file_status === "Missing"}
@@ -368,7 +363,7 @@ export function GameDetailsPage({
         )}
       </nav>
       {gameDetailsTab === "Save Data" && <div className="panel save-data-panel">
-        <div className="game-overview-heading"><div><span className="eyebrow">PER-GAME STORAGE</span><h2>Save Data</h2><p>On launch, Studio automatically uses the save from the build you played most recently. A different save already in the selected build is backed up before replacement. ZIP export and import remain available for manual transfers; Studio app updates keep your saves.</p></div><button className="outline" disabled={saveBusy || activeSessions} onClick={() => void detectSaves()}>{saveBusy ? "Working…" : "Detect saves"}</button></div>
+        <div className="game-overview-heading"><div><span className="eyebrow">PER-GAME STORAGE</span><h2>Save Data</h2><p>On launch, Studio automatically copies missing save slots from the most recently played build. Existing saves are never overwritten. ZIP export and import remain available for manual transfers; Studio app updates keep your saves.</p></div><button className="outline" disabled={saveBusy || activeSessions} onClick={() => void detectSaves()}>{saveBusy ? "Working…" : "Detect saves"}</button></div>
         {activeSessions && <p className="hint">Close all emulator sessions before changing save data.</p>}
         <div className="save-data-settings"><label className="save-auto-backup"><input type="checkbox" checked={autoBackup} onChange={async(e)=>{const enabled=e.currentTarget.checked;setAutoBackup(enabled);try{await invoke("set_setting",{key:"save_data_auto_backup",value:String(enabled)});}catch(error){setAutoBackup(!enabled);setSaveError(String(error));}}}/> Create deduplicated backups after each completed game session</label><div className="buttonrow"><span className="path">{backupDirectory || "Studio app data / save-backups"}</span><button className="outline" disabled={saveBusy} onClick={async()=>{const selected=await nativeOpen({directory:true,multiple:false,title:"Choose save backup folder"});if(typeof selected!=="string")return;try{const path=await invoke<string>("set_save_backup_directory",{path:selected});setBackupDirectory(path);setSaveNotice(`Backup destination changed to ${path}`);}catch(error){setSaveError(String(error));}}}>Choose backup folder</button></div><div className="buttonrow"><label>Keep backups for <input aria-label="Backup retention days" type="number" min={1} max={3650} value={retentionDays} onChange={(e)=>setRetentionDays(e.currentTarget.value)} onBlur={()=>{const days=Math.max(1,Math.min(3650,Number(retentionDays)||90));setRetentionDays(String(days));void invoke("set_setting",{key:"save_data_retention_days",value:String(days)}).catch((error)=>setSaveError(String(error)));}}/> days</label><button className="outline" disabled={saveBusy || activeSessions} onClick={async()=>{const days=Math.max(1,Math.min(3650,Number(retentionDays)||90));if(!await nativeConfirm(`Remove verified backups older than ${days} days? The newest verified backup for each build, user and slot will be kept.`,{title:"Clean save backup history",kind:"warning",okLabel:"Clean old backups"}))return;setSaveBusy(true);try{const bytes=await invoke<number>("clean_save_backups",{gameId:currentGame.id,retentionDays:days});setSaveNotice(`Removed ${formatBytes(bytes)} of old verified backups.`);await detectSaves();}catch(error){setSaveError(String(error));}finally{setSaveBusy(false);}}}>Clean old backups…</button></div><label className="save-point-name">Restore point name <input value={restorePointName} maxLength={64} placeholder="e.g. Before boss fight" onChange={(e)=>setRestorePointName(e.currentTarget.value)}/></label></div>
         {saveError && <p className="error-text">{saveError}</p>}{saveNotice && <p className="hint">{saveNotice}</p>}

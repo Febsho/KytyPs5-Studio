@@ -169,7 +169,10 @@ jobs:
             if (-not $windowReady) { throw 'App did not create a main window before the update test' }
             $update = Start-Process -FilePath $installer.FullName -ArgumentList @('/S', '/UPDATE', "/D=$installPath") -PassThru
             if ($update.WaitForExit(1000)) {
-              throw 'In-place update completed while the application executable was still running'
+              $appProcess.Refresh()
+              if (-not $appProcess.HasExited) {
+                throw 'In-place update completed while the application executable was still running'
+              }
             }
             $appProcess.Refresh()
             # The updater can ask the running app to close while the NSIS
@@ -186,6 +189,10 @@ jobs:
           }
           if ($update.ExitCode -ne 0) { throw "NSIS in-place update failed with exit code $($update.ExitCode)" }
           if (-not (Test-Path $app)) { throw "Updated application was not found at $app" }
+          $builtApp = 'src-tauri/target/release/kytyps5-studio.exe'
+          if ((Get-FileHash $app -Algorithm SHA256).Hash -ne (Get-FileHash $builtApp -Algorithm SHA256).Hash) {
+            throw 'In-place update did not install the newly built executable'
+          }
           $database = Join-Path $env:LOCALAPPDATA 'kytyps5-studio/studio.sqlite3'
           if (-not (Test-Path $database -PathType Leaf)) {
             throw "In-place update did not preserve the user database: $database"

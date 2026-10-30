@@ -62,6 +62,16 @@ function props(overrides: Partial<SettingsPageProps> = {}): SettingsPageProps {
 }
 
 describe("SettingsPage", () => {
+  it("groups available build options without exposing unsupported controls", () => {
+    render(<SettingsPage {...props({ globalUnsupported: false })} />);
+
+    expect(screen.getByRole("heading", { name: "Graphics" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "System" })).toBeTruthy();
+    expect(screen.getByLabelText("Screen width")).toBeTruthy();
+    expect(screen.getByLabelText("Local username")).toBeTruthy();
+    expect(screen.queryByLabelText("Request HDR10 output")).toBeNull();
+  });
+
   it("describes Windows storage and credential services on Windows", () => {
     vi.stubGlobal("navigator", { userAgent: "Windows NT 10.0; Win64; x64" });
     render(<SettingsPage {...props()} />);

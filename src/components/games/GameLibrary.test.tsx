@@ -37,7 +37,7 @@ const compatibilityIndex: OfficialCompatibilityIndex = {
     status: "playable",
     preferred_os: "linux",
     os: { linux: "playable" },
-    report_counts: {},
+    report_counts: { linux: 1 },
     latest_tested: null,
   }],
 };
@@ -89,6 +89,13 @@ describe("VirtualGameGrid", () => {
     expect(badge.closest(".game-card-title-row")).toBeTruthy();
     expect(document.querySelector(".game-art .compatibility-status-badge")).toBeNull();
     expect(screen.getByRole("button", { name: "Game 1, Linux · Playable compatibility" })).toBeTruthy();
+    expect(screen.getByText(/1 report$/)).toBeTruthy();
+  });
+
+  it("shows compatibility below the artwork in grid mode", () => {
+    render(<VirtualGameGrid games={[{ ...games[0], title_id: "PPSA12345" }]} selectedId={1} onSelect={vi.fn()} officialCompatibilityIndex={compatibilityIndex} mode="grid" />);
+    expect(screen.getByText("Playable").closest(".game-card-title-row")).toBeTruthy();
+    expect(document.querySelector(".game-art .compatibility-status-badge")).toBeNull();
   });
 
   it("renders a bounded visible window and advances to the scrolled rows", () => {

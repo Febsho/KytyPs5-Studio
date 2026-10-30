@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GameLibraryPageProps } from "./GameLibraryPage";
 import { GameLibraryPage } from "./GameLibraryPage";
@@ -20,7 +20,7 @@ const game: Game = {
   file_status: "Available",
 };
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.useRealTimers(); });
 
 function props(
   overrides: Partial<GameLibraryPageProps> = {},
@@ -55,6 +55,19 @@ function props(
 }
 
 describe("GameLibraryPage", () => {
+  it("reloads trophy progress when the selected build changes without decoding icons", async () => {
+    vi.useFakeTimers();
+    const inspectGameContent = vi.fn().mockResolvedValue({ trophies: [{ id: "1", grade: "B", hidden: false, name: "One", detail: "", unlocked: true }], trophy_unlock_state: "available", patches: [], patch_source: null, patch_error: null });
+    const page = props({ inspectGameContent });
+    const view = render(<GameLibraryPage {...page} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(800); });
+    expect(inspectGameContent).toHaveBeenLastCalledWith(game.id, false);
+    expect(screen.getByText("1 / 1 earned")).toBeTruthy();
+    view.rerender(<GameLibraryPage {...page} currentGame={{ ...game, build_id: 2 }} />);
+    expect(screen.queryByText("1 / 1 earned")).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(800); });
+    expect(inspectGameContent).toHaveBeenCalledTimes(2);
+  });
   it("keeps the selection summary compact and sends details to the dedicated page", () => {
     const page = props();
     render(<GameLibraryPage {...page} />);

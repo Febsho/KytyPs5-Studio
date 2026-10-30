@@ -21,6 +21,7 @@ import { GameContextMenu, VirtualGameGrid } from "../components/games/GameLibrar
 import { GameCompatibilityBadge } from "../components/games/GameCompatibilityBadge";
 import { emulatorBuildName } from "../utils/format";
 import { trophySummary } from "../utils/trophies";
+import { compatibilityBadgeLabel, officialCompatibilityForGame } from "../utils/compatibility";
 
 export type GameLibraryPageProps = {
   games: Game[];
@@ -30,7 +31,7 @@ export type GameLibraryPageProps = {
   gameIcon: string | null;
   gameScan: GameScanEvent | null;
   officialCompatibilityIndex?: OfficialCompatibilityIndex | null;
-  inspectGameContent?: (gameId: number) => Promise<GameContent>;
+  inspectGameContent?: (gameId: number, includeIcons?: boolean) => Promise<GameContent>;
   query: string;
   setQuery: Dispatch<SetStateAction<string>>;
   libraryFilter: "all" | "favorites" | "recent";
@@ -87,15 +88,20 @@ export function GameLibraryPage({
 }: GameLibraryPageProps) {
   const [contextMenu, setContextMenu] = useState<{ game: Game; x: number; y: number } | null>(null);
   const [trophyProgress, setTrophyProgress] = useState<ReturnType<typeof trophySummary> | null>(null);
+  const activeBuildId = builds.find((build) => build.active)?.id;
+  const compatibility = currentGame ? officialCompatibilityForGame(currentGame, officialCompatibilityIndex ?? null) : null;
+  const reportCount = compatibility && Object.keys(compatibility.report_counts).length
+    ? Object.values(compatibility.report_counts).reduce((sum, count) => sum + count, 0)
+    : null;
   useEffect(() => {
     if (!currentGame || !inspectGameContent) { setTrophyProgress(null); return; }
     let current = true;
     setTrophyProgress(null);
     const timer = window.setTimeout(() => {
-      void inspectGameContent(currentGame.id).then((content) => { if (current) setTrophyProgress(trophySummary(content)); }).catch(() => { if (current) setTrophyProgress(null); });
+      void inspectGameContent(currentGame.id, false).then((content) => { if (current) setTrophyProgress(trophySummary(content)); }).catch(() => { if (current) setTrophyProgress(null); });
     }, 800);
     return () => { current = false; window.clearTimeout(timer); };
-  }, [currentGame?.id, inspectGameContent]);
+  }, [currentGame?.id, currentGame?.build_id, activeBuildId, currentGame?.last_played, inspectGameContent]);
   return (
     <section
       className="page library-page"
@@ -222,6 +228,11 @@ export function GameLibraryPage({
               <h2>{currentGame.title}</h2>
               <GameCompatibilityBadge game={currentGame} index={officialCompatibilityIndex} />
             </div>
+            {compatibility && <p className="library-compatibility-context">
+              Official compatibility: {compatibilityBadgeLabel(compatibility)}
+              {reportCount !== null && <> · {reportCount} {reportCount === 1 ? "report" : "reports"}</>}
+              {compatibility.latest_tested && <> · Latest test {compatibility.latest_tested}</>}
+            </p>}
             <p className="path">{currentGame.path}</p>
             <div className="library-detail-actions">
               <button

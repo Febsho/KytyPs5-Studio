@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10322,8 +10323,75 @@ fn get_profile(app: tauri::AppHandle, game_id: i64) -> Result<Profile, String> {
     game(&c, game_id)?;
     profile(&c, game_id)
 }
+fn trophy_icon_data(data: &[u8]) -> Option<String> {
+    if data.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    let thumbnail = resize_png(data, 128, 128)?;
+    (thumbnail.len() <= 256 * 1024)
+        .then(|| format!("data:image/png;base64,{}", BASE64.encode(thumbnail)))
+}
+fn trophy_icon_id(name: &str) -> Option<&str> {
+    let id = name.strip_prefix("trop")?.strip_suffix(".png")?;
+    (id.len() == 4 && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
+}
+#[cfg(test)]
+#[test]
+fn trophy_icons_match_package_ids_and_are_bounded_pngs() {
+    assert_eq!(trophy_icon_id("trop0042.png"), Some("0042"));
+    assert_eq!(trophy_icon_id("tropmeta_en-us.json"), None);
+    assert_eq!(trophy_icon_id("trop../x.png"), None);
+    let png = encode_rgba_png(2, 2, &[255; 16]).unwrap();
+    assert!(trophy_icon_data(&png)
+        .unwrap()
+        .starts_with("data:image/png;base64,"));
+    assert!(trophy_icon_data(b"not a png").is_none());
+    assert!(trophy_icon_data(&vec![0; 4 * 1024 * 1024 + 1]).is_none());
+}
 #[tauri::command]
-fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_json::Value, String> {
+async fn inspect_game_content(
+    app: tauri::AppHandle,
+    game_id: i64,
+    include_icons: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        inspect_game_content_blocking(app, game_id, include_icons.unwrap_or(true))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+fn read_bounded_trophy_package(path: &Path) -> Option<Vec<u8>> {
+    const MAX_PACKAGE: u64 = 256 * 1024 * 1024;
+    let file = fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() < 64 || metadata.len() > MAX_PACKAGE {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PACKAGE + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() >= 64 && bytes.len() as u64 <= MAX_PACKAGE).then_some(bytes)
+}
+#[cfg(test)]
+#[test]
+fn trophy_package_read_rejects_oversized_files_before_loading() {
+    let path = env::temp_dir().join(format!(
+        "studio-trophy-bound-{}-{}",
+        std::process::id(),
+        now()
+    ));
+    let file = fs::File::create(&path).unwrap();
+    file.set_len(256 * 1024 * 1024 + 1).unwrap();
+    assert!(read_bounded_trophy_package(&path).is_none());
+    file.set_len(64).unwrap();
+    assert_eq!(read_bounded_trophy_package(&path).unwrap().len(), 64);
+    drop(file);
+    fs::remove_file(path).unwrap();
+}
+fn inspect_game_content_blocking(
+    app: tauri::AppHandle,
+    game_id: i64,
+    include_icons: bool,
+) -> Result<serde_json::Value, String> {
     let c = db(&app)?;
     let selected = game(&c, game_id)?;
     let selected_build = build_for_game(&c, game_id).ok();
@@ -10348,6 +10416,7 @@ fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_jso
             .to_path_buf()
     };
     let mut trophies = Vec::new();
+    let mut trophy_icon_bytes = 0usize;
     for trophy_dir in [root.join("sce_sys/trophy2"), root.join("sce_sys/trophy")] {
         if let Ok(entries) = fs::read_dir(&trophy_dir) {
             for entry in entries.flatten() {
@@ -10359,9 +10428,8 @@ fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_jso
                 {
                     continue;
                 }
-                let bytes = match fs::read(&path) {
-                    Ok(b) if b.len() >= 64 && b.len() <= 256 * 1024 * 1024 => b,
-                    _ => continue,
+                let Some(bytes) = read_bounded_trophy_package(&path) else {
+                    continue;
                 };
                 let be32 = |o: usize| -> Option<u32> {
                     Some(u32::from_be_bytes(bytes.get(o..o + 4)?.try_into().ok()?))
@@ -10380,6 +10448,7 @@ fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_jso
                 }
                 let mut conf = None;
                 let mut metadata_by_language = BTreeMap::new();
+                let mut icons = HashMap::new();
                 for i in 0..count as usize {
                     let Some(base) = (toc as usize)
                         .checked_add(32)
@@ -10406,6 +10475,10 @@ fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_jso
                     };
                     if name == "tropconf.json" {
                         conf = serde_json::from_slice::<serde_json::Value>(data).ok();
+                    } else if let Some(id) = trophy_icon_id(&name) {
+                        if include_icons {
+                            icons.insert(id.to_owned(), data);
+                        }
                     } else if name.starts_with("tropmeta_") && name.ends_with(".json") {
                         let language = name
                             .strip_prefix("tropmeta_")
@@ -10464,7 +10537,18 @@ fn inspect_game_content(app: tauri::AppHandle, game_id: i64) -> Result<serde_jso
                         continue;
                     }
                     let text = text_map.get(&id);
-                    trophies.push(serde_json::json!({"id":id,"grade":def.get("grade"),"hidden":def.get("hidden").and_then(|v|v.as_bool()).unwrap_or(false),"name":text.and_then(|v|v.get("name")).and_then(|v|v.as_str()).unwrap_or(""),"detail":text.and_then(|v|v.get("detail")).and_then(|v|v.as_str()).unwrap_or(""),"unlocked":null}));
+                    let icon = icons.get(&id).and_then(|data| {
+                        if trophy_icon_bytes >= 16 * 1024 * 1024 {
+                            return None;
+                        }
+                        let icon = trophy_icon_data(data)?;
+                        if trophy_icon_bytes + icon.len() > 16 * 1024 * 1024 {
+                            return None;
+                        }
+                        trophy_icon_bytes += icon.len();
+                        Some(icon)
+                    });
+                    trophies.push(serde_json::json!({"id":id,"grade":def.get("grade"),"hidden":def.get("hidden").and_then(|v|v.as_bool()).unwrap_or(false),"name":text.and_then(|v|v.get("name")).and_then(|v|v.as_str()).unwrap_or(""),"detail":text.and_then(|v|v.get("detail")).and_then(|v|v.as_str()).unwrap_or(""),"icon":icon,"unlocked":null}));
                 }
             }
         }

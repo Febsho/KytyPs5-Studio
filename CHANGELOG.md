@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.5.0
+
+### Emulator settings and controls
+
+- Group the selected build's available settings by category and keep unsupported options out of the editor.
+- Add an opt-in KytyPS5 fork binding editor with an interactive DualSense diagram, keyboard and mouse capture, and controller input selection. Fork mapping syntax must be supported by the selected emulator; custom bindings replace that device's defaults.
+- Distinguish left and right modifier keys when capturing keyboard bindings.
+
+### Trophies and compatibility
+
+- Read trophy artwork from game packages and display individual trophies on the Home screen and in game details. Hidden unearned trophies remain concealed.
+- Show official compatibility status in the library grid, with available report counts and test dates in the library.
+- Refresh library trophy progress when the selected build changes.
+
+### Performance and reliability
+
+- Process game content on a background worker, check package sizes before reading, and skip trophy image decoding in summary and patch views.
+
 ## 1.4.4
 
 ### Game hub and trophies

@@ -389,7 +389,7 @@ export function App() {
     });
   };
   const inspectGameContent = useCallback(
-    (gameId: number) => call<GameContent>("inspect_game_content", { gameId }),
+    (gameId: number, includeIcons = true) => call<GameContent>("inspect_game_content", { gameId, includeIcons }),
     [call],
   );
   const fetchGameCheats = useCallback(
@@ -421,7 +421,7 @@ export function App() {
     enabled: boolean,
   ) => {
     const patchJson = await call<string>("set_game_patch_mod_enabled", { gameId, modIndex, enabled });
-    const content = await call<GameContent>("inspect_game_content", { gameId });
+    const content = await call<GameContent>("inspect_game_content", { gameId, includeIcons: false });
     return { content, patchJson };
   }, [call]);
   useEffect(() => {

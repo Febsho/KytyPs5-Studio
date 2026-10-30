@@ -20,6 +20,7 @@ import type {
 } from "../types/studio";
 import { date, emulatorBuildName, formatBytes, short } from "../utils/format";
 import { trophyGrade, trophyGrades } from "../utils/trophies";
+import { TrophyItem } from "../components/games/TrophyItem";
 import { compatibilityOsLabel, compatibilityStatusLabel, currentCompatibilityOS, normalizeTitleId, officialCompatibilityForGame, recommendVerifiedBuild } from "../utils/compatibility";
 import type { System, GraphicsDiagnostics } from "../types/studio";
 import { CompatibilityReportDialog } from "../components/compatibility/CompatibilityReportDialog";
@@ -63,7 +64,7 @@ export type GameDetailsPageProps = {
   onBuildRecommendedSource?: (repoId: number) => void;
   onRecordObservation: () => void;
   onOpenSessionLog: (session: Session) => void;
-  onInspectContent?: (gameId:number) => Promise<GameContent>;
+  onInspectContent?: (gameId:number, includeIcons?: boolean) => Promise<GameContent>;
   onFetchOnlineCheats?: (gameId:number) => Promise<RemoteCheatFile[]>;
   shaderPrecompileSupport?: ShaderPrecompileSupport | null;
   onSetShaderPrecompileEnabled?: (enabled: boolean) => void;
@@ -210,9 +211,9 @@ export function GameDetailsPage({
     let current = true;
     setContent(null);
     setContentError("");
-    void onInspectContent(currentGame.id).then((result) => { if (current) { setContent(result); setContentError(""); } }).catch((error) => { if (current) setContentError(String(error)); });
+    void onInspectContent(currentGame.id, gameDetailsTab === "Trophies").then((result) => { if (current) { setContent(result); setContentError(""); } }).catch((error) => { if (current) setContentError(String(error)); });
     return () => { current = false; };
-  }, [gameDetailsTab, currentGame.id, currentGame.build_id, onInspectContent]);
+  }, [gameDetailsTab, currentGame.id, currentGame.build_id, builds.find((build) => build.active)?.id, onInspectContent]);
   const refreshTrophyProgress = async () => {
     setTrophyBusy(true); setTrophyError("");
     try { const [progress,backups]=await Promise.all([invoke<TrophyProgress[]>("list_trophy_progress", {gameId: currentGame.id}),invoke<TrophyBackup[]>("list_trophy_backups",{gameId:currentGame.id})]);setTrophyProgress(progress);setTrophyBackups(backups); }
@@ -264,7 +265,7 @@ export function GameDetailsPage({
       if (!imported) return;
       setCustomPatchPath(imported.path);
       setCustomPatchDraft(imported.content);
-      if (onInspectContent) setContent(await onInspectContent(currentGame.id));
+      if (onInspectContent) setContent(await onInspectContent(currentGame.id, false));
     } catch (error) {
       setCustomPatchError(String(error));
     } finally {
@@ -278,7 +279,7 @@ export function GameDetailsPage({
     try {
       const path = await onSaveCustomPatch(currentGame.id, customPatchDraft);
       setCustomPatchPath(path);
-      if (onInspectContent) setContent(await onInspectContent(currentGame.id));
+      if (onInspectContent) setContent(await onInspectContent(currentGame.id, false));
     } catch (error) {
       setCustomPatchError(String(error));
     } finally {
@@ -588,12 +589,12 @@ export function GameDetailsPage({
           <h2>Trophies</h2>
           <p>Definitions come from the game package. Earned status is local emulator progress only; there is no PlayStation Network sync.</p>
           {trophyError && <p className="error-note">{trophyError}</p>}{trophyNotice && <p className="hint">{trophyNotice}</p>}
-          <section className="trophy-progress-manager"><div className="buttonrow"><h3>Local progress by build, user and service</h3><button className="outline" disabled={trophyBusy} onClick={()=>void refreshTrophyProgress()}>{trophyBusy?"Reading…":"Refresh"}</button></div>
+          <details className="trophy-progress-manager"><summary>Manage local progress and backups</summary><div className="buttonrow"><h3>Local progress by build, user and service</h3><button className="outline" disabled={trophyBusy} onClick={()=>void refreshTrophyProgress()}>{trophyBusy?"Reading…":"Refresh"}</button></div>
             {trophyProgress.length===0&&!trophyBusy&&<p>No local trophy progress files were found in installed build folders. Missing files do not mean zero trophies earned.</p>}
             {trophyProgress.map((entry)=><article className="save-data-entry" key={entry.id}><div><strong>{entry.build_name} · User {entry.user_id} · Service {entry.service_label}</strong><p>{entry.read_status==="readable"?`${entry.earned} earned IDs read`:"Progress file could not be read; earned count unavailable"}</p><small>{entry.path}</small>{entry.error&&<p className="error-note">{entry.error}</p>}</div><div className="buttonrow"><button className="outline" disabled={trophyBusy||activeSessions||entry.read_status!=="readable"} onClick={()=>void backupTrophy(entry)}>Backup Trophies</button><button className="outline" disabled={trophyBusy||activeSessions||entry.read_status!=="readable"} onClick={async()=>{const destination=await nativeSave({defaultPath:`trophies_${entry.user_id}_${entry.service_label}.json`,filters:[{name:"Trophy JSON",extensions:["json"]}]});if(!destination)return;setTrophyBusy(true);try{const path=await invoke<string>("export_trophy_progress",{gameId:currentGame.id,path:entry.path,destination});setTrophyNotice(`Exported ${path}`);}catch(error){setTrophyError(String(error));}finally{setTrophyBusy(false);}}}>Export</button><button className="outline" disabled={trophyBusy||activeSessions} onClick={()=>void invoke("open_trophy_folder",{gameId:currentGame.id,path:entry.path}).catch(error=>setTrophyError(String(error)))}>Open Trophy Folder</button></div></article>)}
             <button className="outline" disabled={trophyBusy||activeSessions} onClick={async()=>{const source=await nativeOpen({multiple:false,filters:[{name:"Trophy JSON",extensions:["json"]}]});if(typeof source!=="string")return;const target=builds.find(b=>b.id===currentGame.build_id)?.id??builds.find(b=>b.active)?.id;if(!target){setTrophyError("No registered build is available as an import target.");return;}if(!await nativeConfirm("Import this exact user and service file? Existing trophy progress will never be overwritten.",{title:"Import trophy progress",kind:"warning",okLabel:"Import JSON"}))return;setTrophyBusy(true);try{const path=await invoke<string>("import_trophy_progress",{gameId:currentGame.id,source,buildId:target});setTrophyNotice(`Imported ${path}`);await refreshTrophyProgress();}catch(error){setTrophyError(String(error));}finally{setTrophyBusy(false);}}}>Import Trophy JSON…</button>
-          </section>
-          <section className="trophy-progress-manager"><h3>Verified trophy backup history</h3>{trophyBackups.length===0?<p>No verified trophy backups yet.</p>:trophyBackups.map(record=><article className="save-data-entry" key={record.path}><div><strong>{record.source_build} · User {record.user_id} · Service {record.service_label}</strong><p>{date(record.timestamp)} · SHA-256 {record.sha256}</p><small>{record.path}</small></div><button className="outline" disabled={trophyBusy||activeSessions} onClick={async()=>{if(!await nativeConfirm(`Restore ${record.filename} for user ${record.user_id}, service ${record.service_label}, to build ${record.source_build}? Existing progress for this exact account and service is backed up first.`,{title:"Restore trophy progress",kind:"warning",okLabel:"Restore progress"}))return;setTrophyBusy(true);try{const path=await invoke<string>("restore_trophy_backup",{gameId:currentGame.id,backupPath:record.path});setTrophyNotice(`Restored ${path}`);await refreshTrophyProgress();}catch(error){setTrophyError(String(error));}finally{setTrophyBusy(false);}}}>Restore…</button></article>)}</section>
+          </details>
+          <details className="trophy-progress-manager"><summary>Verified trophy backup history</summary>{trophyBackups.length===0?<p>No verified trophy backups yet.</p>:trophyBackups.map(record=><article className="save-data-entry" key={record.path}><div><strong>{record.source_build} · User {record.user_id} · Service {record.service_label}</strong><p>{date(record.timestamp)} · SHA-256 {record.sha256}</p><small>{record.path}</small></div><button className="outline" disabled={trophyBusy||activeSessions} onClick={async()=>{if(!await nativeConfirm(`Restore ${record.filename} for user ${record.user_id}, service ${record.service_label}, to build ${record.source_build}? Existing progress for this exact account and service is backed up first.`,{title:"Restore trophy progress",kind:"warning",okLabel:"Restore progress"}))return;setTrophyBusy(true);try{const path=await invoke<string>("restore_trophy_backup",{gameId:currentGame.id,backupPath:record.path});setTrophyNotice(`Restored ${path}`);await refreshTrophyProgress();}catch(error){setTrophyError(String(error));}finally{setTrophyBusy(false);}}}>Restore…</button></article>)}</details>
           {contentError && <p className="error-note">{contentError}</p>}
           {!content && !contentError && <p>Reading trophy package…</p>}
           {content?.trophies.length ? <>
@@ -608,11 +609,7 @@ export function GameDetailsPage({
               if (!trophies.length) return null;
               return <section className={`trophy-section trophy-${grade}`} key={grade}>
                 <h3><span className="trophy-grade-icon" aria-hidden="true">{grade === "platinum" ? "✦" : "●"}</span>{grade === "other" ? "Other trophies" : `${grade[0].toUpperCase()}${grade.slice(1)} trophies`}<small>{trophies.length}</small></h3>
-                <div className="trophy-grid">{trophies.map((t) => <article className={`trophy-item trophy-${grade}`} key={t.id}>
-                  <span className="trophy-item-top"><span className="trophy-grade">{grade === "other" ? (t.grade || "Trophy") : grade}</span><span className={`trophy-earned-state ${t.unlocked === true ? "earned" : ""}`}>{t.unlocked === true ? "✓ Earned" : t.unlocked === false ? "Not earned" : "Status unavailable"}</span></span>
-                  <strong>{t.name || (t.hidden ? "Hidden trophy" : `Trophy ${t.id}`)}</strong>
-                  <small>{t.detail || (t.hidden ? "This trophy is hidden." : `Trophy ${t.id}`)}</small>
-                </article>)}</div>
+                <div className="trophy-grid">{trophies.map((t, index) => <TrophyItem trophy={t} key={`${t.id}-${index}`} />)}</div>
               </section>;
             })}
           </> : content && <p>No readable trophy definitions were found in the game's <code>sce_sys/trophy2</code> or <code>sce_sys/trophy</code> packages.</p>}
@@ -673,7 +670,7 @@ export function GameDetailsPage({
                   setDownloadedCheatPath(path);
                   setCustomPatchPath(path);
                   if (onInspectContent) {
-                    try { setContent(await onInspectContent(currentGame.id)); setContentError(""); }
+                    try { setContent(await onInspectContent(currentGame.id, false)); setContentError(""); }
                     catch (error) { setContentError(String(error)); }
                   }
                 }).catch((error) => setRemoteCheatError(String(error))).finally(() => setDownloadingCheat(""));

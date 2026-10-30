@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { ForkBindingEditor } from "./ForkBindingEditor";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type { CliOptionMetadata } from "../../types/studio";
 
@@ -446,6 +447,7 @@ export function ProfileOptionFields({
                         </select>
                       ) : info.kind === "keymap" ? (
                         <div className="keymap-editor">
+                          <ForkBindingEditor value={value} onChange={set} />
                           {value
                             .split("\n")
                             .filter(Boolean)

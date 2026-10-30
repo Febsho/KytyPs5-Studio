@@ -12,6 +12,7 @@ import { GameContextMenu, VirtualHomeGameRow } from "../components/games/GameLib
 import { GameCompatibilityBadge } from "../components/games/GameCompatibilityBadge";
 import { emulatorBuildName, formatBytes } from "../utils/format";
 import { trophySummary } from "../utils/trophies";
+import { TrophyItem } from "../components/games/TrophyItem";
 
 type Page =
   | "home"
@@ -24,7 +25,7 @@ type Page =
   | "settings"
   | "game-details";
 type TrophySummary = ReturnType<typeof trophySummary>;
-const trophyCache = new Map<number, { summary: TrophySummary; lastPlayed: number | null; cachedAt: number }>();
+const trophyCache = new Map<number, { summary: TrophySummary; trophies: GameContent["trophies"]; lastPlayed: number | null; buildId: number | null; cachedAt: number }>();
 export type HomePageProps = {
   games: Game[];
   officialCompatibilityIndex?: OfficialCompatibilityIndex | null;
@@ -70,27 +71,30 @@ export function HomePage({
   runningGameId,
   onShowRunningSession,
 }: HomePageProps) {
-  const [trophyProgress, setTrophyProgress] = useState<{ gameId: number; summary: TrophySummary } | null>(null);
+  const [trophyProgress, setTrophyProgress] = useState<{ gameId: number; summary: TrophySummary; trophies: GameContent["trophies"] } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ game: Game; x: number; y: number } | null>(null);
   const featuredBuild = builds.find((build) => build.id === featuredGame?.build_id) ?? active;
   useEffect(() => {
     if (!featuredGame || !inspectGameContent) { setTrophyProgress(null); return; }
     let current = true;
     const cached = trophyCache.get(featuredGame.id);
-    if (cached) setTrophyProgress({ gameId: featuredGame.id, summary: cached.summary });
+    const effectiveBuildId = featuredGame.build_id ?? active?.id ?? null;
+    if (cached && cached.buildId === effectiveBuildId) setTrophyProgress({ gameId: featuredGame.id, summary: cached.summary, trophies: cached.trophies });
     else setTrophyProgress(null);
-    if (cached && cached.lastPlayed === featuredGame.last_played && Date.now() - cached.cachedAt < 5 * 60 * 1000) {
+    if (cached && cached.buildId === effectiveBuildId && cached.lastPlayed === featuredGame.last_played && Date.now() - cached.cachedAt < 5 * 60 * 1000) {
       return () => { current = false; };
     }
     const timer = window.setTimeout(() => {
       void inspectGameContent(featuredGame.id).then((result) => {
         const summary = trophySummary(result);
-        trophyCache.set(featuredGame.id, { summary, lastPlayed: featuredGame.last_played, cachedAt: Date.now() });
-        if (current) setTrophyProgress({ gameId: featuredGame.id, summary });
-      }).catch(() => { if (current && !cached) setTrophyProgress(null); });
+        trophyCache.delete(featuredGame.id);
+        trophyCache.set(featuredGame.id, { summary, trophies: result.trophies, lastPlayed: featuredGame.last_played, buildId: effectiveBuildId, cachedAt: Date.now() });
+        if (trophyCache.size > 4) trophyCache.delete(trophyCache.keys().next().value!);
+        if (current) setTrophyProgress({ gameId: featuredGame.id, summary, trophies: result.trophies });
+      }).catch(() => { if (current && (!cached || cached.buildId !== effectiveBuildId)) setTrophyProgress(null); });
     }, 1200);
     return ()=>{ current=false; window.clearTimeout(timer); };
-  }, [featuredGame?.id, featuredGame?.last_played, inspectGameContent]);
+  }, [featuredGame?.id, featuredGame?.last_played, featuredGame?.build_id, active?.id, inspectGameContent]);
   const visibleTrophyProgress = featuredGame && trophyProgress?.gameId === featuredGame.id ? trophyProgress.summary : null;
   return (
     <section
@@ -154,6 +158,11 @@ export function HomePage({
         {visibleTrophyProgress && visibleTrophyProgress.total > 0 && <div className="home-trophy-progress" aria-label="Trophy progress">
           <div className="trophy-progress-heading"><strong>Trophies</strong><span>{visibleTrophyProgress.earned === null ? "Earned status unavailable" : `${visibleTrophyProgress.earned} / ${visibleTrophyProgress.total} earned`}</span></div>
           <div className="trophy-progress-grid">{(["bronze", "silver", "gold", "platinum"] as const).map((grade) => <div className={`trophy-progress-grade trophy-${grade}`} key={grade}><span>{grade}</span><strong>{visibleTrophyProgress.earned === null ? "—" : visibleTrophyProgress.earnedByGrade[grade]} <i>/</i> {visibleTrophyProgress.counts[grade]}</strong></div>)}</div>
+          <div className="home-trophy-list" aria-label="Individual trophies">{trophyProgress?.trophies.map((trophy, index) => <TrophyItem trophy={trophy} key={`${trophy.id}-${index}`} />)}</div>
+          <button className="text-button" onClick={() => {
+            const openTrophies = () => { setGameDetailsTab("Trophies"); setPage("game-details"); };
+            if (selectGameWithGuard(featuredGame.id, openTrophies) !== false) openTrophies();
+          }}>View all trophies <ChevronRight size={14} /></button>
         </div>}
         <div className="hero-actions">
           {featuredGame ? (

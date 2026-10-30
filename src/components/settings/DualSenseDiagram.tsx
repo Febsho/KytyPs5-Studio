@@ -2,30 +2,41 @@ import { CONTROLLER_ACTIONS } from "../../utils/controllerMapping";
 import type { ControllerMapping } from "../../utils/controllerMapping";
 
 type Props = {
-  mapping: ControllerMapping;
+  mapping?: ControllerMapping;
+  targets?: boolean;
   selectedControl: string;
   onSelect: (control: string) => void;
 };
 
-export function DualSenseDiagram({ mapping, selectedControl, onSelect }: Props) {
+const targetControls: Record<string, string> = {
+  "button:6": "L2", "button:4": "L1", "button:7": "R2", "button:5": "R1",
+  "button:9": "Options", "button:17": "TouchPad", "button:12": "Up", "button:13": "Down", "button:14": "Left", "button:15": "Right",
+  "axis:0:-": "LeftStickLeft", "axis:0:+": "LeftStickRight", "axis:1:-": "LeftStickUp", "axis:1:+": "LeftStickDown",
+  "axis:2:-": "RightStickLeft", "axis:2:+": "RightStickRight", "axis:3:-": "RightStickUp", "axis:3:+": "RightStickDown",
+  "button:10": "L3", "button:11": "R3", "button:3": "Triangle", "button:1": "Circle", "button:2": "Square", "button:0": "Cross",
+};
+
+export function DualSenseDiagram({ mapping, targets = false, selectedControl, onSelect }: Props) {
   const hotspot = (control: string, label: string, x: number, y: number, width: number, height: number) => {
-    const assignment = CONTROLLER_ACTIONS.find(({ id }) => mapping[id] === control)?.label;
+    const target = targets ? targetControls[control] : control;
+    if (!target) return null;
+    const assignment = mapping && CONTROLLER_ACTIONS.find(({ id }) => mapping[id] === control)?.label;
     return (
       <g
         key={control}
-        className={`dualsense-hotspot${selectedControl === control ? " selected" : ""}`}
+        className={`dualsense-hotspot${selectedControl === target ? " selected" : ""}`}
         role="button"
         tabIndex={0}
-        aria-label={`${label}, ${assignment ? `assigned to ${assignment}` : "unassigned"}`}
-        onClick={() => onSelect(control)}
+        aria-label={targets ? label : `${label}, ${assignment ? `assigned to ${assignment}` : "unassigned"}`}
+        onClick={() => onSelect(target)}
         onKeyDown={(event) => {
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
-            onSelect(control);
+            onSelect(target);
           }
         }}
       >
-        <title>{`${label} — ${assignment || "Unassigned"}`}</title>
+        <title>{targets ? label : `${label} — ${assignment || "Unassigned"}`}</title>
         <rect x={x} y={y} width={width} height={height} rx={Math.min(width, height) / 2} />
       </g>
     );

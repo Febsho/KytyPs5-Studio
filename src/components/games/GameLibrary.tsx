@@ -119,6 +119,9 @@ export function GameCard({
     };
   }, [game.id]);
   const compatibility = officialCompatibilityForGame(game, officialCompatibilityIndex ?? null);
+  const reportCount = compatibility && Object.keys(compatibility.report_counts).length
+    ? Object.values(compatibility.report_counts).reduce((sum, count) => sum + count, 0)
+    : null;
   return (
     <button
       ref={element}
@@ -137,11 +140,11 @@ export function GameCard({
       </div>
       <span className="game-card-title-row">
         <strong>{game.title}</strong>
-        {mode === "list" && <GameCompatibilityBadge game={game} index={officialCompatibilityIndex} />}
+        <GameCompatibilityBadge game={game} index={officialCompatibilityIndex} />
       </span>
       <small>
         {mode === "list"
-          ? `${game.title_id || "No title ID"} · ${game.game_version ? `v${game.game_version}` : "Version unknown"} · ${formatBytes(game.install_size)} · ${Math.round(game.play_seconds / 60)} min · ${game.build_id ? `Build ${game.build_id}` : "Active build"} · ${game.file_status === "Missing" ? "Missing files" : game.last_played ? `Played ${date(game.last_played)}` : "Not played yet"}`
+          ? `${game.title_id || "No title ID"} · ${game.game_version ? `v${game.game_version}` : "Version unknown"} · ${formatBytes(game.install_size)} · ${Math.round(game.play_seconds / 60)} min · ${game.build_id ? `Build ${game.build_id}` : "Active build"} · ${game.file_status === "Missing" ? "Missing files" : game.last_played ? `Played ${date(game.last_played)}` : "Not played yet"}${reportCount !== null ? ` · ${reportCount} ${reportCount === 1 ? "report" : "reports"}` : ""}`
           : game.file_status === "Missing"
             ? "Missing files"
             : game.last_played

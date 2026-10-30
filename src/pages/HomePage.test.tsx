@@ -117,4 +117,22 @@ describe("HomePage", () => {
     expect(inspectGameContent).toHaveBeenCalledTimes(2);
     vi.useRealTimers();
   });
+
+  it("shows individual trophies and their artwork for the featured game", async () => {
+    vi.useFakeTimers();
+    const game: Game = { id: 903, path: "/games/trophies", title: "Trophy game", favorite: false, build_id: null, play_seconds: 0, last_played: null, title_id: null, game_version: null, icon_path: null, install_size: null, file_status: "Available" };
+    const inspectGameContent = vi.fn().mockResolvedValue({ trophies: [
+      { id: "0001", name: "First trophy", detail: "Found it", grade: "B", hidden: false, unlocked: true, icon: "data:image/png;base64,abc" },
+      { id: "0002", name: "Secret", detail: "Spoiler", grade: "S", hidden: true, unlocked: false, icon: "data:image/png;base64,secret" },
+    ], trophy_unlock_state: "available", patches: [], patch_source: null, patch_error: null });
+    render(<HomePage {...props({ games: [game], featuredGame: game, inspectGameContent })} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1200); });
+    const list = screen.getByLabelText("Individual trophies");
+    expect(list.textContent).toContain("First trophy");
+    expect(list.querySelector("img")?.getAttribute("src")).toBe("data:image/png;base64,abc");
+    expect(list.textContent).toContain("Hidden trophy");
+    expect(list.textContent).not.toContain("Secret");
+    expect(list.querySelectorAll("img")).toHaveLength(1);
+    vi.useRealTimers();
+  });
 });
